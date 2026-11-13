@@ -129,6 +129,8 @@ Required endpoints (all under `/v1`, all except auth/health require a bearer tok
 | PATCH | `/orgs/:orgId/tasks/:taskId` | status transition, validated by state machine |
 | POST | `/orgs/:orgId/tasks/:taskId/run` | start workflow; returns `workflowRunId` |
 | POST | `/orgs/:orgId/tasks/:taskId/cancel` | cancel if safe |
+| GET | `/orgs/:orgId/approvals` | pending queue, risk-ranked (added v1.1 for A3 + Overview) |
+| POST | `/orgs/:orgId/approvals/:approvalId/decision` | `approve \| reject \| request_changes`; ADMIN+; emits `approval.decided.v1` |
 
 **Task state machine** (server-validated, reject anything else):
 `draft → ready → queued → running → verifying → succeeded | failed | blocked | cancelled`
@@ -323,4 +325,33 @@ An empty Overview that says why is correct. A full Overview built on fixtures is
 ### A8. No external specification document
 
 §7 cites "spec §5.3"; no such file exists in the repo. **§7 of this contract is authoritative** for the event envelope. Do not block on a missing document.
+
+---
+
+## 16. Workflow interface contract (binding across API and worker)
+
+Both `apps/api` and `apps/worker` must use these exact literals. Drift here is a silent runtime failure.
+
+| Item | Value |
+|---|---|
+| Task queue | `intelligenz-tasks` |
+| Workflow type | `runTaskWorkflow` |
+| Workflow signature | `runTaskWorkflow(input: { taskId: string; orgId: string; correlationId: string }): Promise<{ status: 'succeeded' \| 'failed' \| 'cancelled'; summary: string }>` |
+| Workflow ID | `task-${taskId}` — deterministic, so a duplicate start is rejected by Temporal itself |
+| Cancellation | Temporal cancellation. The workflow catches `CancelledFailure`, marks the task `cancelled`, emits `task.cancelled.v1`, and rethrows. |
+| Activity: validate | `validateTaskActivity({ taskId, orgId })` |
+| Activity: start | `recordStartActivity({ taskId, orgId, workflowRunId })` |
+| Activity: execute | `executeAgentActivity({ taskId, orgId, correlationId })` |
+| Activity: persist | `persistResultActivity({ taskId, orgId, result })` |
+| Activity: emit | `emitEventActivity({ event })` |
+| Activity: complete | `completeTaskActivity({ taskId, orgId, status })` |
+| Activity retry | `maximumAttempts: 3`, exponential backoff, initial 1s, coefficient 2 |
+| Timeouts | `startToCloseTimeout: '60s'` per activity; `scheduleToCloseTimeout: '5m'`; workflow `runTimeout: '10m'` |
+
+Rules:
+- Activities are **idempotent** on `taskId`. Re-running `persistResultActivity` for the same task must not duplicate `Artifact` or `Evidence` rows (unique on `(taskId, kind, checksum)`).
+- The workflow never writes to the database directly — only through activities.
+- The API starts the workflow with `workflowId: 'task-' + taskId` and `workflowIdReusePolicy: 'REJECT_DUPLICATE'`.
+- A missing Temporal server must surface as `503` on `/health/ready` and as a typed error on run start — never a fabricated success.
+
 
