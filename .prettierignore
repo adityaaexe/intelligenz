@@ -1,0 +1,14 @@
+node_modules/
+dist/
+build/
+.next/
+out/
+coverage/
+.turbo/
+.temporal/
+.artifacts/
+pnpm-lock.yaml
+prototype/
+qa/
+DESIGN.md
+*.md

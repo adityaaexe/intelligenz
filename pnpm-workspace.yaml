@@ -1,0 +1,24 @@
+packages:
+  - 'apps/*'
+  - 'packages/*'
+
+# pnpm 10 blocks lifecycle scripts by default. These packages genuinely need to
+# run one (native addon build, engine download, binary shim). Everything else is
+# blocked on purpose — an unreviewed postinstall is an unreviewed `exec`.
+onlyBuiltDependencies:
+  - '@prisma/client'
+  - '@prisma/engines'
+  - '@tailwindcss/oxide'
+  - argon2
+  - esbuild
+  - prisma
+  - sharp
+  - unrs-resolver
+
+# Reviewed and deliberately NOT executed. Recorded here so the decision is in
+# the repo instead of in a warning on every install.
+#   @swc/core   — only used if Nest is switched to the SWC builder; tsc is the compiler here.
+#   protobufjs  — its postinstall only writes a `pbjs` CLI shim; not used at runtime.
+ignoredBuiltDependencies:
+  - '@swc/core'
+  - protobufjs

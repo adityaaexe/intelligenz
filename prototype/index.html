@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en" data-theme="light" data-density="default">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Overview · INTELLIGENZ</title>
+<meta name="description" content="INTELLIGENZ Control Centre — simulated front-end prototype. Four screens, no backend.">
+<link rel="stylesheet" href="assets/css/tokens.css">
+<link rel="stylesheet" href="assets/css/base.css">
+<link rel="stylesheet" href="assets/css/components.css">
+<link rel="stylesheet" href="assets/css/screens.css">
+</head>
+<body>
+
+<a class="iz-skip" href="#main">Skip to content</a>
+
+<!-- Inline sprite: 16px grid, 1.5 stroke, currentColor. No external icon package. -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <defs>
+    <symbol id="i-grid" viewBox="0 0 16 16"><rect x="2.5" y="2.5" width="4.6" height="4.6" rx="1"/><rect x="8.9" y="2.5" width="4.6" height="4.6" rx="1"/><rect x="2.5" y="8.9" width="4.6" height="4.6" rx="1"/><rect x="8.9" y="8.9" width="4.6" height="4.6" rx="1"/></symbol>
+    <symbol id="i-check-badge" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><path d="M5.4 8.2l1.9 1.9 3.4-4.1"/></symbol>
+    <symbol id="i-hex" viewBox="0 0 16 16"><path d="M8 1.9l5.2 3v6.2L8 14.1 2.8 11.1V4.9z"/><circle cx="8" cy="8" r="1.6"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 16 16"><path d="M2.2 5.2c0-.7.5-1.2 1.2-1.2h2.5l1.4 1.6h5.5c.7 0 1.2.5 1.2 1.2v5.4c0 .7-.5 1.2-1.2 1.2H3.4c-.7 0-1.2-.5-1.2-1.2z"/></symbol>
+    <symbol id="i-code" viewBox="0 0 16 16"><path d="M6 4.4L2.8 8 6 11.6M10 4.4L13.2 8 10 11.6"/></symbol>
+    <symbol id="i-pen" viewBox="0 0 16 16"><path d="M11.3 2.7l2 2-7.9 7.9-2.6.6.6-2.6z"/><path d="M9.7 4.3l2 2"/></symbol>
+    <symbol id="i-spark" viewBox="0 0 16 16"><path d="M8 2.1l1.5 4.4 4.4 1.5-4.4 1.5L8 13.9l-1.5-4.4L2.1 8l4.4-1.5z"/></symbol>
+    <symbol id="i-nodes" viewBox="0 0 16 16"><circle cx="3.4" cy="4" r="1.6"/><circle cx="12.6" cy="4" r="1.6"/><circle cx="8" cy="12.2" r="1.6"/><path d="M4.8 4.9l2.6 5.9M11.2 4.9L8.6 10.8M5 4h6"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.6"/><path d="M8 4.5V8l2.5 1.6"/></symbol>
+    <symbol id="i-flask" viewBox="0 0 16 16"><path d="M6.2 2.3h3.6M6.8 2.4v3.6L3.4 12.1c-.4.7.1 1.6.9 1.6h7.4c.8 0 1.3-.9.9-1.6L9.2 6V2.4"/><path d="M5.2 9.5h5.6"/></symbol>
+    <symbol id="i-chip" viewBox="0 0 16 16"><rect x="4.6" y="4.6" width="6.8" height="6.8" rx="1"/><path d="M8 2v2.6M8 11.4V14M2 8h2.6M11.4 8H14"/></symbol>
+    <symbol id="i-book" viewBox="0 0 16 16"><path d="M2.6 3.6h4.2c.9 0 1.6.7 1.6 1.6v8.2c0-.9-.7-1.6-1.6-1.6H2.6z"/><path d="M13.4 3.6H9.2c-.9 0-1.6.7-1.6 1.6v8.2c0-.9.7-1.6 1.6-1.6h4.2z"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 16 16"><path d="M8 1.8l5.2 2v4.4c0 3-2.2 5.2-5.2 6-3-.8-5.2-3-5.2-6V3.8z"/></symbol>
+    <symbol id="i-doc" viewBox="0 0 16 16"><path d="M4 2.4h5l3 3v8.2H4z"/><path d="M9 2.6v3h3"/><path d="M6 8.2h4M6 10.6h4"/></symbol>
+    <symbol id="i-plug" viewBox="0 0 16 16"><path d="M6 2.4v3M10 2.4v3"/><path d="M4.4 5.4h7.2v2.2a3.6 3.6 0 0 1-7.2 0z"/><path d="M8 11.2v2.4"/></symbol>
+    <symbol id="i-bag" viewBox="0 0 16 16"><path d="M3.4 5.4h9.2l-.8 8.2H4.2z"/><path d="M6 5.4V4a2 2 0 0 1 4 0v1.4"/></symbol>
+    <symbol id="i-search" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4l3.2 3.2"/></symbol>
+    <symbol id="i-command" viewBox="0 0 16 16"><path d="M6 6h4v4H6z"/><path d="M6 6H4.8a1.8 1.8 0 1 1 1.8-1.8zM10 6h1.2a1.8 1.8 0 1 0-1.8-1.8zM6 10H4.8a1.8 1.8 0 1 0 1.8 1.8zM10 10h1.2a1.8 1.8 0 1 1-1.8 1.8z"/></symbol>
+    <symbol id="i-bell" viewBox="0 0 16 16"><path d="M8 2.2a3.6 3.6 0 0 1 3.6 3.6c0 3 1 4 1.4 4.4H3c.4-.4 1.4-1.4 1.4-4.4A3.6 3.6 0 0 1 8 2.2z"/><path d="M6.6 12.4a1.5 1.5 0 0 0 2.8 0"/></symbol>
+    <symbol id="i-chev-down" viewBox="0 0 16 16"><path d="M4 6.4L8 10.4l4-4"/></symbol>
+    <symbol id="i-chev-right" viewBox="0 0 16 16"><path d="M6.4 4l4 4-4 4"/></symbol>
+    <symbol id="i-x" viewBox="0 0 16 16"><path d="M4.2 4.2l7.6 7.6M11.8 4.2l-7.6 7.6"/></symbol>
+    <symbol id="i-check" viewBox="0 0 16 16"><path d="M3.4 8.4l3 3 6.2-7"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 16 16"><path d="M8 3.2v9.6M3.2 8h9.6"/></symbol>
+    <symbol id="i-more" viewBox="0 0 16 16"><circle cx="3.2" cy="8" r="1.1" fill="currentColor" stroke="none"/><circle cx="8" cy="8" r="1.1" fill="currentColor" stroke="none"/><circle cx="12.8" cy="8" r="1.1" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 16 16"><rect x="5.6" y="5.6" width="7.4" height="7.4" rx="1"/><path d="M3 10.4V4.2c0-.7.5-1.2 1.2-1.2h6.2"/></symbol>
+    <symbol id="i-external" viewBox="0 0 16 16"><path d="M9.4 3.4h3.2v3.2"/><path d="M12.6 3.4L7.4 8.6"/><path d="M11 9.4v3.2H3.4V5h3.2"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 16 16"><path d="M13 8a5 5 0 1 1-1.6-3.7"/><path d="M13.4 2.6v3.2h-3.2"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 16 16"><path d="M6 3.4v9.2M10 3.4v9.2"/></symbol>
+    <symbol id="i-play" viewBox="0 0 16 16"><path d="M5 3.4l7.2 4.6L5 12.6z"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 16 16"><rect x="4.4" y="4.4" width="7.2" height="7.2" rx="1"/></symbol>
+    <symbol id="i-warn" viewBox="0 0 16 16"><path d="M8 2.5l5.9 10.4H2.1z"/><path d="M8 6.4v3.2M8 11.6v.1"/></symbol>
+    <symbol id="i-info" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.8"/><path d="M8 7.2v4M8 5.1v.1"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 16 16"><rect x="3.6" y="7" width="8.8" height="6.4" rx="1.2"/><path d="M5.6 7V5.4a2.4 2.4 0 0 1 4.8 0V7"/></symbol>
+    <symbol id="i-branch" viewBox="0 0 16 16"><circle cx="4.6" cy="3.6" r="1.4"/><circle cx="4.6" cy="12.4" r="1.4"/><circle cx="11.4" cy="5.4" r="1.4"/><path d="M4.6 5v6M6 3.6h3.4a2 2 0 0 1 2 2"/></symbol>
+    <symbol id="i-terminal" viewBox="0 0 16 16"><rect x="2.4" y="3.4" width="11.2" height="9.2" rx="1.4"/><path d="M5 6.4l2 1.6-2 1.6M8.6 10.4h3"/></symbol>
+    <symbol id="i-diff" viewBox="0 0 16 16"><rect x="2.6" y="2.6" width="10.8" height="10.8" rx="1.2"/><path d="M5.4 5.8h2.2M6.5 4.7v2.2M8.6 10.4h2.2"/></symbol>
+    <symbol id="i-user" viewBox="0 0 16 16"><circle cx="8" cy="5.4" r="2.6"/><path d="M3.4 13.4c0-2.4 2-4 4.6-4s4.6 1.6 4.6 4"/></symbol>
+    <symbol id="i-sort" viewBox="0 0 16 16"><path d="M5 3v10M5 3L3.2 5M5 3l1.8 2"/><path d="M11 13V3M11 13l-1.8-2M11 13l1.8-2"/></symbol>
+    <symbol id="i-filter" viewBox="0 0 16 16"><path d="M2.6 3.4h10.8L9 8.6v4.2l-2 1V8.6z"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 16 16"><path d="M3.4 4.6h9.2M6.4 4.6V3.2h3.2v1.4M4.6 4.6l.6 9h5.6l.6-9"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 16 16"><path d="M1.8 8c1.6-3 3.8-4.4 6.2-4.4S12.6 5 14.2 8c-1.6 3-3.8 4.4-6.2 4.4S3.4 11 1.8 8z"/><circle cx="8" cy="8" r="1.9"/></symbol>
+    <symbol id="i-hand" viewBox="0 0 16 16"><path d="M5.4 8.4V4a1.1 1.1 0 0 1 2.2 0v4.4M7.6 8.4V3.4a1.1 1.1 0 0 1 2.2 0v5M9.8 8.4V4.6a1.1 1.1 0 0 1 2.2 0v5.8c0 2.2-1.6 3.8-3.8 3.8H7.8c-1.1 0-2-.5-2.6-1.4L3.4 9.6c-.5-.8.6-1.7 1.3-1l1.1 1.2"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 16 16"><path d="M13 9.4A5.6 5.6 0 0 1 6.6 3 5.8 5.8 0 1 0 13 9.4z"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.8"/><path d="M8 1.6v1.6M8 12.8v1.6M1.6 8h1.6M12.8 8h1.6M3.5 3.5l1.1 1.1M11.4 11.4l1.1 1.1M12.5 3.5l-1.1 1.1M4.6 11.4l-1.1 1.1"/></symbol>
+    <symbol id="i-help" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.8"/><path d="M6.4 6.2a1.7 1.7 0 1 1 2.4 1.6c-.5.3-.8.7-.8 1.3v.3M8 11.7v.1"/></symbol>
+    <symbol id="i-layers" viewBox="0 0 16 16"><path d="M8 2.4l5.6 3-5.6 3-5.6-3z"/><path d="M2.4 8.4l5.6 3 5.6-3"/><path d="M2.4 11.4l5.6 3 5.6-3"/></symbol>
+    <symbol id="i-inbox" viewBox="0 0 16 16"><path d="M2.4 9.4l2-5.4h7.2l2 5.4v3.2H2.4z"/><path d="M2.4 9.4h3.4l.8 1.4h2.8l.8-1.4h3.4"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 16 16"><path d="M2.8 4.4h10.4M2.8 8h10.4M2.8 11.6h10.4"/></symbol>
+  </defs>
+</svg>
+
+<div class="iz-app">
+
+  <header class="iz-topbar" role="banner">
+    <button class="iz-iconbtn iz-menu-btn" data-act="nav-drawer" aria-label="Open navigation" aria-controls="sidebar" data-tip="Navigation">
+      <svg class="iz-icon" aria-hidden="true"><use href="#i-menu"></use></svg>
+    </button>
+
+    <a class="iz-brand" href="#/overview" aria-label="INTELLIGENZ — Overview">
+      <span class="iz-mark" aria-hidden="true"></span>
+      <span class="iz-wordmark">Intelligenz<span> · Control Centre</span></span>
+    </a>
+
+    <button class="iz-searchbtn" data-act="search" aria-label="Search runs, approvals, evidence. Keyboard shortcut Command Shift F.">
+      <svg class="iz-icon" aria-hidden="true"><use href="#i-search"></use></svg>
+      <span>Search runs, approvals, evidence…</span>
+      <kbd>⌘⇧F</kbd>
+    </button>
+
+    <div class="iz-topbar__right">
+      <div id="mode-slot"></div>
+      <span class="iz-topbar__divider" aria-hidden="true"></span>
+      <button class="iz-iconbtn" data-act="state-menu" aria-label="Preview a surface state" data-tip="State inspector">
+        <svg class="iz-icon" aria-hidden="true"><use href="#i-layers"></use></svg>
+      </button>
+      <button class="iz-iconbtn" data-act="notif" aria-label="Notifications" data-tip="Notifications" style="position:relative">
+        <svg class="iz-icon" aria-hidden="true"><use href="#i-bell"></use></svg>
+        <span class="iz-badge iz-badge--awaiting" id="notif-count" style="position:absolute;top:-3px;right:-5px">4</span>
+      </button>
+      <button class="iz-iconbtn" data-act="account" aria-label="Account menu for M. Okafor" aria-haspopup="menu" data-tip="Account">
+        <span class="iz-avatar" style="width:22px;height:22px;font-size:11px">MO</span>
+      </button>
+    </div>
+  </header>
+
+  <aside class="iz-sidebar" id="sidebar" aria-label="Sidebar">
+    <div class="iz-sidebar__head">
+      <span class="iz-sidebar__org">
+        <span class="iz-sidebar__orgname">Northwind Labs</span>
+        <span class="iz-sidebar__orgplan">Enterprise · 3 workspaces</span>
+      </span>
+      <button class="iz-iconbtn" data-act="account" aria-label="Account menu" data-tip="Account">
+        <svg class="iz-icon" aria-hidden="true"><use href="#i-user"></use></svg>
+      </button>
+    </div>
+
+    <button class="iz-wsbtn" data-act="workspace" aria-haspopup="menu" aria-label="Switch workspace, current ReveilChat">
+      <span class="iz-avatar iz-avatar--light" style="width:18px;height:18px;font-size:11px">RC</span>
+      <span class="iz-truncate">ReveilChat</span>
+      <svg class="iz-icon" aria-hidden="true"><use href="#i-chev-down"></use></svg>
+    </button>
+
+    <nav class="iz-nav" id="nav" aria-label="Primary"></nav>
+
+    <div class="iz-sidebar__foot">
+      <div class="iz-sidebar__status">
+        <span class="iz-dot" aria-hidden="true"></span>
+        <span>Copilot · prod · healthy</span>
+      </div>
+      <div class="iz-sidebar__tools">
+        <button class="iz-iconbtn" data-act="state-menu" aria-label="State inspector" data-tip="State inspector">
+          <svg class="iz-icon" aria-hidden="true"><use href="#i-layers"></use></svg>
+        </button>
+        <button class="iz-iconbtn" data-act="theme" aria-label="Switch colour theme" data-tip="Switch theme">
+          <svg class="iz-icon" aria-hidden="true"><use href="#i-moon"></use></svg>
+        </button>
+        <button class="iz-iconbtn" data-act="shortcuts" aria-label="Keyboard shortcuts" data-tip="Keyboard shortcuts">
+          <svg class="iz-icon" aria-hidden="true"><use href="#i-help"></use></svg>
+        </button>
+        <button class="iz-iconbtn" data-act="notice" aria-label="About this simulated prototype" data-tip="Simulated data" style="margin-left:auto">
+          <svg class="iz-icon" aria-hidden="true"><use href="#i-info"></use></svg>
+        </button>
+      </div>
+    </div>
+  </aside>
+
+  <div class="iz-scrim iz-scrim--nav" id="sidebar-scrim" aria-hidden="true"></div>
+
+  <div class="iz-maincol">
+    <div class="iz-scopebar" id="scopebar" role="region" aria-label="Scope"></div>
+    <div class="iz-statebar" id="statebar" hidden role="status"></div>
+    <main id="main" tabindex="-1"></main>
+  </div>
+
+</div>
+
+<div id="drawer-root" hidden></div>
+<div id="toast-root" class="iz-toasts" role="region" aria-label="Notifications" aria-live="polite"></div>
+<div id="tip" class="iz-tip" role="tooltip" hidden></div>
+
+<noscript>
+  <div style="padding:24px;font:14px system-ui">
+    <strong>JavaScript is disabled.</strong> This prototype renders entirely from local fixture data and needs
+    JavaScript enabled. No network access is used at any point.
+  </div>
+</noscript>
+
+<script src="assets/js/data.js"></script>
+<script src="assets/js/app.js"></script>
+<script src="assets/js/router.js"></script>
+</body>
+</html>

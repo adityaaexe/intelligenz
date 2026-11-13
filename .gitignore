@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build output
+dist/
+build/
+.next/
+out/
+*.tsbuildinfo
+
+# Test and coverage output
+coverage/
+.vitest/
+playwright-report/
+test-results/
+.playwright/
+
+# Local runtime state (contract §4, §15 A5) — never committed, never backed up
+.temporal/
+.artifacts/
+
+# Turbo (not used today; harmless if a later unit adds it)
+.turbo/
+
+# Secrets — .env is never committed, .env.example always is
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log*
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json

@@ -1,0 +1,106 @@
+name: CI
+
+# Authored, never observed to run: there is no `gh` CLI and no push credential on
+# this host (baseline §7.2). Treat CI status as IMPLEMENTED, never VERIFIED.
+# Local equivalent of this workflow: `bash infra/scripts/verify.sh`.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: intelligenz
+          POSTGRES_PASSWORD: intelligenz
+          POSTGRES_DB: intelligenz_dev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U intelligenz -d intelligenz_dev"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:8
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      NODE_ENV: test
+      DATABASE_URL: postgresql://intelligenz:intelligenz@localhost:5432/intelligenz_dev
+      TEST_DATABASE_URL: postgresql://intelligenz:intelligenz@localhost:5432/intelligenz_test
+      REDIS_URL: redis://localhost:6379
+      # CI-only placeholder. No real credential belongs in this file.
+      JWT_SECRET: ci-placeholder-not-a-real-secret
+      ARTIFACT_ROOT: .artifacts
+      LOG_LEVEL: warn
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # corepack ships with Node, so pnpm is pinned by `packageManager` in
+      # package.json rather than by a separate third-party action.
+      - name: Enable pnpm via corepack
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.15.1 --activate
+          pnpm --version
+
+      # Resolved after pnpm exists, otherwise `pnpm store path` cannot run and a
+      # setup-node `cache: pnpm` step would silently cache nothing.
+      - name: Resolve pnpm store path
+        id: pnpm-store
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Each gate is a hard failure. No continue-on-error anywhere: a red
+      # typecheck must stop the pipeline, not be reported as a note.
+      - name: Typecheck
+        run: pnpm -w typecheck
+
+      - name: Lint
+        run: pnpm -w lint
+
+      - name: Test
+        run: pnpm -w test
+
+      - name: Build
+        run: pnpm -w build

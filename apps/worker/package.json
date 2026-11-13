@@ -1,0 +1,21 @@
+{
+  "name": "@intelligenz/worker",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "build": "tsc --noEmit -p tsconfig.json",
+    "start": "node dist/main.js",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@intelligenz/agent-runtime": "workspace:*",
+    "@intelligenz/contracts": "workspace:*",
+    "@intelligenz/database": "workspace:*",
+    "@temporalio/activity": "1.25.0",
+    "@temporalio/client": "1.25.0",
+    "@temporalio/worker": "1.25.0",
+    "@temporalio/workflow": "1.25.0"
+  }
+}
