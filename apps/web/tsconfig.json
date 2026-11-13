@@ -5,8 +5,20 @@
     "jsx": "preserve",
     "allowJs": true,
     "incremental": true,
-    "plugins": [{ "name": "next" }]
+    "plugins": [{ "name": "next" }],
+    "paths": {
+      "react": ["apps/web/node_modules/@types/react"],
+      "react/jsx-runtime": ["apps/web/node_modules/@types/react/jsx-runtime"],
+      "react/jsx-dev-runtime": ["apps/web/node_modules/@types/react/jsx-dev-runtime"]
+    }
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "next.config.ts", ".next/types/**/*.ts"],
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "e2e/**/*.ts",
+    "next.config.ts",
+    "playwright.config.ts",
+    ".next/types/**/*.ts"
+  ],
   "exclude": ["node_modules", ".next"]
 }

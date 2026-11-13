@@ -3,6 +3,8 @@ node_modules/
 .pnpm-store/
 
 # Build output
+# Prisma client is generated from prisma/schema.prisma; `pnpm db:generate` recreates it.
+packages/database/generated/
 dist/
 build/
 .next/
@@ -15,6 +17,8 @@ coverage/
 playwright-report/
 test-results/
 .playwright/
+# E2E session file: a real bearer token, written by `e2e/global-setup.ts`
+**/e2e/.auth/
 
 # Local runtime state (contract §4, §15 A5) — never committed, never backed up
 .temporal/

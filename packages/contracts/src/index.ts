@@ -1,5 +1,13 @@
 /**
- * Placeholder export. DO-001 is a scaffolding unit: no Zod schemas, no event
- * envelope. Both arrive with the contracts unit (contract §7).
+ * `@intelligenz/contracts` — the wire contract shared by api, worker and web.
+ *
+ * Everything here is dependency-free except Zod: pure schemas, pure predicates.
+ * No Prisma, no Nest, no DOM. That is what lets the worker and the browser import
+ * the same state machine without dragging a database client along.
  */
-export const PACKAGE_NAME = '@intelligenz/contracts' as const;
+
+export * from './enums';
+export * from './event-envelope';
+export * from './dto';
+export * from './task-state-machine';
+export * from './approval';

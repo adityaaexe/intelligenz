@@ -19,6 +19,8 @@ export default tseslint.config(
       '**/playwright-report/**',
       '**/test-results/**',
       '**/*.d.ts',
+      // Generated Prisma client: `prisma generate` output, never hand-edited.
+      'packages/database/generated/**',
       // Frozen Phase 1 artifacts: deliberately not linted (contract §0).
       'prototype/**',
       'qa/**',

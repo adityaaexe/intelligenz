@@ -1,182 +1,243 @@
 # INTELLIGENZ
 
-An autonomous AI engineering and intelligence harness with an enterprise control plane.
+An autonomous AI engineering control plane. Phase 2 is a local vertical slice:
+organisation → workspace → project → task → Temporal workflow → simulated agent run
+→ artifact and evidence → audit event.
 
-This repository is currently a **Phase 2 scaffold**: workspace structure, toolchain, CI definition
-and local service scripts. It contains no product behaviour yet. Every export in `apps/*` and
-`packages/*` is a single placeholder constant.
+It runs on one host with PostgreSQL and the Temporal dev server. Redis is running but
+no Phase 2 code path uses it. It is **not production-ready**. The runtime is simulated
+and says so on screen. Read
+[`docs/engineering/DEPLOYMENT-READINESS.md`](docs/engineering/DEPLOYMENT-READINESS.md)
+before treating any part of it as deployable.
 
-If you are looking for the Phase 1 design work — tokens, component inventory, information
-architecture, and the four-screen prototype — it is still here and unchanged:
-`DESIGN.md`, `docs/design/**`, `prototype/**`, `qa/**`.
+> **Repository state.** The instructions below assume a checkout that contains the
+> Phase 2 source. At the time of writing the implementation is an uncommitted working
+> tree: the only commit is the scaffold. If a fresh clone contains no `apps/api/src`
+> or `apps/web/src`, the tree was never committed. See
+> `docs/engineering/DEPLOYMENT-READINESS.md` §2.3.
 
 ---
 
-## 1. State of the repository
+## What you get in five minutes
 
-| Layer | State | Note |
+- A control centre at `http://localhost:3100`, signed in as a seeded owner.
+- An Overview screen that reads live data from the API: system health, task queues,
+  agent activity, approvals, usage and cost, critical alerts.
+- Two regions and one line that say `Not instrumented`, because no API source exists.
+  They do not invent numbers.
+- A working Temporal workflow, started through the API rather than the browser, that
+  executes a simulated agent, writes a real artifact file, and records an audit trail.
+
+You do not get a coding agent. The runtime has no shell, no network and no model call.
+`LocalSimulatedRuntime` is deterministic and costs `$0.0000`.
+
+---
+
+## Prerequisites
+
+| Requirement | Version | Check |
 |---|---|---|
-| Monorepo + workspaces | present | pnpm workspaces, no Turborepo (contract §2) |
-| TypeScript + lint + tests | configured | `tsc --noEmit`, ESLint flat config, Vitest |
-| CI definition | authored, **never executed** | no `gh`, no push credential on this host |
-| Database | role + DB created | no schema, no migrations, no seed |
-| Temporal dev server | starts, proven reachable | no workflows, no worker bootstrap |
-| API | scaffold only | no modules, controllers, services or guards |
-| Web | scaffold only | no routes, components or layout |
-| Design system | scaffold only | tokens **not** ported yet |
+| Node.js | 22.x | `node -v` |
+| pnpm | 10.15.1 | `pnpm -v` |
+| PostgreSQL | 18, running on `localhost:5432` | `pg_isready` |
+| `sudo -u postgres psql` | passwordless | `sudo -u postgres psql -c 'select 1'` |
+| Network (first Temporal start only) | — | downloads the CLI to `~/.local/bin` |
 
-Do not read this repository as a working product. Contract §13 vocabulary applies to every claim in
-every document here: `VERIFIED`, `IMPLEMENTED`, `PARTIAL`, `BLOCKED`, `NOT IMPLEMENTED`.
+Docker is **not** required and is not installed. Ports **3000** and **4000** belong to
+another product’s live backend on this host. This project uses **3100** and **4100**.
+Do not stop the processes on 3000/4000.
 
-The binding engineering rules live in **`docs/engineering/PHASE-2-CONTRACT.md`** (including the
-v1.1 amendments). The measured starting point lives in `docs/engineering/PHASE-2-BASELINE.md`.
-Architecture decisions live in `docs/decisions/`.
-
----
-
-## 2. Requirements
-
-| Tool | Version | Verified on this host |
-|---|---|---|
-| Node | 22.x | v22.23.2 |
-| pnpm | 10.15.1 | 10.15.1 (via `packageManager`) |
-| PostgreSQL | 18 | 18.6, host instance, port 5432 |
-| Redis | 8 | 8.0.5, host instance, port 6379 |
-| Temporal CLI | 1.10+ | installed on demand into `~/.local/bin` |
-
-Docker is **not** used and is not installed. Local services are the host's PostgreSQL and Redis plus
-the Temporal dev server (SQLite-backed single binary).
-
----
-
-## 3. Ports
-
-| Service | Port | Why |
-|---|---|---|
-| Web (Next.js) | **3100** | 3000 is occupied by another product's backend on this host |
-| API (NestJS) | **4100** | 4000 is occupied by another product's backend on this host |
-| Temporal gRPC | 7233 | free |
-| Temporal UI | 8233 | free |
-| PostgreSQL | 5432 | host instance |
-| Redis | 6379 | host instance |
-
-`3000` and `4000` must never be bound by this project — see contract §15 A1. Do not kill processes
-listening on them; they belong to an unrelated system.
-
----
-
-## 4. Quickstart
+### Generate a signing key first
 
 ```bash
-# 1. dependencies
+cp .env.example .env
+sed -i "s|^JWT_SECRET=.*|JWT_SECRET=$(openssl rand -hex 32)|" .env
+```
+
+`.env.example` contains `JWT_SECRET=REPLACE_ME` on purpose. The API refuses to boot
+until it is replaced with a real key. That is the intended failure: a public signing
+key lets anyone mint a token for any user.
+
+---
+
+## Four commands
+
+```bash
+# 1. Install workspace dependencies
 pnpm install
 
-# 2. environment (one time)
-cp .env.example .env
+# 2. Create the role, three databases, apply migrations, and seed
+pnpm db:bootstrap && pnpm --filter @intelligenz/database db:seed
 
-# 3. database role + databases (idempotent)
-pnpm db:bootstrap
-
-# 4. Temporal dev server (separate terminal, foreground, Ctrl-C to stop)
+# 3. Terminal A — Temporal dev server (gRPC 7233, UI 8233, SQLite at .temporal/dev.db)
 pnpm temporal:start
 
-# 5. the quality gates
+# 4. Terminal B — API, web and worker
+pnpm dev
+```
+
+`pnpm db:bootstrap` does not seed. The seed command is separate; without it there are
+no users and login fails.
+
+Wait for `intelligenz api listening` in Terminal B, then open:
+
+```text
+http://localhost:3100/login
+```
+
+**Seeded login**
+
+| Email | Password | Role |
+|---|---|---|
+| `owner@northwind.test` | `Passw0rd!demo` | OWNER |
+| `admin@northwind.test` | `Passw0rd!demo` | ADMIN |
+| `member@northwind.test` | `Passw0rd!demo` | MEMBER |
+| `viewer@northwind.test` | `Passw0rd!demo` | VIEWER |
+
+After sign-in you land on the workspace Overview:
+
+```text
+http://localhost:3100/reveilchat/overview
+```
+
+The path is `/{workspace-slug}/overview`. The seeded workspace slug is `reveilchat`.
+
+---
+
+## Ports
+
+| Service | Port | Notes |
+|---|---:|---|
+| Web (Next.js) | **3100** | `http://localhost:3100` |
+| API (NestJS) | **4100** | `http://localhost:4100`, routes under `/v1` |
+| Temporal gRPC | 7233 | dev server, `127.0.0.1` only |
+| Temporal UI | 8233 | `http://localhost:8233` |
+| PostgreSQL | 5432 | host instance |
+| Redis | 6379 | running, declared, unused by Phase 2 code |
+
+Do not use 3000 or 4000. The API rejects them at boot.
+
+---
+
+## Verify it is alive
+
+```bash
+curl -s http://localhost:4100/health/ready
+```
+
+Ready:
+
+```json
+{"status":"ready","service":"intelligenz-api","checks":{"postgres":{"status":"up","latencyMs":11},"temporal":{"status":"up","latencyMs":5}},"ageMs":0}
+```
+
+`503` means a dependency is down; the body names which one. The Overview shows the same
+state and does not fabricate health.
+
+Run the gates:
+
+```bash
 pnpm verify
 ```
 
-`pnpm dev` starts api + web + worker together. It currently refuses to run and prints which
-entrypoints are missing: the applications are not implemented yet.
+That runs typecheck, lint, unit/integration tests and build, sequentially. The two E2E
+suites are separate because they need the live stack:
+
+```bash
+pnpm --filter @intelligenz/api test:e2e
+pnpm --filter @intelligenz/web test:e2e
+```
+
+Current results, with literal output: [`docs/engineering/TEST-RESULTS.md`](docs/engineering/TEST-RESULTS.md).
 
 ---
 
-## 5. Layout
+## Repository map
 
-```
+```text
 apps/
-  web/                 @intelligenz/web        Next.js 15 App Router (scaffold)
-  api/                 @intelligenz/api        NestJS 11, REST under /v1 (scaffold)
-  worker/              @intelligenz/worker     Temporal worker (scaffold)
+  api/                 NestJS 11 · 14 routes (12 under /v1) · port 4100
+  web/                 Next.js 15 App Router · Overview + login · port 3100
+  worker/              Temporal worker · runTaskWorkflow + six activities
 packages/
-  contracts/           Zod schemas, shared types, event envelope (scaffold)
-  database/            Prisma schema + client (scaffold, no schema yet)
-  design-system/       --iz-* tokens + primitives (scaffold, no tokens yet)
-  agent-runtime/       AgentRuntime + LocalSimulatedRuntime (scaffold)
-infra/scripts/         bootstrap-db, start-temporal, dev, verify
-.github/workflows/     ci.yml
+  contracts/           Zod DTOs, event envelope, task state machine
+  database/            Prisma schema (12 models), migrations, seed
+  design-system/       138 --iz-* tokens, 14 component modules
+  agent-runtime/       AgentRuntime port + LocalSimulatedRuntime
+infra/scripts/         bootstrap-db · start-temporal · dev · verify
 docs/
-  decisions/           ADR-001 … ADR-010
-  engineering/         contract, baseline, implementation plan
-  design/              FROZEN Phase 1 design output
-prototype/             FROZEN Phase 1 prototype (plain HTML/CSS/JS, zero dependencies)
+  decisions/           ADR-001 … ADR-010, OPEN-DECISIONS
+  engineering/         contract, baseline, plan, status, tests, security, deployment
+  design/              frozen Phase 1 design output
+prototype/             frozen Phase 1 prototype: plain HTML/CSS/JS, zero dependencies
 ```
 
-**Not created on purpose:** `apps/orchestrator`, `apps/research`, `apps/engineering`,
-`apps/creative`. They have no behaviour yet; scaffolding empty services is speculative
-(contract §3, ADR-002).
+Not created on purpose: `apps/orchestrator`, `apps/research`, `apps/engineering`,
+`apps/creative`. They have no behaviour yet.
 
 ---
 
-## 6. Scripts
+## What is real and what is simulated
 
-| Command | What it does |
+**Real:** PostgreSQL rows, tenant scoping, role checks, task state machine, approvals,
+Temporal workflow execution, workflow run ids, artifact files with SHA-256 checksums,
+audit events with correlation ids.
+
+**Simulated:** the agent’s work. No shell, no network, no repository read, no model
+call, no code change, no cost. `AgentRun.model` is the literal string `simulated`. The
+Overview labels a zero recorded cost as `Simulated`; in this build that is the only
+runtime, so the label is accurate.
+
+**Not implemented:** everything except Overview. Fifteen of sixteen navigation
+destinations are placeholders. Approvals and task detail exist as APIs with no screens.
+There is no mutation UI: you can read, not create, run, cancel or approve in the browser.
+
+The full list: [`docs/engineering/KNOWN-LIMITATIONS.md`](docs/engineering/KNOWN-LIMITATIONS.md).
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| API exits at boot with `JWT_SECRET is a placeholder…` | `.env` still has `REPLACE_ME` or a weak value | Run the `openssl rand -hex 32` command above |
+| Login fails for every account | Database was migrated but not seeded | `pnpm --filter @intelligenz/database db:seed` |
+| `EADDRINUSE` on 3100 or 4100 | Another process owns the port | `ss -ltnp "sport = :4100"`; stop only a process you started |
+| `/health/ready` returns `503` with `temporal: down` | Temporal dev server is not running | `pnpm temporal:start` |
+| Overview says the API is unreachable | API is down or `NEXT_PUBLIC_API_URL` is wrong | Check `http://localhost:4100/health` |
+| Worker logs `connection refused` | Temporal is not running | Start Temporal before `pnpm dev` |
+| `sudo: a password is required` during bootstrap | The host does not allow passwordless `sudo -u postgres` | Run `bootstrap-db.sh` as a user with that access, or create the role manually |
+
+---
+
+## Documentation
+
+| Document | What it answers |
 |---|---|
-| `pnpm typecheck` | `tsc --noEmit` in every workspace |
-| `pnpm lint` | ESLint flat config over the repo, `--max-warnings=0` |
-| `pnpm test` | Vitest (1 toolchain smoke test today) |
-| `pnpm build` | build step of every workspace that has one — the three apps typecheck; packages export source and have no emit step yet |
-| `pnpm verify` | the four gates above, sequentially, with a pass/fail summary |
-| `pnpm dev` | api + web + worker together (blocked until entrypoints exist) |
-| `pnpm db:bootstrap` | creates role `intelligenz`, DBs `intelligenz_dev` / `intelligenz_test` |
-| `pnpm temporal:start` | installs the Temporal CLI if missing, then starts the dev server |
-
-Scripts are `set -euo pipefail`, live in `infra/scripts/`, and contain no credential beyond the
-documented local dev values (`intelligenz` / `intelligenz`).
+| [`docs/engineering/PHASE-2-CONTRACT.md`](docs/engineering/PHASE-2-CONTRACT.md) | The binding Phase 2 rules, including §15 amendments |
+| [`docs/engineering/IMPLEMENTATION-STATUS.md`](docs/engineering/IMPLEMENTATION-STATUS.md) | Per-unit status and the vertical slice, hop by hop |
+| [`docs/engineering/TEST-RESULTS.md`](docs/engineering/TEST-RESULTS.md) | Literal gate output and the contract test-case mapping |
+| [`docs/engineering/SECURITY-RESULTS.md`](docs/engineering/SECURITY-RESULTS.md) | The Critical finding, each fix, and what remains open |
+| [`docs/engineering/DEPLOYMENT-READINESS.md`](docs/engineering/DEPLOYMENT-READINESS.md) | Why this is not deployable, and the path to staging |
+| [`docs/engineering/KNOWN-LIMITATIONS.md`](docs/engineering/KNOWN-LIMITATIONS.md) | Forty-two limitations, stated plainly |
+| [`docs/decisions/`](docs/decisions/) | ADR-001 … ADR-010 and the open product decisions |
+| [`apps/api/api-contract.md`](apps/api/api-contract.md) | Route map, envelopes, error codes, state machine |
+| [`DESIGN.md`](DESIGN.md) · [`docs/design/`](docs/design/) · [`prototype/`](prototype/) | Frozen Phase 1 design authority |
 
 ---
 
-## 7. Environment
+## Status vocabulary
 
-`.env` is gitignored; `.env.example` is committed and documents every variable. Nothing in the
-template is a real credential. `JWT_SECRET` is a placeholder — generate one with
-`openssl rand -hex 32` for anything that is not local development.
+Every claim in the engineering documents uses contract §13:
 
-Local-only values that must stay consistent across processes:
+- `VERIFIED` — reproduced by a test or inspection; the output is quoted.
+- `IMPLEMENTED` — code exists; runtime verification is incomplete.
+- `PARTIAL` — some required behaviour exists.
+- `BLOCKED` — an external dependency prevents progress; it is named.
+- `NOT IMPLEMENTED` — nothing exists.
 
-```
-API  http://localhost:4100
-WEB  http://localhost:3100
-DB   postgresql://intelligenz:intelligenz@localhost:5432/intelligenz_dev
-REDIS redis://localhost:6379
-TEMPORAL localhost:7233  (namespace default, task queue intelligenz-tasks)
-ARTIFACTS .artifacts/    (gitignored; worker, API and seed must agree)
-```
+A stub, fixture or mock is never described as a working integration.
 
 ---
 
-## 8. What is deliberately absent
-
-State this before reporting anything as complete:
-
-- No authentication, no tenancy enforcement, no permissions.
-- No database schema, migrations, or seed data.
-- No API endpoints. `GET /health` does not exist yet.
-- No UI routes. The Overview screen does not exist yet.
-- No Temporal workflows or activities.
-- No design tokens in `packages/design-system`.
-- No container images (Docker absent).
-- No CI run evidence (no `gh`, no push credential).
-- No backup or restore procedure for PostgreSQL, the Temporal SQLite store, or `.artifacts/`.
-
-Whether a given unit is `VERIFIED` is a question about command output, not about intent. Reproduce
-it with `pnpm verify`.
-
----
-
-## 9. Phase 1 artifacts (frozen)
-
-`DESIGN.md`, `docs/design/**`, `prototype/**` and `qa/**` are the Phase 1 output and are **not**
-edited by Phase 2 engineering work. They remain the design authority; engineering facts that
-contradict them are recorded as amendments, not by rewriting the design.
-
-The prototype has zero runtime dependencies and no network access. Open `prototype/index.html`
-directly in a browser to view it. Its fixtures are simulated and must never be presented as live data.
+Private and unlicensed. Do not deploy this build to a shared environment.

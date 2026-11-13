@@ -14,6 +14,11 @@ DB_ROLE="${DB_ROLE:-intelligenz}"
 DB_PASSWORD="${DB_PASSWORD:-intelligenz}"
 DB_NAME="${DB_NAME:-intelligenz_dev}"
 DB_TEST_NAME="${DB_TEST_NAME:-intelligenz_test}"
+# `prisma migrate dev` needs a scratch database it may drop and recreate. The
+# application role deliberately has no CREATEDB privilege, so the shadow database
+# is provisioned here and referenced by SHADOW_DATABASE_URL. `migrate deploy`
+# (bootstrap and CI) never touches it.
+DB_SHADOW_NAME="${DB_SHADOW_NAME:-intelligenz_shadow}"
 
 log() { printf '[db] %s\n' "$*"; }
 fail() {
@@ -76,6 +81,7 @@ create_database "$DB_NAME"
 # Separate database so integration tests cannot truncate development data
 # (baseline §7.1: no Docker means no disposable container per test run).
 create_database "$DB_TEST_NAME"
+create_database "$DB_SHADOW_NAME"
 
 # Prisma migrations are applied only once the database package owns a schema.
 # Until then this stage reports that it has nothing to do instead of failing.

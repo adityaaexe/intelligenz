@@ -1,0 +1,151 @@
+/* ==========================================================================
+   INTELLIGENZ — Design tokens
+   1:1 with DESIGN.md §14. Do not add tokens here without updating DESIGN.md.
+   ========================================================================== */
+
+:root {
+  /* colour — surfaces */
+  --iz-color-canvas: #FFFFFF;
+  --iz-color-surface-1: #F7F9FB;
+  --iz-color-surface-2: #F1F3F5;
+  --iz-color-surface-3: #E8EBEE;
+  --iz-color-chrome: #151A20;
+  --iz-color-chrome-raised: #20252B;
+  --iz-color-chrome-hover: #1C222A;
+  --iz-color-chrome-selected: #232930;
+
+  /* colour — text */
+  --iz-ink-1: #14171D;
+  --iz-ink-2: #42474D;
+  --iz-ink-3: #5E6268;
+  --iz-ink-disabled: #8F9297;
+  --iz-on-chrome-1: #F9FAFB;
+  --iz-on-chrome-2: #BBBEC3;
+  --iz-on-chrome-3: #8F9297;
+
+  /* colour — borders + focus + seal */
+  --iz-border-subtle: #E4E6EA;
+  --iz-border-default: #D6D9DE;
+  --iz-border-strong: #B4B8BD;
+  --iz-border-control: #898C92;
+  --iz-focus: #5D4DBE;
+  --iz-focus-on-chrome: #9C96F8;
+  --iz-seal: #C01B31;
+
+  /* colour — status */
+  --iz-status-active-fg: #0059A7;    --iz-status-active-bg: #E8F3FF;
+  --iz-status-queued-fg: #4A4D52;    --iz-status-queued-bg: #F1F2F4;
+  --iz-status-completed-fg: #006731; --iz-status-completed-bg: #E4F8E8;
+  --iz-status-failed-fg: #B71824;    --iz-status-failed-bg: #FFEDEB;
+  --iz-status-awaiting-fg: #8A5700;  --iz-status-awaiting-bg: #FEF0D4;
+  --iz-status-degraded-fg: #A14206;  --iz-status-degraded-bg: #FFECE2;
+  --iz-status-offline-fg: #4B4D50;   --iz-status-offline-bg: #EEEEF0;
+
+  /* colour — risk + viz */
+  --iz-risk-low: #5E6268;
+  --iz-risk-medium: #8A5700;
+  --iz-risk-high: #A14206;
+  --iz-risk-critical: #B71824;
+  --iz-viz-1: #2A61B1; --iz-viz-2: #007C84; --iz-viz-3: #946900;
+  --iz-viz-4: #93398E; --iz-viz-5: #1F6F3D; --iz-viz-6: #6A727E;
+
+  /* type */
+  --iz-font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --iz-font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --iz-text-micro: 11px;   --iz-leading-micro: 14px;
+  --iz-text-xs: 12px;      --iz-leading-xs: 16px;
+  --iz-text-sm: 13px;      --iz-leading-sm: 18px;
+  --iz-text-base: 14px;    --iz-leading-base: 20px;
+  --iz-text-md: 16px;      --iz-leading-md: 22px;
+  --iz-text-lg: 18px;      --iz-leading-lg: 24px;
+  --iz-text-xl: 22px;      --iz-leading-xl: 28px;
+  --iz-text-2xl: 28px;     --iz-leading-2xl: 32px;
+  --iz-text-mono-sm: 12px; --iz-leading-mono-sm: 16px;
+  --iz-text-mono-xs: 11px; --iz-leading-mono-xs: 14px;
+  --iz-weight-regular: 400;
+  --iz-weight-medium: 500;
+  --iz-weight-semibold: 600;
+  --iz-tracking-micro: 0.04em;
+  --iz-tracking-tight: -0.012em;
+  --iz-tracking-tighter: -0.016em;
+
+  /* space */
+  --iz-space-0: 0;    --iz-space-2: 2px;   --iz-space-4: 4px;   --iz-space-6: 6px;
+  --iz-space-8: 8px;  --iz-space-10: 10px; --iz-space-12: 12px; --iz-space-16: 16px;
+  --iz-space-20: 20px; --iz-space-24: 24px; --iz-space-32: 32px; --iz-space-40: 40px;
+  --iz-space-48: 48px; --iz-space-64: 64px; --iz-space-80: 80px;
+
+  /* sizing */
+  --iz-control-sm: 24px; --iz-control-md: 28px; --iz-control-lg: 32px; --iz-control-xl: 36px;
+  --iz-row-compact: 28px; --iz-row-default: 32px; --iz-row-comfortable: 40px;
+  --iz-row-header-h: 32px;
+  --iz-sidebar-w: 264px; --iz-sidebar-rail-w: 64px;
+  --iz-topbar-h: 56px; --iz-scopebar-h: 40px;
+  --iz-trace-rail-w: 400px; --iz-queue-pane-w: 360px; --iz-activity-rail-w: 360px;
+  --iz-max-content: 1760px;
+
+  /* radius + shadow */
+  --iz-radius-xs: 2px; --iz-radius-sm: 4px; --iz-radius-md: 6px; --iz-radius-lg: 8px;
+  --iz-radius-full: 999px;
+  --iz-shadow-popover: 0 1px 2px rgb(16 18 23 / 0.06), 0 6px 16px -4px rgb(16 18 23 / 0.14);
+  --iz-shadow-drawer: -8px 0 24px -8px rgb(16 18 23 / 0.18);
+  --iz-shadow-modal: 0 2px 4px rgb(16 18 23 / 0.06), 0 20px 40px -12px rgb(16 18 23 / 0.22);
+  --iz-shadow-toast: 0 1px 2px rgb(16 18 23 / 0.10), 0 10px 24px -6px rgb(16 18 23 / 0.20);
+
+  /* motion */
+  --iz-dur-0: 0ms; --iz-dur-fast: 90ms; --iz-dur-base: 140ms;
+  --iz-dur-slow: 200ms; --iz-dur-enter: 240ms;
+  --iz-ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --iz-ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --iz-ease-linear: linear;
+
+  /* z */
+  --iz-z-base: 0; --iz-z-sticky: 10; --iz-z-chrome: 20; --iz-z-dropdown: 100;
+  --iz-z-drawer: 200; --iz-z-scrim: 290; --iz-z-modal: 300; --iz-z-palette: 320;
+  --iz-z-toast: 400; --iz-z-tooltip: 500;
+
+  /* breakpoints (documentation tokens; media queries use literal px) */
+  --iz-bp-sm: 640px; --iz-bp-md: 768px; --iz-bp-lg: 1024px;
+  --iz-bp-xl: 1280px; --iz-bp-2xl: 1440px; --iz-bp-3xl: 1680px;
+}
+
+:root[data-theme="dark"] {
+  --iz-color-canvas: #101316;
+  --iz-color-surface-1: #171A1E;
+  --iz-color-surface-2: #1E2125;
+  --iz-color-surface-3: #24282D;
+  --iz-color-chrome: #0A0C0F;
+  --iz-color-chrome-raised: #14171B;
+  --iz-color-chrome-hover: #121519;
+  --iz-color-chrome-selected: #1B1F24;
+  --iz-ink-1: #F0F2F4;
+  --iz-ink-2: #B8BBBE;
+  --iz-ink-3: #96989D;
+  --iz-ink-disabled: #6C6F74;
+  --iz-on-chrome-1: #F0F2F4;
+  --iz-on-chrome-2: #B8BBBE;
+  --iz-on-chrome-3: #8A8D93;
+  --iz-border-subtle: #23272C;
+  --iz-border-default: #2B2E33;
+  --iz-border-strong: #3A3E44;
+  --iz-border-control: #70757C;
+  --iz-focus: #9C96F8;
+  --iz-focus-on-chrome: #B6B3FF;
+  --iz-status-active-fg: #7ABDFF;    --iz-status-active-bg: color-mix(in oklab, #7ABDFF 16%, #101316);
+  --iz-status-queued-fg: #A8ACB2;    --iz-status-queued-bg: color-mix(in oklab, #A8ACB2 14%, #101316);
+  --iz-status-completed-fg: #7FCC94; --iz-status-completed-bg: color-mix(in oklab, #7FCC94 16%, #101316);
+  --iz-status-failed-fg: #FB817A;    --iz-status-failed-bg: color-mix(in oklab, #FB817A 16%, #101316);
+  --iz-status-awaiting-fg: #E8BE62;  --iz-status-awaiting-bg: color-mix(in oklab, #E8BE62 16%, #101316);
+  --iz-status-degraded-fg: #FC9B6F;  --iz-status-degraded-bg: color-mix(in oklab, #FC9B6F 16%, #101316);
+  --iz-status-offline-fg: #8A8D93;   --iz-status-offline-bg: color-mix(in oklab, #8A8D93 14%, #101316);
+  --iz-risk-low: #96989D;
+  --iz-risk-medium: #E8BE62;
+  --iz-risk-high: #FC9B6F;
+  --iz-risk-critical: #FB817A;
+  --iz-viz-1: #6FA3F0; --iz-viz-2: #4FC3CB; --iz-viz-3: #D9AE5A;
+  --iz-viz-4: #D08BCB; --iz-viz-5: #6FC08A; --iz-viz-6: #9AA1AB;
+  --iz-shadow-popover: 0 1px 2px rgb(0 0 0 / 0.4), 0 6px 16px -4px rgb(0 0 0 / 0.5);
+  --iz-shadow-drawer: -8px 0 24px -8px rgb(0 0 0 / 0.55);
+  --iz-shadow-modal: 0 2px 4px rgb(0 0 0 / 0.4), 0 20px 40px -12px rgb(0 0 0 / 0.6);
+  --iz-shadow-toast: 0 1px 2px rgb(0 0 0 / 0.5), 0 10px 24px -6px rgb(0 0 0 / 0.55);
+}

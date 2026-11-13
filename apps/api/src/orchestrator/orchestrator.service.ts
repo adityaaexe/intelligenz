@@ -1,0 +1,311 @@
+import {
+  Client,
+  Connection,
+  WorkflowExecutionAlreadyStartedError,
+  WorkflowIdReusePolicy,
+} from '@temporalio/client';
+import { Inject, Injectable, type OnApplicationShutdown } from '@nestjs/common';
+
+import { APP_CONFIG, type AppConfig, type TemporalConfig } from '../config/app-config';
+
+/**
+ * Temporal is the only orchestrator (contract §9, §16).
+ *
+ * ## Literals are copied, not composed
+ *
+ * `runTaskWorkflow` and the `intelligenz-tasks` queue appear in both this app and
+ * `apps/worker`. A shared constant would need a package that both can import
+ * without dragging Prisma into a worker's workflow bundle; instead the literals are
+ * declared here and in §16, and the constants below name them so a drift is a
+ * one-line diff.
+ *
+ * ## Failure is typed, never silent
+ *
+ * Starting a workflow has three outcomes:
+ *   - started (`202`) — a `WorkflowRun` row exists and Temporal owns the execution;
+ *   - already running (`409`) — an execution with the deterministic workflow id is
+ *     still open, so Temporal refuses the duplicate;
+ *   - unreachable (`503 ORCHESTRATOR_UNAVAILABLE`) — the task must not be left
+ *     `running`, because nothing is running it.
+ *
+ * ## A closed run must not burn the workflow id
+ *
+ * The workflow id is `task-<taskId>` and it is never reused for a *successful* run.
+ * But a run that closed as failed, cancelled or terminated is exactly the case the user
+ * retries, and `REJECT_DUPLICATE` made that retry impossible: the id stayed reserved
+ * forever, so every later `POST /run` was answered `409` with nothing running.
+ * `ALLOW_DUPLICATE_FAILED_ONLY` keeps the guard that matters — a duplicate of a *running*
+ * execution is still rejected — while letting a retry after a failed run start again.
+ */
+
+export const WORKFLOW_TYPE = 'runTaskWorkflow';
+export const WORKFLOW_ID_PREFIX = 'task-';
+
+/**
+ * Contract §16: `runTimeout: '10m'`. Declared as a named literal because the worker's
+ * client wrapper sets the same value and a drift must be a one-line diff.
+ */
+export const WORKFLOW_RUN_TIMEOUT = '10m';
+
+/**
+ * The policy the start uses. Exported so a test asserts the *service's* value rather
+ * than re-declaring the enum and accidentally asserting its own copy.
+ *
+ * `ALLOW_DUPLICATE_FAILED_ONLY` is the narrowest policy that permits a retry: a closed
+ * failed/cancelled/terminated execution may be replaced, a running one may not.
+ */
+export const WORKFLOW_ID_REUSE_POLICY = WorkflowIdReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY;
+
+/** Contract §16 signature. The API and the worker must agree on this object. */
+export interface RunTaskWorkflowInput {
+  readonly taskId: string;
+  readonly orgId: string;
+  readonly correlationId: string;
+}
+
+export interface StartedWorkflow {
+  readonly workflowId: string;
+  readonly runId: string;
+}
+
+export type ProbeResult =
+  | { readonly ok: true; readonly latencyMs: number }
+  | { readonly ok: false; readonly latencyMs: number; readonly detail: string };
+
+export type CancelResult = 'cancelled' | 'not_found';
+
+/** gRPC status codes that mean "the orchestrator cannot take work right now". */
+const GRPC_CANCELLED = 1;
+const GRPC_DEADLINE_EXCEEDED = 4;
+const GRPC_NOT_FOUND = 5;
+const GRPC_UNAVAILABLE = 14;
+
+export class OrchestratorUnavailableError extends Error {
+  constructor(message: string, override readonly cause?: unknown) {
+    super(message);
+    this.name = 'OrchestratorUnavailableError';
+  }
+}
+
+/**
+ * A duplicate start is not an outage. Exported as a predicate so callers do not have
+ * to import Temporal's error class — the task service should not need to know which
+ * engine implements the orchestrator.
+ */
+export function isWorkflowAlreadyStartedError(error: unknown): boolean {
+  return error instanceof WorkflowExecutionAlreadyStartedError;
+}
+
+@Injectable()
+export class OrchestratorService implements OnApplicationShutdown {
+  private client?: Client;
+  private connection?: Connection;
+
+  constructor(@Inject(APP_CONFIG) private readonly config: AppConfig) {}
+
+  /**
+   * A getter, not a field initializer: with `useDefineForClassFields` a field
+   * initializer runs before the constructor body assigns parameter properties, so
+   * `private readonly temporal = this.config.temporal` would read `undefined`.
+   */
+  private get temporal(): TemporalConfig {
+    return this.config.temporal;
+  }
+
+  /**
+   * A lazy connection opens its channel on the first RPC instead of at boot. That
+   * is deliberate: the API must start (and serve `/health`, which reports the
+   * dependency as down) even when Temporal is not running.
+   */
+  private getClient(): Client {
+    if (this.client !== undefined) return this.client;
+
+    this.connection = Connection.lazy({
+      address: this.temporal.address,
+      connectTimeout: this.config.readinessTimeoutMs,
+    });
+
+    this.client = new Client({
+      connection: this.connection,
+      namespace: this.temporal.namespace,
+    });
+
+    return this.client;
+  }
+
+  async startTaskWorkflow(input: RunTaskWorkflowInput): Promise<StartedWorkflow> {
+    const client = this.getClient();
+    const workflowId = `${WORKFLOW_ID_PREFIX}${input.taskId}`;
+
+    try {
+      const handle = await withTimeout(
+        client.workflow.start(WORKFLOW_TYPE, {
+          taskQueue: this.temporal.taskQueue,
+          workflowId,
+          // Contract §16, amended by this unit: reuse is permitted only when the
+          // previous execution closed as failed/cancelled/terminated. A *running*
+          // duplicate is still rejected by Temporal, so a retried POST cannot fork
+          // two executions — but a retry after a failure can actually run.
+          workflowIdReusePolicy: WORKFLOW_ID_REUSE_POLICY,
+          // Contract §16 timeout table. Without it a stuck run has no ceiling; the
+          // worker's client wrapper already sets it, and the two must agree.
+          workflowRunTimeout: WORKFLOW_RUN_TIMEOUT,
+          args: [input],
+        }),
+        this.config.readinessTimeoutMs * 2,
+      );
+
+      return { workflowId: handle.workflowId, runId: handle.firstExecutionRunId };
+    } catch (error) {
+      if (error instanceof WorkflowExecutionAlreadyStartedError) throw error;
+
+      const status = grpcStatus(error);
+
+      if (
+        status === GRPC_UNAVAILABLE ||
+        status === GRPC_DEADLINE_EXCEEDED ||
+        status === GRPC_CANCELLED ||
+        error instanceof TimeoutError
+      ) {
+        throw new OrchestratorUnavailableError(
+          `Temporal at ${this.temporal.address} did not accept the workflow start.`,
+          error,
+        );
+      }
+
+      // Anything else is a real bug (a bad argument, a serialization failure). It
+      // must surface as a 500 with a logged stack, not be disguised as an outage.
+      throw error;
+    }
+  }
+
+  /**
+   * Requests cancellation. `not_found` means Temporal has no execution with that id
+   * — which is a safe state to treat as "nothing is running", not an error.
+   */
+  async cancelTaskWorkflow(workflowId: string): Promise<CancelResult> {
+    const client = this.getClient();
+
+    try {
+      await withTimeout(
+        client.workflow.getHandle(workflowId).cancel(),
+        this.config.readinessTimeoutMs * 2,
+      );
+
+      return 'cancelled';
+    } catch (error) {
+      const status = grpcStatus(error);
+
+      if (status === GRPC_NOT_FOUND) return 'not_found';
+
+      if (status === GRPC_UNAVAILABLE || status === GRPC_DEADLINE_EXCEEDED || status === GRPC_CANCELLED || error instanceof TimeoutError) {
+        throw new OrchestratorUnavailableError(
+          `Temporal at ${this.temporal.address} did not accept the cancellation.`,
+          error,
+        );
+      }
+
+      throw error;
+    }
+  }
+
+  /**
+   * Readiness probe.
+   *
+   * A fresh connection per probe, closed immediately: `Connection.ensureConnected`
+   * memoises its *first* result, so a connection that failed once while Temporal
+   * was down would keep reporting down after Temporal recovered. Channel creation
+   * is cheap compared to being permanently wrong about readiness.
+   */
+  async probe(): Promise<ProbeResult> {
+    const startedAt = Date.now();
+    const connection = Connection.lazy({
+      address: this.temporal.address,
+      connectTimeout: this.config.readinessTimeoutMs,
+    });
+
+    try {
+      await withTimeout(connection.ensureConnected(), this.config.readinessTimeoutMs);
+      // `ensureConnected` already proves the channel and calls getSystemInfo; the
+      // extra call keeps the probe honest if that behaviour ever changes.
+      await withTimeout(connection.workflowService.getSystemInfo({}), this.config.readinessTimeoutMs);
+
+      return { ok: true, latencyMs: Date.now() - startedAt };
+    } catch (error) {
+      return {
+        ok: false,
+        latencyMs: Date.now() - startedAt,
+        detail: describeProbeFailure(error),
+      };
+    } finally {
+      void connection.close().catch(() => undefined);
+    }
+  }
+
+  async onApplicationShutdown(): Promise<void> {
+    await this.connection?.close();
+  }
+}
+
+export class TimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+
+/**
+ * Bounds an RPC. `client.workflow.start` has no default deadline; without this a
+ * half-open connection would hold a request open until the socket gives up.
+ */
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new TimeoutError(`Operation exceeded ${timeoutMs}ms.`)),
+      timeoutMs,
+    );
+  });
+
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
+ * gRPC errors arrive either directly (`code` on the error) or wrapped in a
+ * `ServiceError` (`cause.code`). Both are checked; anything else returns undefined
+ * so the caller rethrows instead of guessing.
+ */
+function grpcStatus(error: unknown, depth = 0): number | undefined {
+  if (typeof error !== 'object' || error === null || depth > 3) return undefined;
+
+  const code = (error as { code?: unknown }).code;
+  if (typeof code === 'number') return code;
+
+  return grpcStatus((error as { cause?: unknown }).cause, depth + 1);
+}
+
+/** A readiness detail is a classification, never a raw driver message. */
+function describeProbeFailure(error: unknown): string {
+  if (error instanceof TimeoutError) return 'timeout';
+
+  // `Connection.ensureConnected` throws a bare `Error('Failed to connect before the
+  // deadline')` when the server is not listening — no gRPC status to read. The
+  // pattern is SDK-generated, not user input, so matching it adds no injection risk.
+  if (error instanceof Error && /deadline|timed? ?out/i.test(error.message)) return 'timeout';
+
+  switch (grpcStatus(error)) {
+    case GRPC_UNAVAILABLE:
+      return 'unavailable';
+    case GRPC_DEADLINE_EXCEEDED:
+      return 'deadline_exceeded';
+    case GRPC_NOT_FOUND:
+      return 'not_found';
+    default:
+      return 'error';
+  }
+}

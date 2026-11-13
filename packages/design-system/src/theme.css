@@ -1,0 +1,156 @@
+/* ==========================================================================
+   INTELLIGENZ — Tailwind v4 theme bridge
+
+   `tokens.css` stays byte-identical to `prototype/assets/css/tokens.css`
+   (contract §10: ported verbatim). This file maps those tokens onto Tailwind's
+   theme namespaces so utilities resolve without a second palette:
+
+     bg-surface-1     → var(--iz-color-surface-1)
+     text-ink-1       → var(--iz-ink-1)
+     border-subtle    → var(--iz-border-subtle)
+     text-status-awaiting-fg → var(--iz-status-awaiting-fg)
+
+   `@theme inline` is required, not cosmetic: the `--iz-*` values are redefined
+   under `[data-theme="dark"]`, so the utility must emit `var(--iz-…)` at the
+   point of use. A non-inline `@theme` would freeze the value into
+   `--color-surface-1` on `:root` and the dark override would only apply if that
+   indirection happened to re-resolve — this removes the question.
+
+   The default Tailwind palette is cleared. There is one palette in this
+   product; `bg-red-500` existing but being wrong is a trap, so it does not
+   exist.
+
+   Spacing note: `--spacing: 1px` makes every numeric spacing/size utility equal
+   its pixel value (`p-16` = 16px, `gap-24` = 24px, `w-264` = 264px). That
+   matches the token naming in DESIGN.md §6.1 — "the pixel value is the name" —
+   and removes a lookup table from every layout decision.
+   ========================================================================== */
+
+@theme {
+  --color-*: initial;
+}
+
+@theme inline {
+  /* --- surfaces ------------------------------------------------------- */
+  --color-canvas: var(--iz-color-canvas);
+  --color-surface-1: var(--iz-color-surface-1);
+  --color-surface-2: var(--iz-color-surface-2);
+  --color-surface-3: var(--iz-color-surface-3);
+
+  /* --- chrome --------------------------------------------------------- */
+  --color-chrome: var(--iz-color-chrome);
+  --color-chrome-raised: var(--iz-color-chrome-raised);
+  --color-chrome-hover: var(--iz-color-chrome-hover);
+  --color-chrome-selected: var(--iz-color-chrome-selected);
+
+  /* --- ink ------------------------------------------------------------ */
+  --color-ink-1: var(--iz-ink-1);
+  --color-ink-2: var(--iz-ink-2);
+  --color-ink-3: var(--iz-ink-3);
+  --color-ink-disabled: var(--iz-ink-disabled);
+  --color-on-chrome-1: var(--iz-on-chrome-1);
+  --color-on-chrome-2: var(--iz-on-chrome-2);
+  --color-on-chrome-3: var(--iz-on-chrome-3);
+
+  /* --- borders + focus + seal ----------------------------------------
+     Named without a `border-` prefix so the utility reads
+     `border-subtle` rather than `border-border-subtle`. */
+  --color-subtle: var(--iz-border-subtle);
+  --color-default: var(--iz-border-default);
+  --color-strong: var(--iz-border-strong);
+  --color-control: var(--iz-border-control);
+  --color-focus: var(--iz-focus);
+  --color-focus-on-chrome: var(--iz-focus-on-chrome);
+  --color-seal: var(--iz-seal);
+
+  /* --- status (each state ships fg + bg; glyph and label live in code) -- */
+  --color-status-active-fg: var(--iz-status-active-fg);
+  --color-status-active-bg: var(--iz-status-active-bg);
+  --color-status-queued-fg: var(--iz-status-queued-fg);
+  --color-status-queued-bg: var(--iz-status-queued-bg);
+  --color-status-completed-fg: var(--iz-status-completed-fg);
+  --color-status-completed-bg: var(--iz-status-completed-bg);
+  --color-status-failed-fg: var(--iz-status-failed-fg);
+  --color-status-failed-bg: var(--iz-status-failed-bg);
+  --color-status-awaiting-fg: var(--iz-status-awaiting-fg);
+  --color-status-awaiting-bg: var(--iz-status-awaiting-bg);
+  --color-status-degraded-fg: var(--iz-status-degraded-fg);
+  --color-status-degraded-bg: var(--iz-status-degraded-bg);
+  --color-status-offline-fg: var(--iz-status-offline-fg);
+  --color-status-offline-bg: var(--iz-status-offline-bg);
+
+  /* --- risk + categorical viz ---------------------------------------- */
+  --color-risk-low: var(--iz-risk-low);
+  --color-risk-medium: var(--iz-risk-medium);
+  --color-risk-high: var(--iz-risk-high);
+  --color-risk-critical: var(--iz-risk-critical);
+  --color-viz-1: var(--iz-viz-1);
+  --color-viz-2: var(--iz-viz-2);
+  --color-viz-3: var(--iz-viz-3);
+  --color-viz-4: var(--iz-viz-4);
+  --color-viz-5: var(--iz-viz-5);
+  --color-viz-6: var(--iz-viz-6);
+
+  /* --- type ----------------------------------------------------------
+     `--text-<name>--line-height` makes `text-sm` emit both size and leading. */
+  --font-sans: var(--iz-font-sans);
+  --font-mono: var(--iz-font-mono);
+
+  --text-micro: var(--iz-text-micro);
+  --text-micro--line-height: var(--iz-leading-micro);
+  --text-xs: var(--iz-text-xs);
+  --text-xs--line-height: var(--iz-leading-xs);
+  --text-sm: var(--iz-text-sm);
+  --text-sm--line-height: var(--iz-leading-sm);
+  --text-base: var(--iz-text-base);
+  --text-base--line-height: var(--iz-leading-base);
+  --text-md: var(--iz-text-md);
+  --text-md--line-height: var(--iz-leading-md);
+  --text-lg: var(--iz-text-lg);
+  --text-lg--line-height: var(--iz-leading-lg);
+  --text-xl: var(--iz-text-xl);
+  --text-xl--line-height: var(--iz-leading-xl);
+  --text-2xl: var(--iz-text-2xl);
+  --text-2xl--line-height: var(--iz-leading-2xl);
+  --text-mono-sm: var(--iz-text-mono-sm);
+  --text-mono-sm--line-height: var(--iz-leading-mono-sm);
+  --text-mono-xs: var(--iz-text-mono-xs);
+  --text-mono-xs--line-height: var(--iz-leading-mono-xs);
+
+  --font-weight-regular: var(--iz-weight-regular);
+  --font-weight-medium: var(--iz-weight-medium);
+  --font-weight-semibold: var(--iz-weight-semibold);
+
+  --tracking-micro: var(--iz-tracking-micro);
+  --tracking-tight: var(--iz-tracking-tight);
+  --tracking-tighter: var(--iz-tracking-tighter);
+
+  /* --- spacing: 1 utility unit = 1px (see header note) ---------------- */
+  --spacing: 1px;
+
+  /* --- radius --------------------------------------------------------- */
+  --radius-xs: var(--iz-radius-xs);
+  --radius-sm: var(--iz-radius-sm);
+  --radius-md: var(--iz-radius-md);
+  --radius-lg: var(--iz-radius-lg);
+  --radius-full: var(--iz-radius-full);
+
+  /* --- elevation: floating surfaces only (DESIGN.md §8) --------------- */
+  --shadow-popover: var(--iz-shadow-popover);
+  --shadow-drawer: var(--iz-shadow-drawer);
+  --shadow-modal: var(--iz-shadow-modal);
+  --shadow-toast: var(--iz-shadow-toast);
+
+  /* --- motion --------------------------------------------------------- */
+  --ease-out: var(--iz-ease-out);
+  --ease-in-out: var(--iz-ease-in-out);
+  --ease-linear: var(--iz-ease-linear);
+
+  /* --- breakpoints (literal px in media queries; these drive `xl:` etc.) */
+  --breakpoint-sm: 640px;
+  --breakpoint-md: 768px;
+  --breakpoint-lg: 1024px;
+  --breakpoint-xl: 1280px;
+  --breakpoint-2xl: 1440px;
+  --breakpoint-3xl: 1680px;
+}

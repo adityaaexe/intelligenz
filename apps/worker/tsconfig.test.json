@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // Test files run through Vitest, which is ESM: `import.meta.url` is legal there and
+    // is how a test names a source file without depending on the working directory.
+    // The shipped program stays CommonJS (see tsconfig.json), so the two programs get
+    // two module settings rather than one that is wrong for half the repository.
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}

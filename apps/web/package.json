@@ -4,10 +4,13 @@
   "private": true,
   "scripts": {
     "dev": "next dev --port 3100",
-    "build": "tsc --noEmit -p tsconfig.json",
+    "build": "next build",
     "start": "next start --port 3100",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "clean": "rm -rf .next"
+    "clean": "rm -rf .next",
+    "lint": "eslint src --max-warnings=0",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui"
   },
   "dependencies": {
     "@intelligenz/contracts": "workspace:*",

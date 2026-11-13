@@ -1,0 +1,358 @@
+// INTELLIGENZ — Phase 2 data model (ADR-004, ADR-005, contract §5–§7, §15 A2/A3/A5).
+//
+// Conventions enforced here, not just documented:
+//   - every tenant-owned table carries a non-null `orgId`, indexed;
+//   - composite indexes lead with `orgId` so a tenant list query is a range scan;
+//   - money is Decimal(12,4), never Float;
+//   - ids are opaque uuid strings, never sequential integers;
+//   - deletes cascade from Organization down to Task, and are restricted where
+//     history must survive (ApprovalRequest, AuditEvent).
+//
+// Prisma 7: the connection URL lives in `prisma.config.ts`, not in this file.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Enums ───────────────────────────────────────────────────────────────────
+// These mirror `@intelligenz/contracts/src/enums.ts` exactly. Postgres enum
+// labels are case-sensitive; a rename is a migration, so the two files must be
+// changed together.
+
+enum Role {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
+enum RiskClass {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum TaskStatus {
+  draft
+  ready
+  queued
+  running
+  verifying
+  succeeded
+  failed
+  blocked
+  cancelled
+}
+
+enum TaskPriority {
+  low
+  normal
+  high
+  urgent
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CHANGES_REQUESTED
+}
+
+enum RunStatus {
+  queued
+  running
+  succeeded
+  failed
+  cancelled
+  timed_out
+}
+
+enum ActorType {
+  user
+  agent
+  system
+}
+
+enum Environment {
+  prod
+  staging
+  dev
+}
+
+// ─── Identity and tenancy ────────────────────────────────────────────────────
+
+model Organization {
+  id        String   @id @default(uuid())
+  name      String
+  slug      String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  workspaces       Workspace[]
+  memberships      Membership[]
+  projects         Project[]
+  tasks            Task[]
+  workflowRuns     WorkflowRun[]
+  agentRuns        AgentRun[]
+  artifacts        Artifact[]
+  evidence         Evidence[]
+  approvalRequests ApprovalRequest[]
+  auditEvents      AuditEvent[]
+}
+
+model Workspace {
+  id        String   @id @default(uuid())
+  orgId     String
+  name      String
+  slug      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  projects     Project[]
+  tasks        Task[]
+
+  @@unique([orgId, slug])
+  @@index([orgId])
+}
+
+model User {
+  id           String   @id @default(uuid())
+  // Stored lower-cased at the application boundary (contract §15 A5). The unique
+  // index is therefore case-insensitive in practice without a `citext` dependency.
+  email        String   @unique
+  name         String
+  passwordHash String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  memberships          Membership[]
+  createdTasks         Task[]            @relation("TaskCreatedBy")
+  requestedApprovals   ApprovalRequest[] @relation("ApprovalRequestedBy")
+  decidedApprovals     ApprovalRequest[] @relation("ApprovalDecidedBy")
+}
+
+model Membership {
+  id        String   @id @default(uuid())
+  orgId     String
+  userId    String
+  role      Role
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, userId])
+  @@index([userId])
+}
+
+model Project {
+  id          String      @id @default(uuid())
+  orgId       String
+  workspaceId String
+  key         String
+  name        String
+  environment Environment
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  workspace    Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  tasks        Task[]
+  auditEvents  AuditEvent[]
+
+  @@unique([workspaceId, key])
+  @@index([orgId])
+  @@index([orgId, createdAt])
+}
+
+// ─── Work ────────────────────────────────────────────────────────────────────
+
+model Task {
+  id       String @id @default(uuid())
+  orgId    String
+  projectId String
+  // Denormalised from Project: a tenant filter that needs a join is a filter
+  // that gets omitted (ADR-004).
+  workspaceId       String
+  title             String
+  goal              String
+  status            TaskStatus     @default(draft)
+  riskClass         RiskClass
+  priority          TaskPriority   @default(normal)
+  // Postgres `text[]`. Acceptable for Phase 2; normalising into a child table is
+  // a later migration if criteria ever need per-item status.
+  acceptanceCriteria String[]
+  createdById       String
+  // Client-supplied per project. `(projectId, idempotencyKey)` unique makes a
+  // duplicate POST return the existing task instead of a second row (contract §6).
+  idempotencyKey    String
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  organization      Organization      @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  project           Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  workspace         Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  createdBy         User              @relation("TaskCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  workflowRuns      WorkflowRun[]
+  artifacts         Artifact[]
+  evidence          Evidence[]
+  approvalRequests  ApprovalRequest[]
+
+  @@unique([projectId, idempotencyKey])
+  @@index([orgId])
+  @@index([orgId, status])
+  @@index([orgId, createdAt])
+  @@index([projectId, status])
+}
+
+model WorkflowRun {
+  id            String    @id @default(uuid())
+  orgId         String
+  taskId        String
+  workflowId    String
+  // Assigned by Temporal when the workflow actually starts; null while queued.
+  temporalRunId String?   @unique
+  status        RunStatus @default(queued)
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  error         Json?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  task          Task         @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  agentRuns     AgentRun[]
+
+  @@index([orgId, createdAt])
+  @@index([orgId, status])
+  @@index([taskId, createdAt])
+}
+
+model AgentRun {
+  id            String    @id @default(uuid())
+  orgId         String
+  workflowRunId String
+  runtimeId     String
+  model         String
+  status        RunStatus @default(queued)
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  tokensIn      Int       @default(0)
+  tokensOut     Int       @default(0)
+  // Advisory only in Phase 2 — recorded, never enforced (contract §15 A7).
+  costUsd       Decimal?  @db.Decimal(12, 4)
+  error         Json?
+  createdAt     DateTime  @default(now())
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  workflowRun  WorkflowRun  @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
+
+  @@index([orgId, createdAt])
+  @@index([workflowRunId])
+}
+
+model Artifact {
+  id        String   @id @default(uuid())
+  orgId     String
+  taskId    String
+  // The runtime instance that produced it (`LocalSimulatedRuntime`, ...). Not a
+  // foreign key: an artifact outlives the run record that mentioned it.
+  runtimeId String
+  kind      String
+  // `uri` may legitimately move (a different artifact root); the checksum is what
+  // identifies the content.
+  uri       String
+  checksum  String
+  sizeBytes BigInt
+  createdAt DateTime @default(now())
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  task         Task         @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  // Content-addressed: a retried `persistResultActivity` that produces identical bytes
+  // is the same artifact, and the database now refuses a second row for it. The worker's
+  // deterministic id made this an application-level hope; this makes it a guarantee.
+  @@unique([orgId, taskId, kind, checksum])
+  @@index([orgId, taskId])
+  @@index([taskId, createdAt])
+}
+
+model Evidence {
+  id         String   @id @default(uuid())
+  orgId      String
+  taskId     String
+  kind       String
+  uri        String
+  // Actor id (user or agent) as an opaque string; deliberately not a foreign key.
+  producedBy String
+  createdAt  DateTime @default(now())
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  task         Task         @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  // One evidence row per claim about a given location. `Evidence` carries no checksum
+  // column, so `uri` is the stable identity available; a retried activity must not
+  // double-count the trail.
+  @@unique([orgId, taskId, kind, uri])
+  @@index([orgId, taskId])
+}
+
+// ─── Governance ──────────────────────────────────────────────────────────────
+
+model ApprovalRequest {
+  id            String         @id @default(uuid())
+  orgId         String
+  taskId        String
+  riskClass     RiskClass
+  status        ApprovalStatus @default(PENDING)
+  requestedById String
+  decidedById   String?
+  decisionNote  String?
+  createdAt     DateTime       @default(now())
+  decidedAt     DateTime?
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Restrict)
+  // Restrict: a task with an approval history must not vanish underneath it.
+  task         Task         @relation(fields: [taskId], references: [id], onDelete: Restrict)
+  requestedBy  User         @relation("ApprovalRequestedBy", fields: [requestedById], references: [id], onDelete: Restrict)
+  decidedBy    User?        @relation("ApprovalDecidedBy", fields: [decidedById], references: [id], onDelete: Restrict)
+
+  @@index([orgId])
+  @@index([orgId, status])
+  @@index([taskId])
+}
+
+/// Append-only history. Rows are written, never updated: the mutable aggregate
+/// holds current state, this table explains how it got there (ADR-004).
+model AuditEvent {
+  id             String    @id @default(uuid())
+  orgId          String
+  projectId      String?
+  actorType      ActorType
+  actorId        String
+  action         String
+  aggregateType  String
+  aggregateId    String
+  eventType      String
+  correlationId  String
+  causationId    String?
+  idempotencyKey String
+  payload        Json
+  occurredAt     DateTime
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Restrict)
+  // SetNull: losing a project must not erase the record that it existed.
+  project      Project?     @relation(fields: [projectId], references: [id], onDelete: SetNull)
+
+  @@index([orgId, occurredAt])
+  @@index([aggregateType, aggregateId])
+  @@index([orgId, idempotencyKey])
+}

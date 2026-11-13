@@ -2,7 +2,12 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "jsx": "react-jsx",
-    "lib": ["ES2023", "DOM"]
+    "lib": ["ES2023", "DOM"],
+    "paths": {
+      "react": ["apps/web/node_modules/@types/react"],
+      "react/jsx-runtime": ["apps/web/node_modules/@types/react/jsx-runtime"],
+      "react/jsx-dev-runtime": ["apps/web/node_modules/@types/react/jsx-dev-runtime"]
+    }
   },
   "include": ["src/**/*.ts", "src/**/*.tsx"],
   "exclude": ["node_modules", "dist"]

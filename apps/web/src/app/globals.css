@@ -1,0 +1,1135 @@
+@import 'tailwindcss';
+
+/*
+ * The design system owns the palette, the type scale, and the primitives.
+ * Imported by relative path rather than by package specifier so the Tailwind
+ * entry point processes `@theme` from the package itself: the mapping stays in
+ * `@intelligenz/design-system`, not copied into this app.
+ */
+@import '../../../../packages/design-system/src/tokens.css';
+@import '../../../../packages/design-system/src/theme.css';
+@import '../../../../packages/design-system/src/primitives.css';
+
+/* Explicit sources. Auto-detection would work, but being explicit means a
+ * change to the build's working directory cannot silently drop classes. */
+@source '../app';
+@source '../components';
+@source '../lib';
+
+@layer components {
+  /* =====================================================================
+     App shell — DESIGN.md §7.1
+
+     ┌ topbar 56 ─────────────────────────────────────────────┐
+     ├ sidebar 264/64 ┬ scopebar 40 ─────────────────────────┤
+     │                 ┴ content ─────────────────────────────┤
+     └────────────────────────────────────────────────────────┘
+
+     The sidebar and both bars are sticky; the sidebar scrolls independently
+     and never scrolls with the content.
+     ===================================================================== */
+
+  .app-skip-link {
+    position: absolute;
+    top: var(--iz-space-8);
+    left: var(--iz-space-8);
+    z-index: var(--iz-z-toast);
+    padding: var(--iz-space-6) var(--iz-space-12);
+    border-radius: var(--iz-radius-sm);
+    background: var(--iz-color-chrome);
+    color: var(--iz-on-chrome-1);
+    font-size: var(--iz-text-sm);
+    text-decoration: none;
+    transform: translateY(calc(-100% - var(--iz-space-16)));
+  }
+
+  /*
+   * `:focus`, not `:focus-visible`: a skip link is only ever focused on purpose
+   * (Tab, or a fragment jump), and it must be on screen in either case — a
+   * skip link nobody can see is a keyboard trap with extra steps.
+   */
+  .app-skip-link:focus {
+    transform: none;
+  }
+
+  .app-shell {
+    display: flex;
+    min-height: 100dvh;
+    background: var(--iz-color-canvas);
+  }
+
+  .app-column {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-width: 0;
+  }
+
+  /* --- top bar --------------------------------------------------------- */
+
+  .app-topbar {
+    position: sticky;
+    top: 0;
+    z-index: var(--iz-z-chrome);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--iz-space-16);
+    height: var(--iz-topbar-h);
+    padding: 0 var(--iz-space-16);
+    background: var(--iz-color-chrome);
+    color: var(--iz-on-chrome-1);
+    border-bottom: 1px solid var(--iz-color-chrome-raised);
+  }
+
+  .app-topbar__start,
+  .app-topbar__end {
+    display: flex;
+    align-items: center;
+    gap: var(--iz-space-12);
+    min-width: 0;
+  }
+
+  .app-brand {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--iz-space-8);
+    color: var(--iz-on-chrome-1);
+    font-size: var(--iz-text-sm);
+    font-weight: var(--iz-weight-semibold);
+    letter-spacing: 0.08em;
+    text-decoration: none;
+    white-space: nowrap;
+  }
+
+  .app-brand__mark {
+    width: 10px;
+    height: 10px;
+    background: var(--iz-seal);
+    border-radius: var(--iz-radius-xs);
+    flex-shrink: 0;
+  }
+
+  .app-topbar__divider {
+    width: 1px;
+    height: 20px;
+    background: var(--iz-color-chrome-selected);
+    flex-shrink: 0;
+  }
+
+  .app-topbar__org {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    line-height: 1.15;
+  }
+
+  .app-topbar__org-name {
+    font-size: var(--iz-text-sm);
+    font-weight: var(--iz-weight-medium);
+    color: var(--iz-on-chrome-1);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .app-topbar__org-meta {
+    font-size: var(--iz-text-micro);
+    color: var(--iz-on-chrome-3);
+    white-space: nowrap;
+  }
+
+  .app-topbar__user {
+    display: none;
+    font-size: var(--iz-text-xs);
+    color: var(--iz-on-chrome-2);
+    white-space: nowrap;
+  }
+
+  @media (min-width: 768px) {
+    .app-topbar__user {
+      display: inline;
+    }
+  }
+
+  .app-icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--iz-control-lg);
+    height: var(--iz-control-lg);
+    border: 1px solid transparent;
+    border-radius: var(--iz-radius-sm);
+    background: transparent;
+    color: var(--iz-on-chrome-2);
+    cursor: pointer;
+  }
+
+  .app-icon-btn:hover {
+    background: var(--iz-color-chrome-hover);
+    color: var(--iz-on-chrome-1);
+  }
+
+  .app-icon-btn:focus-visible {
+    outline-color: var(--iz-focus-on-chrome);
+  }
+
+  /* The drawer toggle only exists when the sidebar is a drawer. */
+  .app-nav-toggle {
+    display: none;
+  }
+
+  @media (max-width: 767.98px) {
+    .app-nav-toggle {
+      display: inline-flex;
+    }
+  }
+
+  /* --- sidebar --------------------------------------------------------- */
+
+  .app-sidebar {
+    position: sticky;
+    top: 0;
+    z-index: var(--iz-z-chrome);
+    display: flex;
+    flex-direction: column;
+    flex: 0 0 var(--iz-sidebar-w);
+    width: var(--iz-sidebar-w);
+    height: 100dvh;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    background: var(--iz-color-chrome);
+    color: var(--iz-on-chrome-1);
+    border-right: 1px solid var(--iz-color-chrome-raised);
+  }
+
+  .app-sidebar__workspace {
+    display: flex;
+    flex-direction: column;
+    gap: var(--iz-space-2);
+    padding: var(--iz-space-10) var(--iz-space-12);
+    border-bottom: 1px solid var(--iz-color-chrome-raised);
+  }
+
+  .app-sidebar__workspace-label {
+    font-size: var(--iz-text-micro);
+    letter-spacing: var(--iz-tracking-micro);
+    text-transform: uppercase;
+    color: var(--iz-on-chrome-3);
+  }
+
+  .app-workspace-switch {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--iz-space-4);
+  }
+
+  .app-workspace-switch__item {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--iz-space-4);
+    min-height: var(--iz-control-sm);
+    padding: 0 var(--iz-space-6);
+    border: 1px solid var(--iz-color-chrome-selected);
+    border-radius: var(--iz-radius-sm);
+    color: var(--iz-on-chrome-2);
+    font-size: var(--iz-text-xs);
+    text-decoration: none;
+  }
+
+  .app-workspace-switch__item:hover {
+    background: var(--iz-color-chrome-hover);
+    color: var(--iz-on-chrome-1);
+  }
+
+  .app-workspace-switch__item[aria-current='true'] {
+    background: var(--iz-color-chrome-selected);
+    border-color: var(--iz-on-chrome-3);
+    color: var(--iz-on-chrome-1);
+  }
+
+  .app-nav {
+    display: flex;
+    flex-direction: column;
+    gap: var(--iz-space-4);
+    padding: var(--iz-space-8) var(--iz-space-8);
+    flex: 1;
+  }
+
+  .app-nav__group {
+    display: flex;
+    flex-direction: column;
+    gap: var(--iz-space-2);
+  }
+
+  .app-nav__group-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--iz-space-8);
+    width: 100%;
+    min-height: var(--iz-control-sm);
+    padding: 0 var(--iz-space-8);
+    border: 1px solid transparent;
+    border-radius: var(--iz-radius-sm);
+    background: transparent;
+    color: var(--iz-on-chrome-2);
+    font-size: var(--iz-text-micro);
+    font-weight: var(--iz-weight-medium);
+    letter-spacing: var(--iz-tracking-micro);
+    text-transform: uppercase;
+    cursor: pointer;
+  }
+
+  .app-nav__group-toggle:hover {
+    background: var(--iz-color-chrome-hover);
+    color: var(--iz-on-chrome-1);
+  }
+
+  .app-nav__group-toggle:focus-visible {
+    outline-color: var(--iz-focus-on-chrome);
+  }
+
+  .app-nav__group-toggle svg {
+    transition: transform var(--iz-dur-base) var(--iz-ease-out);
+  }
+
+  .app-nav__group-toggle[aria-expanded='false'] svg {
+    transform: rotate(-90deg);
+  }
+
+  .app-nav__list {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .app-nav__item {
+    display: flex;
+    align-items: center;
+    gap: var(--iz-space-8);
+    min-height: var(--iz-control-lg);
+    padding: 0 var(--iz-space-8);
+    border-radius: var(--iz-radius-sm);
+    color: var(--iz-on-chrome-2);
+    font-size: var(--iz-text-sm);
+    text-decoration: none;
+  }
+
+  .app-nav__item:hover {
+    background: var(--iz-color-chrome-hover);
+    color: var(--iz-on-chrome-1);
+  }
+
+  .app-nav__item:focus-visible {
+    outline-color: var(--iz-focus-on-chrome);
+  }
+
+  /* Selection is not carried by colour alone: it also sets aria-current. */
+  .app-nav__item[aria-current='page'] {
+    background: var(--iz-color-chrome-selected);
+    color: var(--iz-on-chrome-1);
+    font-weight: var(--iz-weight-medium);
+    box-shadow: inset 2px 0 0 var(--iz-on-chrome-1);
+  }
+
+  .app-nav__icon {
+    flex-shrink: 0;
+  }
+
+  .app-nav__label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+    .app-sidebar__footer {
+    display: flex;
+    flex-direction: column;
+    gap: var(--iz-space-4);
+    padding: var(--iz-space-10) var(--iz-space-12);
+    border-top: 1px solid var(--iz-color-chrome-raised);
+  }
+
+  .app-sidebar__user {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--iz-space-8);
+    min-width: 0;
+  }
+
+  .app-sidebar__user-name {
+    font-size: var(--iz-text-xs);
+    color: var(--iz-on-chrome-1);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .app-sidebar__user-role {
+    font-size: var(--iz-text-micro);
+    color: var(--iz-on-chrome-3);
+    white-space: nowrap;
+  }
+
+  .app-signout {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--iz-space-4);
+    min-height: var(--iz-control-sm);
+    padding: 0 var(--iz-space-6);
+    border: 1px solid var(--iz-color-chrome-selected);
+    border-radius: var(--iz-radius-sm);
+    background: transparent;
+    color: var(--iz-on-chrome-2);
+    font-family: inherit;
+    font-size: var(--iz-text-xs);
+    cursor: pointer;
+  }
+
+  .app-signout:hover {
+    background: var(--iz-color-chrome-hover);
+    color: var(--iz-on-chrome-1);
+  }
+
+  .app-signout:focus-visible {
+    outline-color: var(--iz-focus-on-chrome);
+  }
+
+  .app-scrim {
+    display: none;
+  }
+
+  /* --- 1280 and up: full sidebar -------------------------------------- */
+
+  @media (max-width: 1279.98px) {
+    .app-sidebar {
+      flex-basis: var(--iz-sidebar-rail-w);
+      width: var(--iz-sidebar-rail-w);
+    }
+
+    .app-sidebar__workspace,
+    .app-sidebar__footer {
+      padding-left: var(--iz-space-8);
+      padding-right: var(--iz-space-8);
+      align-items: center;
+    }
+
+    .app-sidebar__workspace-label,
+    .app-workspace-switch__item span,
+    .app-sidebar__user-role,
+    .app-signout span {
+      display: none;
+    }
+
+    .app-workspace-switch {
+      flex-direction: column;
+      align-items: center;
+    }
+
+    .app-workspace-switch__item {
+      width: var(--iz-control-sm);
+      padding: 0;
+      justify-content: center;
+      text-transform: uppercase;
+    }
+
+    /* Group headers collapse to a rule in the rail; the group stays open. */
+    .app-nav__group-toggle {
+      justify-content: center;
+      padding: 0;
+      min-height: 18px;
+      color: var(--iz-on-chrome-3);
+    }
+
+    .app-nav__group-toggle span,
+    .app-nav__group-toggle svg {
+      display: none;
+    }
+
+    .app-nav__group-toggle::before {
+      content: '';
+      width: 24px;
+      height: 1px;
+      background: var(--iz-color-chrome-selected);
+    }
+
+    .app-nav__item {
+      justify-content: center;
+      padding: 0;
+    }
+
+    /* Accessible name never comes from the tooltip alone (DESIGN.md §9). */
+    .app-nav__label {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+    }
+
+    .app-sidebar__user {
+      justify-content: center;
+      flex-direction: column;
+    }
+
+    .app-sidebar__user-name {
+      display: none;
+    }
+
+    .app-signout {
+      width: var(--iz-control-sm);
+      padding: 0;
+    }
+  }
+
+  /* --- below 768: the nav becomes an off-canvas drawer ------------------ */
+
+  @media (max-width: 767.98px) {
+    .app-sidebar {
+      position: fixed;
+      inset: 0 auto 0 0;
+      flex-basis: var(--iz-sidebar-w);
+      width: var(--iz-sidebar-w);
+      transform: translateX(-100%);
+      /*
+       * Above the scrim, not below it. The frozen scale puts the scrim (290)
+       * over the drawer (200), which dims the drawer and — because the scrim is a
+       * full-viewport button — swallows every tap meant for a nav link. One above
+       * the scrim is the only value that keeps the scale's ordering and still
+       * leaves the drawer usable; `elementFromPoint` over a nav link used to
+       * return `.app-scrim`.
+       */
+      z-index: calc(var(--iz-z-scrim) + 1);
+      /* Re-expand inside the drawer: a 64px rail in a 264px panel is silly. */
+    }
+
+    /*
+     * The transition belongs to the open state only. Declared on the closed
+     * state it would also animate the *media query* change, so resizing a
+     * desktop window across 768px slid the drawer across the screen once.
+     */
+    .app-sidebar[data-open='true'] {
+      transform: none;
+      transition: transform var(--iz-dur-slow) var(--iz-ease-in-out);
+    }
+
+    .app-sidebar__workspace,
+    .app-sidebar__footer {
+      padding-left: var(--iz-space-12);
+      padding-right: var(--iz-space-12);
+      align-items: stretch;
+    }
+
+    .app-sidebar__workspace-label,
+    .app-workspace-switch__item span,
+    .app-sidebar__user-role,
+    .app-signout span,
+    .app-nav__group-toggle span,
+    .app-nav__group-toggle svg,
+    .app-sidebar__user-name {
+      display: block;
+    }
+
+    .app-workspace-switch {
+      flex-direction: row;
+    }
+
+    .app-workspace-switch__item {
+      width: auto;
+      padding: 0 var(--iz-space-6);
+    }
+
+    .app-nav__group-toggle {
+      justify-content: space-between;
+      padding: 0 var(--iz-space-8);
+      min-height: var(--iz-control-sm);
+      color: var(--iz-on-chrome-2);
+    }
+
+    .app-nav__group-toggle::before {
+      display: none;
+    }
+
+    .app-nav__item {
+      justify-content: flex-start;
+      padding: 0 var(--iz-space-8);
+    }
+
+    .app-nav__label {
+      position: static;
+      width: auto;
+      height: auto;
+      margin: 0;
+      overflow: hidden;
+      clip: auto;
+      white-space: nowrap;
+    }
+
+    .app-sidebar__user {
+      flex-direction: row;
+      justify-content: space-between;
+    }
+
+    .app-signout {
+      width: auto;
+      padding: 0 var(--iz-space-6);
+    }
+
+    .app-scrim[data-visible='true'] {
+      display: block;
+      position: fixed;
+      inset: 0;
+      z-index: var(--iz-z-scrim);
+      background: color-mix(in oklab, var(--iz-color-chrome) 55%, transparent);
+      border: 0;
+    }
+  }
+
+  /* --- scope bar ------------------------------------------------------- */
+
+  .app-scopebar {
+    position: sticky;
+    top: var(--iz-topbar-h);
+    z-index: var(--iz-z-chrome);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--iz-space-8);
+    height: var(--iz-scopebar-h);
+    padding: 0 var(--iz-space-16);
+    background: var(--iz-color-surface-1);
+    border-bottom: 1px solid var(--iz-border-default);
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .app-scopebar::-webkit-scrollbar {
+    display: none;
+  }
+
+  /*
+   * The bar is a tab stop (it scrolls horizontally below 768px), so its focus
+   * ring has to stay inside its own 40px strip rather than bleed over the sticky
+   * topbar it sits under.
+   */
+  .app-scopebar:focus-visible {
+    outline-offset: -2px;
+  }
+
+  .app-scopebar__chips,
+  .app-scopebar__meta {
+    display: flex;
+    align-items: center;
+    gap: var(--iz-space-6);
+    flex-shrink: 0;
+  }
+
+  /*
+   * Cascade note: this must come after the base `display: flex` above. Equal
+   * specificity means source order decides, and a media query does not add any.
+   * At 390px the second chip was clipped by the bar's own horizontal scroll.
+   */
+  @media (max-width: 767.98px) {
+    .app-scopebar__meta {
+      display: none;
+    }
+  }
+
+  .app-scope-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--iz-space-4);
+    min-height: 22px;
+    padding: 0 var(--iz-space-6);
+    border: 1px solid var(--iz-border-subtle);
+    border-radius: var(--iz-radius-sm);
+    background: var(--iz-color-canvas);
+    color: var(--iz-ink-2);
+    font-size: var(--iz-text-xs);
+    white-space: nowrap;
+  }
+
+  .app-scope-chip[data-emphasis='true'] {
+    color: var(--iz-ink-1);
+    font-weight: var(--iz-weight-medium);
+  }
+
+  .app-scope-chip__key {
+    color: var(--iz-ink-3);
+  }
+
+  /* --- content --------------------------------------------------------- */
+
+  .app-content {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .app-content__inner {
+    width: 100%;
+    max-width: var(--iz-max-content);
+    margin: 0 auto;
+    padding: var(--iz-space-12);
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  @media (min-width: 768px) {
+    .app-content__inner {
+      padding: var(--iz-space-16);
+    }
+  }
+
+  @media (min-width: 1280px) {
+    .app-content__inner {
+      padding: var(--iz-space-24);
+    }
+  }
+
+  .app-page-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--iz-space-12);
+    padding-bottom: var(--iz-space-12);
+    border-bottom: 1px solid var(--iz-border-default);
+  }
+
+  .app-page-header__text {
+    display: flex;
+    flex-direction: column;
+    gap: var(--iz-space-2);
+    min-width: 0;
+  }
+
+  .app-page-title {
+    font-size: var(--iz-text-xl);
+    line-height: var(--iz-leading-xl);
+    font-weight: var(--iz-weight-semibold);
+    letter-spacing: var(--iz-tracking-tight);
+    color: var(--iz-ink-1);
+    text-wrap: balance;
+  }
+
+  .app-page-subtitle {
+    font-size: var(--iz-text-xs);
+    line-height: var(--iz-leading-xs);
+    color: var(--iz-ink-3);
+  }
+
+  .app-page-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--iz-space-8);
+    flex-wrap: wrap;
+  }
+
+  .app-asof {
+    font-size: var(--iz-text-xs);
+    color: var(--iz-ink-3);
+    white-space: nowrap;
+  }
+
+  /* --- hairline region grids ------------------------------------------
+     Rules between regions, never a gap and never a card edge (§7.1). The
+     container paints the rule colour; 1px gaps become the rules. */
+
+  .iz-hairlines {
+    display: grid;
+    gap: 1px;
+    background: var(--iz-border-default);
+    border-bottom: 1px solid var(--iz-border-default);
+  }
+
+  .iz-hairlines > * {
+    background: var(--iz-color-canvas);
+    min-width: 0;
+  }
+
+  /* R1 posture strip: five cells, one band. */
+  .ov-posture {
+    margin-top: var(--iz-space-16);
+    border-top: 1px solid var(--iz-border-default);
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+  }
+
+  /*
+   * The region grid. One rule system for the whole page: every region is a cell
+   * on the canvas and the 1px gaps are the dividers. No nested panels, no
+   * double rules, no cards (§7.1, §8).
+   */
+  .ov-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 1px;
+    margin-top: var(--iz-space-16);
+    background: var(--iz-border-default);
+    border-block: 1px solid var(--iz-border-default);
+  }
+
+  .ov-grid > * {
+    background: var(--iz-color-canvas);
+    min-width: 0;
+  }
+
+  .ov-grid__full {
+    grid-column: 1 / -1;
+  }
+
+  .ov-grid__two {
+    grid-column: span 2;
+  }
+
+  /*
+   * Five cells do not divide evenly into three or two columns. The trailing
+   * empty cell of a hairline grid is painted with the container's rule colour,
+   * which reads as a grey block — so the spend cell spans the remainder.
+   */
+  @media (max-width: 1279.98px) {
+    .ov-posture__spend {
+      grid-column: span 2;
+    }
+
+    .ov-grid {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .ov-grid__two,
+    .ov-grid__full {
+      grid-column: 1 / -1;
+    }
+
+    .ov-posture {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+  }
+
+  @media (max-width: 767.98px) {
+    .ov-posture {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .ov-posture__spend {
+      grid-column: 1 / -1;
+    }
+  }
+
+  .ov-region {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    background: var(--iz-color-canvas);
+  }
+
+  /* --- region internals ------------------------------------------------ */
+
+  .ov-queue-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--iz-space-6);
+    padding: var(--iz-space-10) var(--iz-space-16);
+    border-bottom: 1px solid var(--iz-border-subtle);
+    background: var(--iz-color-surface-1);
+  }
+
+  .ov-queue-count {
+    display: inline-flex;
+    align-items: baseline;
+    gap: var(--iz-space-4);
+    padding: 0 var(--iz-space-6);
+    min-height: 22px;
+    border: 1px solid var(--iz-border-subtle);
+    border-radius: var(--iz-radius-sm);
+    background: var(--iz-color-canvas);
+    font-size: var(--iz-text-xs);
+    color: var(--iz-ink-2);
+    white-space: nowrap;
+  }
+
+  .ov-queue-count__value {
+    font-variant-numeric: tabular-nums slashed-zero;
+    font-weight: var(--iz-weight-semibold);
+    color: var(--iz-ink-1);
+  }
+
+  .ov-approval-list {
+    display: flex;
+    flex-direction: column;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .ov-approval {
+    display: flex;
+    flex-direction: column;
+    gap: var(--iz-space-4);
+    padding: var(--iz-space-10) var(--iz-space-16);
+    border-bottom: 1px solid var(--iz-border-subtle);
+  }
+
+  /*
+   * DESIGN.md §4.9 gives `#FAF1F0` for the critical row tint; tokens.css has no
+   * token for it. Derived from the failed status background toward the canvas so
+   * no new literal enters the palette (same technique as §4.8 dark derivations).
+   * Reported as a token gap.
+   */
+  .ov-approval[data-critical='true'] {
+    background: color-mix(in oklab, var(--iz-status-failed-bg) 62%, var(--iz-color-canvas));
+  }
+
+  .ov-approval:last-child {
+    border-bottom: 0;
+  }
+
+  .ov-approval__head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--iz-space-8);
+  }
+
+  .ov-approval__title {
+    font-size: var(--iz-text-sm);
+    line-height: var(--iz-leading-sm);
+    font-weight: var(--iz-weight-medium);
+    color: var(--iz-ink-1);
+    text-wrap: pretty;
+  }
+
+  .ov-approval__meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--iz-space-8);
+    font-size: var(--iz-text-xs);
+    color: var(--iz-ink-3);
+  }
+
+  .ov-health-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--iz-space-8);
+    padding: var(--iz-space-8) var(--iz-space-0);
+    border-bottom: 1px solid var(--iz-border-subtle);
+  }
+
+  .ov-health-row:last-child {
+    border-bottom: 0;
+  }
+
+  .ov-health-row__name {
+    display: flex;
+    align-items: center;
+    gap: var(--iz-space-6);
+    font-family: var(--iz-font-mono);
+    font-size: var(--iz-text-mono-sm);
+    color: var(--iz-ink-2);
+  }
+
+  .ov-health-row__meta {
+    display: flex;
+    align-items: center;
+    gap: var(--iz-space-8);
+    font-size: var(--iz-text-xs);
+    color: var(--iz-ink-3);
+    font-variant-numeric: tabular-nums slashed-zero;
+  }
+
+  .ov-figure {
+    display: flex;
+    align-items: baseline;
+    gap: var(--iz-space-6);
+    font-size: var(--iz-text-2xl);
+    line-height: var(--iz-leading-2xl);
+    font-weight: var(--iz-weight-semibold);
+    letter-spacing: var(--iz-tracking-tighter);
+    font-variant-numeric: tabular-nums slashed-zero;
+    color: var(--iz-ink-1);
+  }
+
+  .ov-figure--md {
+    font-size: var(--iz-text-md);
+    line-height: var(--iz-leading-md);
+    letter-spacing: 0;
+    font-weight: var(--iz-weight-medium);
+  }
+
+  .ov-figure-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--iz-space-8);
+    padding-bottom: var(--iz-space-8);
+    border-bottom: 1px solid var(--iz-border-subtle);
+    margin-bottom: var(--iz-space-8);
+  }
+
+  .ov-kv {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--iz-space-8);
+    font-size: var(--iz-text-xs);
+    color: var(--iz-ink-2);
+    padding: var(--iz-space-4) 0;
+  }
+
+  .ov-kv__value {
+    font-variant-numeric: tabular-nums slashed-zero;
+    color: var(--iz-ink-1);
+  }
+
+  .ov-alert-list {
+    display: flex;
+    flex-direction: column;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .ov-alert {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--iz-space-8);
+    padding: var(--iz-space-8) var(--iz-space-16);
+    border-bottom: 1px solid var(--iz-border-subtle);
+  }
+
+  .ov-alert:last-child {
+    border-bottom: 0;
+  }
+
+  .ov-alert__body {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+  }
+
+  .ov-alert__title {
+    font-size: var(--iz-text-sm);
+    line-height: var(--iz-leading-sm);
+    color: var(--iz-ink-1);
+    text-wrap: pretty;
+  }
+
+  .ov-alert__meta {
+    font-size: var(--iz-text-xs);
+    color: var(--iz-ink-3);
+  }
+
+  .ov-constraints {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--iz-space-8);
+    min-height: 32px;
+    padding: var(--iz-space-4) var(--iz-space-24);
+    border-bottom: 1px solid var(--iz-border-subtle);
+    background: var(--iz-color-surface-1);
+    font-size: var(--iz-text-xs);
+    color: var(--iz-ink-2);
+  }
+
+  /* --- login ----------------------------------------------------------- */
+
+  .login-page {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100dvh;
+    padding: var(--iz-space-24);
+    background: var(--iz-color-surface-1);
+  }
+
+  .login-card {
+    width: 100%;
+    max-width: 380px;
+    border: 1px solid var(--iz-border-default);
+    border-radius: var(--iz-radius-md);
+    background: var(--iz-color-canvas);
+    padding: var(--iz-space-24);
+    display: flex;
+    flex-direction: column;
+    gap: var(--iz-space-16);
+  }
+
+  .login-card__head {
+    display: flex;
+    flex-direction: column;
+    gap: var(--iz-space-4);
+  }
+
+  .login-card__title {
+    display: flex;
+    align-items: center;
+    gap: var(--iz-space-8);
+    font-size: var(--iz-text-lg);
+    line-height: var(--iz-leading-lg);
+    font-weight: var(--iz-weight-semibold);
+    letter-spacing: -0.01em;
+    color: var(--iz-ink-1);
+  }
+
+  .login-card__subtitle {
+    font-size: var(--iz-text-xs);
+    color: var(--iz-ink-3);
+  }
+
+  .login-form {
+    display: flex;
+    flex-direction: column;
+    gap: var(--iz-space-12);
+  }
+
+  /* --- placeholder module page ----------------------------------------- */
+
+  .placeholder {
+    display: flex;
+    flex-direction: column;
+    gap: var(--iz-space-16);
+    max-width: 72ch;
+    padding-top: var(--iz-space-16);
+  }
+
+  .placeholder__facts {
+    display: flex;
+    flex-direction: column;
+    gap: var(--iz-space-8);
+    margin: 0;
+  }
+
+  .placeholder__fact {
+    display: grid;
+    grid-template-columns: 120px minmax(0, 1fr);
+    gap: var(--iz-space-12);
+    font-size: var(--iz-text-sm);
+    line-height: var(--iz-leading-sm);
+  }
+
+  .placeholder__fact dt {
+    color: var(--iz-ink-3);
+  }
+
+  .placeholder__fact dd {
+    margin: 0;
+    color: var(--iz-ink-1);
+    overflow-wrap: anywhere;
+  }
+}

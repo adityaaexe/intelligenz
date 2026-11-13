@@ -8,10 +8,18 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:migrate:test": "PRISMA_TARGET=test prisma migrate deploy",
+    "db:seed": "prisma db seed",
+    "db:reset": "prisma migrate reset --force",
+    "typecheck": "prisma generate && tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
   },
   "dependencies": {
-    "@prisma/client": "7.10.1"
+    "@prisma/adapter-pg": "7.10.1",
+    "@prisma/client": "7.10.1",
+    "argon2": "0.45.2"
   },
   "devDependencies": {
     "prisma": "7.10.1"
