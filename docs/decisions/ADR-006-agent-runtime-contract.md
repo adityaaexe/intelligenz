@@ -105,6 +105,33 @@ Mandatory labelling, enforced in code and in the UI:
 - Whether artifacts can be streamed to the store during execution rather than returned at the end. **Unknown — must be resolved before any run produces more than a few megabytes.**
 - `cancel(executionId)` takes an id that `execute()` never returns. This is a contract defect inherited from §8: the interface cannot cancel an execution it has not identified. Phase 2 works around it by tracking `taskId → AbortSignal` in the activity. Flagged to the Leader; the type should be `cancel(taskId)` or `execute()` should return a handle.
 
+## Phase 3 implementation note — what `network: false` actually means (SEC-302)
+
+`OpencodeCliRuntime` is the first real adapter, and it **keeps `network: false`**. The
+capability is a claim about the agent, not about the adapter, and the precise claim is:
+
+> **No general egress; model traffic only via an allowlisted 443 proxy; all other
+> sockets blocked.**
+
+Concretely:
+
+- Every process the agent can spawn runs in a network namespace with no interfaces
+  (`--unshare-net`). TCP, UDP and DNS all fail; `probeSandbox()` measures this rather
+  than trusting a comment.
+- A model call has to leave the sandbox, so the adapter owns a **separate** channel: a
+  unix socket bound into the sandbox, terminating at a host proxy that accepts `CONNECT`
+  only to an exact allowlist of provider hosts **and only on port 443**. Non-443 is
+  refused with `403` and logged. Absolute-form HTTP is refused outright, so there is no
+  second, TLS-less egress path.
+- `network: false` must not be reported or documented without that qualifier. It means
+  "the agent has no network capability", not "no bytes leave the machine": a tunnel to a
+  provider is a capability of the *adapter*, and the proxy is its boundary.
+
+The proxy does not inspect TLS, does not rate-limit, and cannot distinguish a provider
+request from any other request to the same host:443. It is a reachability control, not a
+content control. Anything that needs content control (a secret leaving in a prompt, for
+example) is a redaction and policy problem, not a network one.
+
 ## Revisit trigger
 
 Revisit at the **first real adapter** — expect a v2 of `ExecutionRequest` and possibly `ExecutionResult`, because the interface has never been exercised against vendor reality. Specific triggers: a runtime that streams partial output; a run that needs mid-execution approval; an artifact larger than memory; a runtime that cannot honour `timeoutMs`; or any adapter that must expose a vendor capability with no home in `RuntimeCapabilities`.

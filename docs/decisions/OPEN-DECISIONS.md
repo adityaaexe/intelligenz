@@ -117,6 +117,13 @@ change with its own regression surface.
 suppress them silently. A blanket `pnpm.overrides` pin here would replace a known
 advisory with an untested resolution.
 
+**Measured 2026-11-13 (DOC-301):** the severity classification above is out of date.
+`pnpm audit --audit-level high` now **exits 1**: 7 advisories, of which **2 are rated
+`high`** (both PostCSS, reached through `next`; also 4 moderate and 1 low). The advisories
+are still build-time transitive dependencies, not request-path code, so the exposure
+argument stands — but the gate is red, not "Low–Medium". `PHASE-3-TEST-RESULTS.md` §1.7
+records the literal output and the path list. The decision itself is unchanged.
+
 ---
 
 ## D-005 — `Cache-Control` is not set on authenticated API responses
@@ -133,3 +140,62 @@ response could be served to a different tenant.
 place as the security headers — **or** prove the proxy never caches. Do not add it
 blindly now: it would disable caching for a future endpoint that legitimately wants
 it, and the current topology has no cache to defeat.
+
+---
+
+## D-006 — Risk class is self-attested at task creation, so the approval gate is voluntary
+
+**Status:** OPEN · **Raised:** 2026-11-13 (Phase 3 security audit, finding F5) · **Severity:** High (policy)
+
+### What happens today
+
+- `POST /v1/orgs/:orgId/tasks` accepts `riskClass` **from the caller**. A `MEMBER` can
+  create a task labelled `LOW` whatever the work actually is.
+- Approval is required for `HIGH` and `CRITICAL` only
+  (`packages/contracts/src/approval.ts:13`). A `LOW` task gets no `ApprovalRequest` at
+  all.
+- `POST /v1/orgs/:orgId/tasks/:taskId/run` checks "is there an `APPROVED` request for
+  this task" only when `requiresApproval(riskClass)` is true.
+
+So any `MEMBER` can execute arbitrary agent work with no second pair of eyes by typing
+`"riskClass": "LOW"`. The approvals screen presents a control that the caller can opt
+out of. That is not a bug in the check — the check does what it says — it is a question
+about **who is allowed to decide that work is low risk**.
+
+This is recorded rather than changed because the answer changes the product:
+
+- Some teams genuinely want a member to run a small, reversible change unattended.
+  Gating every run on an `ADMIN` turns the approval queue into a rubber stamp, which is
+  worse than no control because it looks like one.
+- An auditor will read "approvals required for HIGH/CRITICAL" as a control, and will
+  expect the classification to be trustworthy.
+
+`apps/api/test/tasks.e2e-spec.ts` contains a test that **documents the current
+behaviour** (a `MEMBER` creates and runs a `LOW` task with zero approval rows). If the
+policy changes, that test fails and this decision is updated — the bypass is visible
+rather than assumed.
+
+### Options
+
+| Option | Change | Cost |
+|---|---|---|
+| A. Keep as-is, document it | No code change; say "risk class is set by the requester; only HIGH/CRITICAL are gated" in the operator guide | The approvals screen overstates the control; a member can self-serve any work |
+| B. Server-side floor per project | Project (or org) carries a minimum risk class; `requiresApproval` uses `max(requested, floor)` | One column + migration; an admin sets it once; no per-task friction |
+| C. `ADMIN` confirms risk on real runs | `POST /run` requires `ADMIN` for any real runtime; `LOW` stays self-service only for the simulated adapter | Highest assurance, most friction; blocks unattended work entirely |
+| D. Approve the *capability*, not the task | Approval attaches to (member, project, budget, runtime) for a time window; individual tasks inherit it | A different product: standing grants need expiry, revocation and an audit story |
+
+### Recommendation
+
+**B, with C's wording in the operator guide.** A per-project minimum risk class is one
+migration and one `max()` in the gate, and it closes the "type LOW to skip approval"
+path without turning every small change into an approval. C is the right answer for an
+organisation that does not trust its members at all, but it makes the queue the
+bottleneck and should be a deliberate choice, not the default.
+
+Whichever is chosen, the **worker** must re-check at execution time
+(`executeAgentActivity` currently does not — finding F18 in the Phase 3 report), or the
+gate is only an API-layer courtesy.
+
+### Owner
+
+Founder / product owner. This is a risk-appetite decision, not an engineering one.
