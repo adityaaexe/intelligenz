@@ -43,9 +43,28 @@ export function deterministicId(name: string): string {
   ].join('-');
 }
 
-/** One agent run per `(workflow run, runtime)`. A retry updates, never duplicates. */
-export function agentRunIdFor(workflowRunId: string, runtimeId: string): string {
-  return deterministicId(`agent-run:${workflowRunId}:${runtimeId}`);
+/** One agent run per `(workflow run, runtime, attempt)`. A retried attempt is a new row. */
+export function agentRunIdFor(workflowRunId: string, runtimeId: string, attemptNumber = 1): string {
+  return deterministicId(`agent-run:${workflowRunId}:${runtimeId}:${attemptNumber}`);
+}
+
+/**
+ * One attempt per `(workflow run, attemptNumber)`. Both halves are needed: the
+ * database's `@@unique([workflowRunId, attemptNumber])` is the authority, and a
+ * deterministic id means a retried activity that re-computes the row hits the same
+ * primary key instead of racing a second insert.
+ */
+export function executionAttemptIdFor(workflowRunId: string, attemptNumber: number): string {
+  return deterministicId(`execution-attempt:${workflowRunId}:${attemptNumber}`);
+}
+
+/**
+ * One lease per `(workflow run, attempt)`. A retry gets a **new** directory rather
+ * than reusing the failed one: the failed workspace is evidence, and provisioning
+ * over it would make the failure unreproducible (`workspace-manager` `state.ts`).
+ */
+export function executionWorkspaceIdFor(workflowRunId: string, attemptNumber: number): string {
+  return deterministicId(`execution-workspace:${workflowRunId}:${attemptNumber}`);
 }
 
 /**

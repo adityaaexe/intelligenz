@@ -1,4 +1,8 @@
-// INTELLIGENZ — Phase 2 data model (ADR-004, ADR-005, contract §5–§7, §15 A2/A3/A5).
+// INTELLIGENZ — data model.
+//
+// Phase 2 aggregate (ADR-004, ADR-005, contract §5–§7, §15 A2/A3/A5) plus the
+// Phase 3 execution identity: where a run executed (`ExecutionWorkspace`), which
+// attempt it was (`ExecutionAttempt`), and what it did (`ToolInvocation`).
 //
 // Conventions enforced here, not just documented:
 //   - every tenant-owned table carries a non-null `orgId`, indexed;
@@ -6,7 +10,10 @@
 //   - money is Decimal(12,4), never Float;
 //   - ids are opaque uuid strings, never sequential integers;
 //   - deletes cascade from Organization down to Task, and are restricted where
-//     history must survive (ApprovalRequest, AuditEvent).
+//     history must survive (ApprovalRequest, AuditEvent, ExecutionAttempt,
+//     ExecutionWorkspace);
+//   - every Phase 3 column added to a Phase 2 table is nullable or defaulted, so
+//     existing rows survive the migration unaltered.
 //
 // Prisma 7: the connection URL lives in `prisma.config.ts`, not in this file.
 
@@ -85,6 +92,20 @@ enum Environment {
   dev
 }
 
+/// Execution workspace lifecycle (Phase 3). `preserving` is the window between
+/// "the run finished" and "the bytes are archived or removed": a separate state so
+/// a cleanup that failed is visible as `failed` rather than silently implied.
+enum WorkspaceState {
+  requested
+  provisioning
+  ready
+  executing
+  preserving
+  completed
+  failed
+  cancelled
+}
+
 // ─── Identity and tenancy ────────────────────────────────────────────────────
 
 model Organization {
@@ -104,6 +125,10 @@ model Organization {
   evidence         Evidence[]
   approvalRequests ApprovalRequest[]
   auditEvents      AuditEvent[]
+
+  executionWorkspaces ExecutionWorkspace[]
+  executionAttempts   ExecutionAttempt[]
+  toolInvocations     ToolInvocation[]
 }
 
 model Workspace {
@@ -206,6 +231,9 @@ model Task {
   evidence          Evidence[]
   approvalRequests  ApprovalRequest[]
 
+  executionWorkspaces ExecutionWorkspace[]
+  executionAttempts   ExecutionAttempt[]
+
   @@unique([projectId, idempotencyKey])
   @@index([orgId])
   @@index([orgId, status])
@@ -227,9 +255,10 @@ model WorkflowRun {
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
 
-  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
-  task          Task         @relation(fields: [taskId], references: [id], onDelete: Cascade)
-  agentRuns     AgentRun[]
+  organization Organization       @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  task         Task               @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  agentRuns    AgentRun[]
+  attempts     ExecutionAttempt[]
 
   @@index([orgId, createdAt])
   @@index([orgId, status])
@@ -252,11 +281,42 @@ model AgentRun {
   error         Json?
   createdAt     DateTime  @default(now())
 
+  // ─── Phase 3: execution identity ─────────────────────────────────────────
+  // A retry is a new row, not a mutation of the old one. `attemptNumber` is the
+  // 1-based position of this run inside its workflow run, so "the third attempt"
+  // is addressable without reading `createdAt`.
+  attemptNumber  Int     @default(1)
+  // The directory this run was confined to: `ExecutionWorkspace`, NOT the tenant
+  // `Workspace` four models up. Two different concepts sharing one word; see the
+  // model comment. Nullable because every Phase 2 row predates the concept.
+  workspaceId    String?
+  // False means "a real runtime produced this". Phase 2 rows were all
+  // `local-simulated`, and ADR-006 already required them to report `simulated:
+  // true`, so the migration backfills them rather than letting the column default
+  // relabel history as real execution.
+  simulated      Boolean @default(false)
+  // Reported by the adapter (`opencode --version`), not inferred from `runtimeId`.
+  runtimeVersion String?
+  // Provider-shaped detail: routing, cache read/write, provider request id.
+  providerMeta   Json?
+
   organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
   workflowRun  WorkflowRun  @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
 
+  // Where this run executed (`AgentRun.workspaceId`).
+  executionWorkspace  ExecutionWorkspace?  @relation("AgentRunExecutionWorkspace", fields: [workspaceId], references: [id], onDelete: SetNull)
+  // The same link from the other side (`ExecutionWorkspace.agentRunId`). Both
+  // directions exist because each side is queried on its own terms: "which
+  // directory did this run use" and "which runs are attributed to this directory".
+  executionWorkspaces ExecutionWorkspace[] @relation("ExecutionWorkspaceAgentRun")
+  attempts            ExecutionAttempt[]
+  toolInvocations     ToolInvocation[]
+
   @@index([orgId, createdAt])
   @@index([workflowRunId])
+  // Not a read index: a SetNull foreign key needs one or every parent delete
+  // sequential-scans this table to find the rows it must null out.
+  @@index([workspaceId])
 }
 
 model Artifact {
@@ -303,6 +363,153 @@ model Evidence {
   // double-count the trail.
   @@unique([orgId, taskId, kind, uri])
   @@index([orgId, taskId])
+}
+
+// ─── Execution (Phase 3) ─────────────────────────────────────────────────────
+//
+// Three questions the Phase 2 schema could not answer, each with its own table:
+//
+//   where  → `ExecutionWorkspace`  a disposable directory, with a lifecycle
+//   which  → `ExecutionAttempt`    "was this the first try or the fourth?"
+//   what   → `ToolInvocation`      a redacted, ordered trace of tool use
+//
+// Naming warning: this section's `ExecutionWorkspace` is a filesystem boundary for
+// one run. It is unrelated to `Workspace` above, which is a tenant-scoped grouping
+// that owns projects. Never join them, never call both "workspace" in code that
+// reads both.
+
+/// A disposable filesystem boundary in which one agent run executes.
+///
+/// `rootPath` is the identity that matters operationally: it is unique so two rows
+/// can never claim the same directory, and the workspace manager can therefore
+/// answer "is this path already leased?" with one index probe rather than a scan.
+model ExecutionWorkspace {
+  id         String         @id @default(uuid())
+  orgId      String
+  taskId     String
+  // Which run this directory belongs to. SetNull rather than Cascade: losing the
+  // run record must not erase the evidence that a directory exists on disk. The
+  // cleaner is what removes the bytes, and it needs the row to still be there.
+  agentRunId String?
+  state      WorkspaceState @default(requested)
+  // Absolute, canonical (no `..`, no symlink segments). Unique across all tenants
+  // because the filesystem is shared, not partitioned by org.
+  rootPath   String         @unique
+  // `clone` | `worktree` | `empty`. Deliberately not an enum: the set grows as
+  // adapters are added, and a Postgres enum cannot be extended inside a
+  // transaction. Validated at the application boundary.
+  sourceKind String
+  // Repository URL for `clone`/`worktree`, source directory for `empty`.
+  sourceRef  String?
+  // Recorded so a run is reproducible even if the branch moves underneath it.
+  baseCommit String?
+  branch     String?
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+  // Null until the directory is usable / until it has been removed or archived.
+  readyAt    DateTime?
+  cleanedAt  DateTime?
+  // Retention deadline. Null means "no deadline set"; the sweeper treats an
+  // expired row as reclaimable, it never implies immediate deletion.
+  expiresAt  DateTime?
+  // Container for the provisioning or cleanup failure: `{ stage, message, code }`.
+  // JSON because the error shape belongs to the workspace manager, not the schema.
+  error      Json?
+
+  // Restrict: an organization that has ever leased a workspace cannot be hard
+  // deleted until those rows are resolved. Same posture as AuditEvent — history
+  // outlives the aggregate.
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Restrict)
+  // Cascade: the directory is owned by the task; if the task is deleted the
+  // directory is orphaned by definition and the row must not linger.
+  task         Task         @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  agentRun     AgentRun?    @relation("ExecutionWorkspaceAgentRun", fields: [agentRunId], references: [id], onDelete: SetNull)
+  agentRuns    AgentRun[]   @relation("AgentRunExecutionWorkspace")
+
+  // The state board: "what is provisioning or executing in this org right now".
+  @@index([orgId, state])
+  // "Show me every workspace this task ever used" — the retry history view.
+  @@index([taskId])
+  // Tenant-scoped listing, newest first.
+  @@index([orgId, createdAt])
+  // Foreign-key maintenance for the SetNull above, not a read path.
+  @@index([agentRunId])
+}
+
+/// One execution of one workflow run.
+///
+/// The reason this table exists: a Temporal retry re-runs an activity, and Phase 2
+/// had no way to say whether a second `AgentRun` was a retry of the first or an
+/// independent run. `(workflowRunId, attemptNumber)` is that identity.
+model ExecutionAttempt {
+  id            String    @id @default(uuid())
+  orgId         String
+  taskId        String
+  workflowRunId String
+  // Null while the attempt has not produced a run yet (queued, or the runtime
+  // failed to start). SetNull so pruning run records never destroys the attempt.
+  agentRunId    String?
+  // 1-based. No default: the caller must state which attempt this is, because
+  // guessing is exactly the bug this column exists to prevent.
+  attemptNumber Int
+  // Adapter identity, e.g. `opencode-cli`, `local-simulated`. Not an enum and not
+  // a foreign key: adapters ship independently of the database.
+  runtimeId     String
+  // Load-bearing, not decorative. True means no real model call happened. The UI
+  // labels every row from this column, and a mismatch against the adapter's own
+  // report is a test failure (Phase 3 baseline §7).
+  simulated     Boolean   @default(false)
+  status        RunStatus @default(queued)
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  error         Json?
+  createdAt     DateTime  @default(now())
+
+  // Restrict: attempt history is the audit trail for "how many times did we try".
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Restrict)
+  task         Task         @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  workflowRun  WorkflowRun  @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
+  agentRun     AgentRun?    @relation(fields: [agentRunId], references: [id], onDelete: SetNull)
+
+  // A workflow run cannot claim attempt 3 twice. A retried activity that tries to
+  // insert a duplicate gets P2002 instead of a second silent row.
+  @@unique([workflowRunId, attemptNumber])
+  @@index([orgId, createdAt])
+  // Foreign-key maintenance for the SetNull above, not a read path.
+  @@index([agentRunId])
+}
+
+/// Ordered, redacted record of what an agent did during a run.
+///
+/// Not a transcript. `summary` is a human-readable, already-redacted one-liner
+/// (tool name, target, outcome) capped at 500 characters in the database so a
+/// careless caller cannot smuggle a full payload in. Raw input and output belong in
+/// an `Artifact`, where the checksum makes them verifiable and the storage policy
+/// makes them expirable; a table that every list query scans is the wrong home for
+/// megabytes of model text.
+model ToolInvocation {
+  id         String   @id @default(uuid())
+  orgId      String
+  agentRunId String
+  // Monotonic within a run, assigned by the adapter. Ordering is by this column,
+  // not by timestamp: two tool calls can share a millisecond, and a clock can move.
+  sequence   Int
+  // Tool identifier as the runtime named it (`read`, `edit`, `bash`, `task`).
+  tool       String
+  summary    String   @db.VarChar(500)
+  // Observed time, supplied by the adapter. No default: the database must not
+  // invent a time for something that happened elsewhere.
+  occurredAt DateTime
+
+  // Cascade from both parents: this is derived evidence, and it is worthless
+  // without the run it describes or the tenant that owns it.
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  agentRun     AgentRun     @relation(fields: [agentRunId], references: [id], onDelete: Cascade)
+
+  // Also the index that serves "everything this run did", in order.
+  @@unique([agentRunId, sequence])
+  // Tenant-wide activity feed, newest first.
+  @@index([orgId, occurredAt])
 }
 
 // ─── Governance ──────────────────────────────────────────────────────────────

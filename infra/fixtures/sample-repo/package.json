@@ -1,0 +1,10 @@
+{
+  "name": "sample-repo",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Fixed input for the Phase 3 real-execution proof. No dependencies, no network.",
+  "scripts": {
+    "test": "node --test"
+  }
+}

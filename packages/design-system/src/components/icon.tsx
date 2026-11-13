@@ -56,6 +56,7 @@ export type IconName =
   | 'stop'
   | 'clock'
   | 'rail'
+  | 'download'
   | 'signout';
 
 const PATHS: Readonly<Record<IconName, ReactNode>> = {
@@ -253,6 +254,15 @@ const PATHS: Readonly<Record<IconName, ReactNode>> = {
     <>
       <circle cx="8" cy="8" r="5.5" />
       <path d="M8 4.8V8l2.4 1.7" />
+    </>
+  ),
+  /* From the core set in DESIGN.md §9; the arrow enters a tray, so it never
+     reads as "download finished" (there is no progress state on this glyph). */
+  download: (
+    <>
+      <path d="M8 2.6v7.2" />
+      <path d="M5.2 7.1 8 9.9l2.8-2.8" />
+      <path d="M3.2 12.8h9.6" />
     </>
   ),
   rail: <path d="M2.6 4.2h10.8M2.6 8h10.8M2.6 11.8h10.8" />,

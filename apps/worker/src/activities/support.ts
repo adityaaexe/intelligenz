@@ -24,6 +24,28 @@ export function nonRetryable(type: string, message: string): ApplicationFailure 
   return ApplicationFailure.create({ message, type, nonRetryable: true });
 }
 
+/**
+ * A non-retryable rejection that also carries machine-readable context across the
+ * activity boundary.
+ *
+ * `ApplicationFailure.details` survives the proxy and is how `runTaskWorkflow` learns,
+ * for example, which project a refused task belonged to — without the activity
+ * returning a value the workflow must interpret, and without a second database read in
+ * the workflow sandbox (which has no Prisma).
+ */
+export function nonRetryableWithDetails(
+  type: string,
+  message: string,
+  details: Record<string, unknown>,
+): ApplicationFailure {
+  return ApplicationFailure.create({
+    message,
+    type,
+    nonRetryable: true,
+    details: [details],
+  });
+}
+
 /** A failure that is worth another attempt. `maximumAttempts: 3` still applies. */
 export function retryable(type: string, message: string): ApplicationFailure {
   return ApplicationFailure.create({ message, type, nonRetryable: false });

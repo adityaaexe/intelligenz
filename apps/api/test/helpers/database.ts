@@ -70,6 +70,9 @@ const TEST_HASH_OPTIONS = {
 const TRUNCATE_TABLES = [
   'AuditEvent',
   'ApprovalRequest',
+  'ToolInvocation',
+  'ExecutionAttempt',
+  'ExecutionWorkspace',
   'Evidence',
   'Artifact',
   'AgentRun',

@@ -25,6 +25,8 @@ const config: AppConfig = {
   corsOrigins: [],
   temporal: { address: 'localhost:7233', namespace: 'default', taskQueue: 'intelligenz-tasks' },
   readinessTimeoutMs: 2_000,
+  artifactRoot: '/tmp/intelligenz-test-artifacts',
+  workspaceRoot: '/tmp/intelligenz-test-workspaces',
 };
 
 function responseStub(): ApiResponse & { statusCalls: number[] } {

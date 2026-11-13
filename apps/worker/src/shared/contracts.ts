@@ -89,6 +89,13 @@ export interface ExecuteAgentActivityInput {
   readonly taskId: string;
   readonly orgId: string;
   readonly correlationId: string;
+  /**
+   * Phase 3 addition, optional so a direct caller (a test, a replay script) keeps
+   * working: the database `WorkflowRun.id` this execution belongs to. Without it the
+   * activity falls back to the newest run for the task, which is the same row under
+   * the one-live-workflow-per-task rule. The workflow always passes it.
+   */
+  readonly workflowRunId?: string;
 }
 
 /** The normalised result, exactly as the port defines it. */

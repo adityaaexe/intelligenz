@@ -360,6 +360,55 @@ describe('state machine', () => {
   });
 });
 
+/**
+ * F5 — documented, not silently changed.
+ *
+ * The approval gate is risk-class based: `requiresApproval` is true for `HIGH` and
+ * `CRITICAL` only. A `MEMBER` can therefore create a task labelled `LOW` and run it
+ * with no approval at all. That is a real bypass of the approvals screen as a control,
+ * and it is a **product decision**, not a bug to patch by reclassifying risk on the
+ * owner's behalf: many low-risk edits are meant to run unattended.
+ *
+ * The decision is recorded in `docs/decisions/OPEN-DECISIONS.md` (D-006) with options
+ * and a recommendation. This test exists so the current behaviour is *visible* — if a
+ * later change closes the bypass, this test fails and the decision gets updated.
+ */
+describe('approval gate — current behaviour for LOW risk (F5, documented)', () => {
+  it('lets a MEMBER run a LOW task with no approval request, because LOW is not gated', async () => {
+    const created = await request(suite.app.getHttpServer())
+      .post(tasksPath())
+      .set(authHeaders(memberToken, suite.fixtures.orgA.id))
+      .set('idempotency-key', 'member-low-bypass-1')
+      .send({
+        title: 'LOW change started by a MEMBER with no approval',
+        goal: 'Document the current approval policy: LOW is self-attested.',
+        riskClass: 'LOW',
+        acceptanceCriteria: [],
+      })
+      .expect(201);
+
+    const taskId = (created.body as CreateTaskBody).data.id;
+
+    await request(suite.app.getHttpServer())
+      .patch(taskPath(taskId))
+      .set(authHeaders(memberToken, suite.fixtures.orgA.id))
+      .send({ status: 'ready', reason: 'Ready to run.' })
+      .expect(200);
+
+    // No approval row was ever created for this task: `requiresApproval('LOW')` is false.
+    expect(await suite.prisma.approvalRequest.count({ where: { taskId } })).toBe(0);
+
+    // The run is accepted on the same terms as any other LOW task. With Temporal up it
+    // is a 202; without it, the orchestrator failure is 503 — either way the approval
+    // gate did not refuse it, which is the behaviour under test.
+    const run = await request(suite.app.getHttpServer())
+      .post(`${taskPath(taskId)}/run`)
+      .set(authHeaders(memberToken, suite.fixtures.orgA.id));
+
+    expect([202, 503]).toContain(run.status);
+  });
+});
+
 describe('approval gate (contract §15 A3)', () => {
   it('refuses to start a HIGH risk task without an approved request', async () => {
     const response = await request(suite.app.getHttpServer())
@@ -387,6 +436,28 @@ describe('approval gate (contract §15 A3)', () => {
 
     expect(audits.length).toBeGreaterThan(0);
     expect(audits[0]?.payload).toMatchObject({ reason: 'approval_required', to: 'queued' });
+  });
+
+  it('cannot be queued through PATCH, so the approval gate is not reachable that way', async () => {    // `ready → queued` is a real edge of the state machine, owned by the orchestrator.
+    // Refusing it here is what makes `POST /run` (and its approval check) the only
+    // door to execution; without it a MEMBER could queue a CRITICAL task with two
+    // calls and never touch the gate.
+    const response = await request(suite.app.getHttpServer())
+      .patch(taskPath(suite.fixtures.tasks.highReadyA))
+      .set(authHeaders(ownerToken, suite.fixtures.orgA.id))
+      .send({ status: 'queued' })
+      .expect(409);
+
+    expect((response.body as ApiErrorBody).error.code).toBe('TRANSITION_IS_SYSTEM_MANAGED');
+
+    const row = await suite.prisma.task.findUniqueOrThrow({
+      where: { id: suite.fixtures.tasks.highReadyA },
+    });
+
+    expect(row.status).toBe('ready');
+    expect(
+      await suite.prisma.workflowRun.count({ where: { taskId: suite.fixtures.tasks.highReadyA } }),
+    ).toBe(0);
   });
 
   it('allows the same task once the request is approved', async () => {

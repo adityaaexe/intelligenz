@@ -280,7 +280,15 @@ function SidebarBody({
               <ul className="app-nav__list" id={listId} hidden={isCollapsed}>
                 {group.modules.map((module) => {
                   const href = moduleHref(workspace, module.slug);
-                  const active = pathname === href;
+                  /*
+                   * A task's execution detail is a child of the Overview ledger
+                   * (`/[workspace]/tasks/[taskId]`, reached from the Task queues
+                   * table), so Overview stays current there. Without this the shell
+                   * has no current item and the operator loses their place.
+                   */
+                  const active =
+                    pathname === href ||
+                    (module.slug === 'overview' && pathname.startsWith(`/${workspace}/tasks/`));
                   return (
                     <li key={module.slug}>
                       <Link

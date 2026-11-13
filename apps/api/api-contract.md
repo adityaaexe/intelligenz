@@ -65,6 +65,8 @@ every audit row written by the request.
 | `WORKFLOW_ALREADY_RUNNING` | 409 | An execution for this task is still open under the deterministic workflow id |
 | `INVALID_TRANSITION` | 422 | State machine refused the edge; `details.transition` says which |
 | `RATE_LIMITED` | 429 | Too many sign-in attempts for this `(ip, email)`; `Retry-After` says when |
+| `ARTIFACT_INTEGRITY_FAILED` | 409 | The bytes on disk do not match the recorded SHA-256; nothing is served |
+| `ARTIFACT_GONE` | 410 | The artifact row exists but its file is no longer on this host |
 | `ORCHESTRATOR_UNAVAILABLE` | 503 | Temporal unreachable; nothing was started |
 | `INTERNAL_ERROR` | 500 | Server bug; the message is deliberately opaque |
 
@@ -188,6 +190,120 @@ Risk ranking is `CRITICAL → HIGH → MEDIUM → LOW`, oldest first inside a cl
 `Approval` = `{ id, taskId, riskClass, status, createdAt, decidedAt, decisionNote,
 task: { id, title, status, riskClass, projectId, workspaceId }, requestedBy,
 decidedBy }`.
+
+### Executions (Phase 3)
+
+One row per **attempt**, not per task. A Temporal retry produces a second attempt, so
+"the third time we tried" is addressable without reading timestamps.
+
+| Method | Path | Role | Response |
+|---|---|---|---|
+| GET | `/v1/orgs/:orgId/tasks/:taskId/executions` | any member | `200 { data: ExecutionAttemptSummary[] }` — newest first |
+| GET | `/v1/orgs/:orgId/tasks/:taskId/executions/:attemptId` | any member | `200 { data: { attempt, toolInvocations[], artifacts[] } }` |
+
+```json
+{
+  "id": "uuid",
+  "taskId": "uuid",
+  "workflowRunId": "uuid",
+  "attemptNumber": 1,
+  "runtimeId": "opencode-cli",
+  "runtimeVersion": "2.2.7",
+  "simulated": false,
+  "status": "succeeded",
+  "startedAt": "2026-11-13T10:00:00.000Z",
+  "finishedAt": "2026-11-13T10:00:42.000Z",
+  "durationMs": 42000,
+  "tokensIn": 43598,
+  "tokensOut": 120,
+  "costUsd": "0.0005",
+  "error": null,
+  "workspace": {
+    "id": "uuid",
+    "state": "completed",
+    "sourceKind": "clone",
+    "baseCommit": "…",
+    "branch": "main",
+    "readyAt": "…",
+    "cleanedAt": "…"
+  }
+}
+```
+
+- `simulated` is **required** and comes from the adapter's own report. `false` means a
+  real model call happened. The UI must label every row from this field; never infer it
+  from `runtimeId`.
+- `costUsd` is a **string** (Decimal), so `0.1985` does not become
+  `0.19850000000000001`. `null` means "not reported", which is not `0`.
+- `attemptNumber` is unique per `workflowRunId`; `attemptNumber: 3` implies attempts 1
+  and 2 exist (or existed) for that run.
+- `workspace` is `null` for simulated runs and for attempts that failed before a
+  workspace was provisioned. `state` is the `WorkspaceState` enum
+  (`requested|provisioning|ready|executing|preserving|completed|failed|cancelled`).
+- No absolute host path appears in this response. `workspace.id` is the handle; the
+  directory is not the client's business.
+
+`toolInvocations` (detail only) are **summaries**, already redacted by the adapter,
+ordered by `sequence`. They are capped at 200 rows per run; a truncated trace is
+recorded in the run's `providerMeta`, not silently shortened.
+
+Artifact attribution in the detail response is by `(taskId, runtimeId, time window)`
+because `Artifact` has no `attemptId` in the Phase 3 schema. Only one workflow per task
+can be open at a time, so the window is unambiguous; it is a documented schema gap.
+
+### Artifacts (Phase 3)
+
+| Method | Path | Role | Response |
+|---|---|---|---|
+| GET | `/v1/orgs/:orgId/artifacts/:artifactId` | any member | `200 { data: Artifact }` |
+| GET | `/v1/orgs/:orgId/artifacts/:artifactId/content` | any member for `diff` / `report`; **`ADMIN`+ for `transcript`** | `200` raw bytes, `403` raw transcript to a lower role, `409` integrity failure, `410` file gone |
+
+```json
+{
+  "id": "uuid",
+  "taskId": "uuid",
+  "runtimeId": "opencode-cli",
+  "kind": "transcript",
+  "uri": "org/task/workspace-1/artifacts/transcript.ndjson",
+  "checksum": "sha256 hex",
+  "sizeBytes": 1234,
+  "integrity": "verified",
+  "createdAt": "…",
+  "mediaType": "application/x-ndjson"
+}
+```
+
+- `uri` is **logical**: relative to the configured artifact root that stores the bytes,
+  posix separators, never an absolute host path.
+- `integrity` is computed **at read time** by hashing the file: `verified` (matches),
+  `failed` (bytes differ), `unknown` (file missing or unreadable). It is never a stored
+  `true`, and `unknown` must render as "unverified".
+- **A raw transcript download requires `ADMIN` or higher.** A transcript is model and
+  shell output — whatever the agent read, printed or was told — so it is the
+  highest-risk artifact the platform stores, and downloading it is an administrative
+  act (debugging a run), not a viewing one. `VIEWER` and `MEMBER` keep:
+  - the **metadata** (`GET /artifacts/:id`, including `kind`, `checksum`, `integrity`);
+  - the **`diff`** artifact, which is the redacted change the run produced;
+  - the **`report`** artifact, when one exists.
+
+  The check is per artifact kind, so it cannot be expressed as a route-level role: the
+  row is loaded first and a `transcript` is refused with
+  `403 FORBIDDEN — Raw transcripts require the ADMIN role or higher.` before any byte is
+  read. A refused request never partially streams.
+- `content` re-hashes before the first byte is written:
+  - mismatch → `409 ARTIFACT_INTEGRITY_FAILED`;
+  - missing file → `410 ARTIFACT_GONE`;
+  - path outside every configured root → `404 NOT_FOUND` (never the path);
+  - role below `ADMIN` on a `transcript` → `403 FORBIDDEN`;
+  - success → the bytes plus `ETag: "sha256-…"` and `X-Artifact-Checksum`.
+- A transcript is **redacted at collection time** (before it is written) and capped at
+  5 MiB. Exceeding the cap appends one `{"type":"truncated"}` line and stops; the
+  artifact never grows past the cap.
+- `kind` selects the media type: `transcript` → `application/x-ndjson`, `diff` →
+  `text/x-diff`, `report` → `text/markdown; charset=utf-8`, anything else →
+  `application/octet-stream`.
+
+`TaskDetail.artifacts[].uri` uses the same logical form.
 
 ---
 

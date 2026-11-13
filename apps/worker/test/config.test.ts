@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { loadWorkerConfig, resolveArtifactRoot } from '../src/config';
+import { DEFAULT_AGENT_MAX_USD, loadWorkerConfig, resolveArtifactRoot } from '../src/config';
 
 /**
  * Configuration is a boot-time decision. A wrong artifact root is discovered when the
@@ -57,6 +57,38 @@ describe('loadWorkerConfig', () => {
     expect(config.faultInjection.failExecuteOnce).toBe(true);
     expect(config.runtime.timeoutMs).toBe(1500);
     expect(config.artifactRoot).toBe('/tmp/artifacts');
+  });
+
+  /**
+   * F3/F11: a real adapter with no cap is an unlimited purchase order.
+   *
+   * `AGENT_MAX_USD` used to be commented out in `.env.example` and `undefined` meant
+   * "whatever the adapter defaults to" — which was also "no cap". Now it has a shipped
+   * default, and a real runtime refuses to boot with a non-positive value.
+   */
+  it('ships a default spend cap rather than leaving a real runtime uncapped', () => {
+    const config = loadWorkerConfig({ ...base, AGENT_RUNTIME: 'opencode-cli' });
+
+    expect(config.execution.maxUsd).toBe(DEFAULT_AGENT_MAX_USD);
+    expect(config.execution.maxUsd).toBeGreaterThan(0);
+  });
+
+  it('honours an explicit cap', () => {
+    const config = loadWorkerConfig({ ...base, AGENT_RUNTIME: 'opencode-cli', AGENT_MAX_USD: '1.25' });
+
+    expect(config.execution.maxUsd).toBe(1.25);
+  });
+
+  it('refuses a real runtime with a non-positive cap instead of running unlimited', () => {
+    expect(() =>
+      loadWorkerConfig({ ...base, AGENT_RUNTIME: 'opencode-cli', AGENT_MAX_USD: '0' }),
+    ).toThrow(/AGENT_MAX_USD must be greater than 0/);
+  });
+
+  it('does not require a cap for the simulated runtime, which cannot spend', () => {
+    const config = loadWorkerConfig({ ...base, AGENT_MAX_USD: '0' });
+
+    expect(config.execution.runtimeId).toBe('local-simulated');
   });
 
   it('rejects a nonsense log level rather than silently logging everything', () => {

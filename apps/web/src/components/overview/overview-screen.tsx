@@ -228,7 +228,7 @@ export function OverviewScreen({ workspace }: { readonly workspace: string }) {
           <SystemHealth snapshot={snapshot} onRetry={refresh} />
         </div>
         <div className="ov-grid__two">
-          <TaskQueues snapshot={snapshot} onRetry={refresh} />
+          <TaskQueues snapshot={snapshot} workspace={workspace} onRetry={refresh} />
         </div>
         <AwaitingApprovals snapshot={snapshot} onRetry={refresh} />
         <UsageCost snapshot={snapshot} onRetry={refresh} />

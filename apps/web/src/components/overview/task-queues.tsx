@@ -10,6 +10,7 @@ import {
   riskFromWire,
 } from '@intelligenz/design-system';
 import type { DataTableColumn } from '@intelligenz/design-system';
+import Link from 'next/link';
 
 import type { OverviewSnapshot } from '../../lib/overview';
 import { queueCounts } from '../../lib/overview';
@@ -26,9 +27,11 @@ import { RegionError } from './region-error';
  */
 export function TaskQueues({
   snapshot,
+  workspace,
   onRetry,
 }: {
   readonly snapshot: OverviewSnapshot;
+  readonly workspace: string;
   readonly onRetry: () => void;
 }) {
   const { tasks, projects } = snapshot;
@@ -62,9 +65,13 @@ export function TaskQueues({
       header: 'Task',
       sortValue: (task) => task.title,
       render: (task) => (
-        <span className="iz-truncate" title={task.title}>
+        <Link
+          className="iz-link iz-truncate"
+          href={`/${workspace}/tasks/${task.id}`}
+          title={`Open execution history for ${task.title}`}
+        >
           {task.title}
-        </span>
+        </Link>
       ),
     },
     {
@@ -100,6 +107,7 @@ export function TaskQueues({
           {formatCount(tasks.value.length)} task{tasks.value.length === 1 ? '' : 's'} across{' '}
           {projects.ok ? projects.value.length : 0} project
           {projects.ok && projects.value.length === 1 ? '' : 's'} in this workspace, newest first.
+          A task title opens its execution history, where each attempt is a row.
           Workflow runs are not listed here — <span className="iz-mono">WorkflowRun</span> has no
           read endpoint.
           {snapshot.taskListFailures > 0

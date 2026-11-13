@@ -145,6 +145,103 @@ export interface TaskDetail extends Task {
   readonly approvals: readonly TaskApprovalSummary[];
 }
 
+/* --- executions (Phase 3) ---------------------------------------------- */
+
+/** Mirrors `RunStatus` in `@intelligenz/contracts` — lower-case on the wire. */
+export type RunStatus =
+  | 'queued'
+  | 'running'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled'
+  | 'timed_out';
+
+/** Mirrors the Prisma `WorkspaceState` enum (`packages/contracts/src/execution.ts`). */
+export type ExecutionWorkspaceState =
+  | 'requested'
+  | 'provisioning'
+  | 'ready'
+  | 'executing'
+  | 'preserving'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+/**
+ * Integrity is computed at read time by the API hashing the bytes
+ * (`api-contract.md` §Artifacts). `unknown` is not a soft pass: it means the
+ * bytes could not be read at all.
+ */
+export type ArtifactIntegrity = 'verified' | 'failed' | 'unknown';
+
+export interface ExecutionWorkspace {
+  readonly id: string;
+  readonly state: ExecutionWorkspaceState;
+  readonly sourceKind: string;
+  readonly baseCommit: string | null;
+  readonly branch: string | null;
+  readonly readyAt: string | null;
+  readonly cleanedAt: string | null;
+}
+
+/**
+ * One attempt, transcribed from `api-contract.md` §Executions.
+ *
+ * `simulated` is **required** in the contract and required here: a nullable flag
+ * would let a component default to "real", which is the one lie the column
+ * exists to prevent (ADR-006). Nothing in this app infers provenance from
+ * `runtimeId`; see `lib/execution-state.ts`.
+ */
+export interface ExecutionAttempt {
+  readonly id: string;
+  readonly taskId: string;
+  readonly workflowRunId: string;
+  readonly attemptNumber: number;
+  readonly runtimeId: string;
+  readonly runtimeVersion: string | null;
+  readonly simulated: boolean;
+  readonly status: RunStatus;
+  readonly startedAt: string | null;
+  readonly finishedAt: string | null;
+  readonly durationMs: number | null;
+  readonly tokensIn: number;
+  readonly tokensOut: number;
+  /** Decimal serialised as a string; `null` means "not reported", which is not `0`. */
+  readonly costUsd: string | null;
+  /** Shape is `ExecutionResult.error` or a pre-dispatch failure: not uniform. */
+  readonly error: unknown;
+  readonly workspace: ExecutionWorkspace | null;
+}
+
+/** One redacted tool call. `sequence` is monotonic inside a run, starting at 1. */
+export interface ToolInvocation {
+  readonly id: string;
+  readonly sequence: number;
+  readonly tool: string;
+  readonly summary: string;
+  readonly occurredAt: string;
+}
+
+export interface ExecutionArtifact {
+  readonly id: string;
+  readonly taskId: string;
+  readonly runtimeId: string;
+  readonly kind: string;
+  readonly uri: string;
+  readonly checksum: string;
+  readonly sizeBytes: number;
+  readonly integrity: ArtifactIntegrity;
+  readonly createdAt: string;
+  /** Added by the attempt-detail route; selects the download media type. */
+  readonly mediaType?: string;
+}
+
+export interface ExecutionAttemptDetail {
+  readonly attempt: ExecutionAttempt;
+  readonly toolInvocations: readonly ToolInvocation[];
+  readonly artifacts: readonly ExecutionArtifact[];
+}
+
 /* --- approvals --------------------------------------------------------- */
 
 export interface Approval {

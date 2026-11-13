@@ -15,6 +15,7 @@ import type { Prisma, PrismaClient } from '@intelligenz/database';
 import type { Logger } from 'pino';
 
 import { AuditService } from '../audit/audit.service';
+import { ArtifactsService } from '../artifacts/artifacts.service';
 import { AppError } from '../common/errors';
 import { LOGGER } from '../common/logger';
 import { isUniqueConstraintError } from '../common/prisma-errors';
@@ -81,6 +82,7 @@ export class TasksService {
     @Inject(LOGGER) private readonly logger: Logger,
     @Inject(AuditService) private readonly audit: AuditService,
     @Inject(OrchestratorService) private readonly orchestrator: OrchestratorService,
+    @Inject(ArtifactsService) private readonly artifacts: ArtifactsService,
   ) {}
 
   /**
@@ -359,7 +361,10 @@ export class TasksService {
       artifacts: task.artifacts.map((artifact) => ({
         id: artifact.id,
         kind: artifact.kind,
-        uri: artifact.uri,
+        // Logical, relative to the artifact root that stores it. The stored value is an
+        // absolute host path; returning it would describe the server's filesystem to
+        // every member of the organisation.
+        uri: this.artifacts.logicalUri(artifact.uri),
         checksum: artifact.checksum,
         // BigInt does not survive JSON.stringify; bytes are far inside the safe
         // integer range, so a number is the honest representation.

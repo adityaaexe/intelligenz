@@ -64,6 +64,23 @@ const taskActivities = proxyActivities<typeof activitiesModule.activities>({
 });
 
 /**
+ * The executor gets its own budget. A real agent run is not a 60-second operation —
+ * it clones a repository, thinks, edits, and runs a test suite — and killing it at 60s
+ * would make the real adapter unusable while the simulated one stayed comfortable.
+ * The *reason* for a run's death must still be recorded, so the adapter's own timeout
+ * (55s simulated / `AGENT_TIMEOUT_MS` real) stays below `startToClose`.
+ */
+const executorActivities = proxyActivities<typeof activitiesModule.activities>({
+  startToCloseTimeout: '4m',
+  scheduleToCloseTimeout: '10m',
+  retry: {
+    maximumAttempts: 3,
+    initialInterval: '1s',
+    backoffCoefficient: 2,
+  },
+});
+
+/**
  * A stable id for the worker as an audit actor. Not a user row: `actorType` is `agent`,
  * and inventing a user id would misattribute every run to a person. A fixed v5-shaped
  * UUID keeps it greppable and valid for `EventEnvelope.actor.id`.
@@ -136,7 +153,14 @@ export async function runTaskWorkflow(
       }),
     });
 
-    const result = await taskActivities.executeAgentActivity({ taskId, orgId, correlationId });
+    const result = await executorActivities.executeAgentActivity({
+      taskId,
+      orgId,
+      correlationId,
+      // The database run id, not the Temporal one: the attempt's `workflowRunId` is a
+      // foreign key, and `recordStartActivity` has already resolved which row this is.
+      workflowRunId: started.workflowRunId,
+    });
 
     await taskActivities.persistResultActivity({ taskId, orgId, result });
 
@@ -184,7 +208,10 @@ export async function runTaskWorkflow(
       throw error;
     }
 
-    return await recordUnexpectedFailure(error, input, projectId);
+    // An activity that refused has no return value, so the project it belonged to is
+    // carried in the failure's details (see `validateTaskActivity`). Without this, a
+    // direct-start refusal would end the task with no audit event at all.
+    return await recordUnexpectedFailure(error, input, projectId ?? projectIdFromFailure(error));
   }
 }
 
@@ -429,16 +456,54 @@ function isTerminal(status: TaskStatus): boolean {
  * Normalises a workflow-visible error. `ApplicationFailure.type` is the machine-readable
  * code, and it survives the activity boundary — which is why every activity throws typed
  * failures rather than bare errors.
+ *
+ * It does **not** survive at the top level: Temporal wraps it in `ActivityFailure` (and
+ * that in `ChildWorkflowFailure` when nested), so the code lives somewhere down the
+ * `cause` chain. Walking it is not defensive coding — it is the difference between an
+ * audit row that says `APPROVAL_REQUIRED` and one that says `Error`.
  */
 function describeFailure(error: unknown): { code: string; message: string } {
-  if (error instanceof Error) {
-    const type = (error as { type?: unknown }).type;
+  for (const candidate of errorChain(error)) {
+    const type = (candidate as { type?: unknown }).type;
 
-    return {
-      code: typeof type === 'string' && type.length > 0 ? type : error.name,
-      message: error.message,
-    };
+    if (typeof type === 'string' && type.length > 0) {
+      return { code: type, message: messageOf(candidate) };
+    }
   }
 
-  return { code: 'WORKFLOW_FAILED', message: String(error) };
+  return { code: 'WORKFLOW_FAILED', message: messageOf(error) };
+}
+
+/** The project a refused activity named in its failure details, if it named one. */
+function projectIdFromFailure(error: unknown): string | undefined {
+  for (const candidate of errorChain(error)) {
+    const details = (candidate as { details?: unknown }).details;
+    if (!Array.isArray(details)) continue;
+
+    for (const detail of details) {
+      if (typeof detail !== 'object' || detail === null) continue;
+
+      const projectId = (detail as { projectId?: unknown }).projectId;
+      if (typeof projectId === 'string' && projectId.length > 0) return projectId;
+    }
+  }
+
+  return undefined;
+}
+
+function errorChain(error: unknown, depth = 0): readonly unknown[] {
+  if (depth > 6) return [];
+
+  const chain: unknown[] = [error];
+  const cause = typeof error === 'object' && error !== null ? (error as { cause?: unknown }).cause : undefined;
+
+  if (cause !== undefined && cause !== error) chain.push(...errorChain(cause, depth + 1));
+
+  return chain;
+}
+
+function messageOf(error: unknown): string {
+  if (error instanceof Error && error.message.length > 0) return error.message;
+
+  return String(error);
 }

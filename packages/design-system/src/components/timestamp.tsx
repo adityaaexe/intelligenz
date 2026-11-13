@@ -18,14 +18,24 @@ export interface TimestampProps {
 
 export function Timestamp({ iso, mode = 'relative', now, className }: TimestampProps) {
   const parts = timestampParts(iso, now);
+  const visible = mode === 'absolute' ? parts.absolute : parts.text;
+  const needsSpokenForm = visible !== parts.accessibleLabel;
   return (
-    <time
-      className={className}
-      dateTime={parts.dateTime}
-      title={parts.absolute}
-      aria-label={parts.accessibleLabel}
-    >
-      {mode === 'absolute' ? parts.absolute : parts.text}
+    <time className={className} dateTime={parts.dateTime} title={parts.absolute}>
+      {needsSpokenForm ? (
+        <>
+          {/*
+           * `aria-label` on a `<time>` (no role) is not reliably announced — axe
+           * reports it as `aria-prohibited-attr`. The spoken absolute value is
+           * therefore real text, and the visual short form is hidden from AT so
+           * the value is announced once, in full.
+           */}
+          <span className="iz-sr-only">{parts.accessibleLabel}</span>
+          <span aria-hidden="true">{visible}</span>
+        </>
+      ) : (
+        visible
+      )}
     </time>
   );
 }

@@ -443,7 +443,12 @@
     .app-nav__group-toggle {
       justify-content: center;
       padding: 0;
-      min-height: 18px;
+      /*
+       * 24px, not the 18px the rule visually needs: WCAG 2.2 §2.5.8 sets a 24px
+       * floor on the pointer target, and the collapsed header is still a button.
+       * The visible rule is unchanged (it is the ::before), the hit area is not.
+       */
+      min-height: var(--iz-control-sm);
       color: var(--iz-on-chrome-3);
     }
 
@@ -1131,5 +1136,679 @@
     margin: 0;
     color: var(--iz-ink-1);
     overflow-wrap: anywhere;
+  }
+
+  /* =====================================================================
+     Execution detail — /[workspace]/tasks/[taskId]
+
+     The same ledger language as the Overview: 1px rules between regions, no
+     cards, no shadows, no new colour. Every value below resolves to an `--iz-*`
+     token; nothing here introduces a hue.
+     ===================================================================== */
+
+  .ex-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    margin-top: var(--iz-space-16);
+    background: var(--iz-border-default);
+    border-block: 1px solid var(--iz-border-default);
+  }
+
+  .ex-stack > * {
+    background: var(--iz-color-canvas);
+    min-width: 0;
+  }
+
+  .ex-skeleton {
+    padding: var(--iz-space-16);
+  }
+
+  /* --- task state strip ------------------------------------------------ */
+
+  .ex-taskstrip {
+    margin-top: var(--iz-space-16);
+    border-top: 1px solid var(--iz-border-default);
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+  }
+
+  .ex-taskstrip__cell {
+    display: flex;
+    flex-direction: column;
+    gap: var(--iz-space-4);
+    padding: var(--iz-space-10) var(--iz-space-16);
+    min-width: 0;
+  }
+
+  .ex-taskstrip__value {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--iz-space-8);
+    margin: 0;
+    font-size: var(--iz-text-sm);
+    line-height: var(--iz-leading-sm);
+    color: var(--iz-ink-1);
+    min-width: 0;
+  }
+
+  @media (max-width: 1279.98px) {
+    .ex-taskstrip {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    /* Five cells in a three-column rule grid would paint an empty sixth cell. */
+    .ex-taskstrip__cell:last-child {
+      grid-column: span 2;
+    }
+  }
+
+  @media (max-width: 767.98px) {
+    .ex-taskstrip {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .ex-taskstrip__cell:last-child {
+      grid-column: 1 / -1;
+    }
+  }
+
+  /* A gate is a badge plus its one-line reason; the reason never replaces the
+     word inside the badge, so the state survives a greyscale screenshot. */
+  .ex-gate {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--iz-space-6);
+    min-width: 0;
+  }
+
+  .ex-gate__reason {
+    font-size: var(--iz-text-xs);
+    line-height: var(--iz-leading-xs);
+    color: var(--iz-ink-3);
+  }
+
+  /* --- provenance: Live vs Simulated, never colour alone --------------- */
+
+  /*
+   * Two non-colour channels on top of the glyph and the word: the simulated
+   * badge carries a dashed edge, the live badge a solid one. At 1.4.1 the two
+   * are still distinguishable with every hue removed.
+   */
+  .ex-provenance[data-provenance='simulated'] {
+    border-style: dashed;
+  }
+
+  .ex-provenance[data-provenance='live'] {
+    border-style: solid;
+  }
+
+  /* --- run state ------------------------------------------------------- */
+
+  .ex-runstate {
+    display: inline-flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: var(--iz-space-6);
+    min-width: 0;
+  }
+
+  .ex-runstate__qualifier {
+    font-size: var(--iz-text-xs);
+    color: var(--iz-ink-3);
+    white-space: nowrap;
+  }
+
+  /* Failed integrity is loud: bolder word, tinted row, and a sentence. */
+  .ex-integrity[data-loud='true'] {
+    font-weight: var(--iz-weight-semibold);
+  }
+
+  /* --- attempt table --------------------------------------------------- */
+
+  .ex-attempts tbody tr[data-selected='true'] td {
+    background: var(--iz-color-surface-3);
+  }
+
+  /* Selection is also a 2px ink inset bar, the table convention (DESIGN.md §4.9). */
+  .ex-attempts tbody tr[data-selected='true'] td:first-child {
+    box-shadow: inset 2px 0 0 var(--iz-ink-1);
+  }
+
+  .ex-attempt-select {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--iz-space-4);
+    min-height: var(--iz-control-sm);
+    margin: 0 calc(var(--iz-space-4) * -1);
+    padding: 0 var(--iz-space-4);
+    border: 1px solid transparent;
+    border-radius: var(--iz-radius-sm);
+    background: transparent;
+    color: var(--iz-ink-1);
+    font: inherit;
+    cursor: pointer;
+  }
+
+  .ex-attempt-select:hover {
+    background: var(--iz-color-surface-3);
+  }
+
+  .ex-workspace-state {
+    font-size: var(--iz-text-xs);
+    color: var(--iz-ink-2);
+  }
+
+  .ex-runtime {
+    display: block;
+    max-width: 100%;
+    font-size: var(--iz-text-mono-sm);
+  }
+
+  /* --- attempt detail -------------------------------------------------- */
+
+  .ex-detail {
+    min-width: 0;
+    /* A disclosed region must not be scrolled under the sticky bars. */
+    scroll-margin-top: calc(var(--iz-topbar-h) + var(--iz-scopebar-h) + var(--iz-space-8));
+  }
+
+  .ex-detail:focus-visible {
+    outline-offset: -2px;
+  }
+
+  .ex-detail__head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--iz-space-12);
+    min-height: 40px;
+    padding: var(--iz-space-8) var(--iz-space-16);
+    border-bottom: 1px solid var(--iz-border-default);
+  }
+
+  .ex-detail__title {
+    display: flex;
+    align-items: baseline;
+    gap: var(--iz-space-6);
+    font-size: var(--iz-text-md);
+    line-height: var(--iz-leading-md);
+    font-weight: var(--iz-weight-semibold);
+    letter-spacing: -0.005em;
+    color: var(--iz-ink-1);
+    text-wrap: balance;
+  }
+
+  .ex-detail__badges {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--iz-space-8);
+  }
+
+  .ex-detail__section {
+    padding: var(--iz-space-16);
+    border-top: 1px solid var(--iz-border-default);
+    min-width: 0;
+  }
+
+  .ex-detail__subtitle {
+    display: flex;
+    align-items: baseline;
+    gap: var(--iz-space-8);
+    font-size: var(--iz-text-md);
+    line-height: var(--iz-leading-md);
+    font-weight: var(--iz-weight-semibold);
+    letter-spacing: -0.005em;
+    color: var(--iz-ink-1);
+  }
+
+  .ex-detail__section-head {
+    display: flex;
+    align-items: baseline;
+    gap: var(--iz-space-8);
+  }
+
+  .ex-detail__count {
+    font-size: var(--iz-text-xs);
+    font-weight: var(--iz-weight-regular);
+    color: var(--iz-ink-3);
+    font-variant-numeric: tabular-nums slashed-zero;
+  }
+
+  .ex-detail__meta {
+    margin: var(--iz-space-4) 0 0;
+    font-size: var(--iz-text-xs);
+    line-height: var(--iz-leading-xs);
+    color: var(--iz-ink-3);
+    max-width: 78ch;
+    text-wrap: pretty;
+  }
+
+  .ex-detail__body {
+    margin: var(--iz-space-4) 0 0;
+    font-size: var(--iz-text-sm);
+    line-height: var(--iz-leading-sm);
+    color: var(--iz-ink-2);
+    max-width: 72ch;
+    text-wrap: pretty;
+  }
+
+  .ex-detail__banner {
+    border-bottom: 1px solid var(--iz-border-default);
+  }
+
+  /* A failed attempt's error text is an alert row, not a footnote. */
+  .ex-detail__failure {
+    margin: 0 var(--iz-space-16) var(--iz-space-16);
+    padding: var(--iz-space-10) var(--iz-space-12);
+    border: 1px solid color-mix(in oklab, var(--iz-status-failed-fg) 32%, transparent);
+    border-radius: var(--iz-radius-sm);
+    background: var(--iz-status-failed-bg);
+  }
+
+  .ex-detail__failure-title {
+    display: flex;
+    align-items: center;
+    gap: var(--iz-space-6);
+    font-size: var(--iz-text-sm);
+    line-height: var(--iz-leading-sm);
+    font-weight: var(--iz-weight-medium);
+    color: var(--iz-ink-1);
+  }
+
+  .ex-detail__failure-title svg {
+    color: var(--iz-status-failed-fg);
+    flex-shrink: 0;
+  }
+
+  .ex-detail__error {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--iz-space-6);
+    font-size: var(--iz-text-sm);
+    line-height: var(--iz-leading-sm);
+    color: var(--iz-ink-1);
+  }
+
+  .ex-detail__error svg {
+    margin-top: 1px;
+    color: var(--iz-status-failed-fg);
+    flex-shrink: 0;
+  }
+
+  /* --- key/value rows -------------------------------------------------- */
+
+  .ex-kv {
+    display: flex;
+    flex-direction: column;
+    margin: 0;
+  }
+
+  .ex-kv--grid {
+    padding: var(--iz-space-4) 0;
+  }
+
+  @media (min-width: 768px) {
+    .ex-kv--grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      column-gap: var(--iz-space-24);
+    }
+  }
+
+  .ex-kv__row {
+    display: grid;
+    grid-template-columns: minmax(84px, 132px) minmax(0, 1fr);
+    gap: var(--iz-space-12);
+    padding: var(--iz-space-6) var(--iz-space-16);
+    border-bottom: 1px solid var(--iz-border-subtle);
+    font-size: var(--iz-text-xs);
+    line-height: var(--iz-leading-xs);
+  }
+
+  .ex-kv__row:last-child {
+    border-bottom: 0;
+  }
+
+  .ex-kv dt {
+    color: var(--iz-ink-3);
+  }
+
+  .ex-kv dd {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--iz-space-4);
+    margin: 0;
+    color: var(--iz-ink-1);
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .ex-kv__id {
+    font-size: var(--iz-text-mono-xs);
+    line-height: var(--iz-leading-mono-xs);
+    color: var(--iz-ink-2);
+  }
+
+  .ex-muted {
+    color: var(--iz-ink-3);
+  }
+
+  /* --- tool timeline --------------------------------------------------- */
+
+  .ex-timeline {
+    list-style: none;
+    margin: var(--iz-space-8) 0 0;
+    padding: 0;
+    border-top: 1px solid var(--iz-border-subtle);
+  }
+
+  /*
+   * Below 768 the row is two lines: sequence / tool / time, then the summary
+   * across the full width. A trace is read line by line on a phone, so the
+   * summary gets the width rather than being squeezed into a column.
+   */
+  .ex-timeline__item {
+    display: grid;
+    grid-template-columns: var(--iz-space-24) minmax(0, 1fr) auto;
+    grid-template-areas:
+      'seq tool time'
+      '. summary summary';
+    gap: var(--iz-space-2) var(--iz-space-8);
+    padding: var(--iz-space-8) var(--iz-space-16);
+    border-bottom: 1px solid var(--iz-border-subtle);
+    min-width: 0;
+  }
+
+  @media (min-width: 768px) {
+    .ex-timeline__item {
+      grid-template-columns: var(--iz-space-24) 96px minmax(0, 1fr) 72px;
+      grid-template-areas: 'seq tool summary time';
+      align-items: baseline;
+    }
+  }
+
+  .ex-timeline__seq {
+    grid-area: seq;
+    color: var(--iz-ink-3);
+    font-size: var(--iz-text-mono-xs);
+    line-height: var(--iz-leading-mono-xs);
+    text-align: right;
+    padding-right: var(--iz-space-2);
+  }
+
+  .ex-timeline__tool {
+    grid-area: tool;
+    color: var(--iz-ink-1);
+    font-size: var(--iz-text-mono-sm);
+    line-height: var(--iz-leading-mono-sm);
+    overflow-wrap: anywhere;
+  }
+
+  .ex-timeline__summary {
+    grid-area: summary;
+    color: var(--iz-ink-2);
+    font-size: var(--iz-text-sm);
+    line-height: var(--iz-leading-sm);
+    overflow-wrap: anywhere;
+    text-wrap: pretty;
+  }
+
+  /* A command is an identifier: monospace, and its output keeps its own lines. */
+  .ex-timeline__summary--command {
+    color: var(--iz-ink-1);
+    font-size: var(--iz-text-mono-xs);
+    line-height: var(--iz-leading-mono-xs);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .ex-timeline__time {
+    grid-area: time;
+    color: var(--iz-ink-3);
+    font-family: var(--iz-font-mono);
+    font-size: var(--iz-text-mono-xs);
+    line-height: var(--iz-leading-mono-xs);
+    text-align: right;
+    white-space: nowrap;
+  }
+
+  .ex-note {
+    margin: var(--iz-space-8) 0 0;
+    font-size: var(--iz-text-xs);
+    line-height: var(--iz-leading-xs);
+    color: var(--iz-ink-3);
+    max-width: 78ch;
+    text-wrap: pretty;
+  }
+
+  /* --- artifacts ------------------------------------------------------- */
+
+  /*
+   * Fixed layout is what makes an unbroken logical uri truncate instead of
+   * widening the table: an auto-layout table sizes to the longest unbreakable
+   * string, which pushed the Download control outside the scroll region.
+   */
+  .ex-artifacts {
+    table-layout: fixed;
+  }
+
+  /*
+   * Widths are declared here, not inline, so a column hidden with `.iz-col-sm`
+   * stops reserving its width. An inline width on a `display: none` cell still
+   * took space in fixed layout, which starved the uri column at 390.
+   */
+  .ex-artifacts th:nth-child(4),
+  .ex-artifacts td:nth-child(4) {
+    width: 112px;
+  }
+
+  .ex-artifacts th:nth-child(5),
+  .ex-artifacts td:nth-child(5) {
+    width: 108px;
+  }
+
+  @media (min-width: 768px) {
+    .ex-artifacts th:nth-child(2),
+    .ex-artifacts td:nth-child(2) {
+      width: 96px;
+    }
+
+    .ex-artifacts th:nth-child(3),
+    .ex-artifacts td:nth-child(3) {
+      width: 88px;
+    }
+  }
+
+  .ex-artifacts td {
+    vertical-align: top;
+  }
+
+  .ex-artifact-uri {
+    display: flex;
+    align-items: baseline;
+    max-width: 100%;
+    min-width: 0;
+    font-size: var(--iz-text-mono-xs);
+    line-height: var(--iz-leading-mono-xs);
+    color: var(--iz-ink-2);
+  }
+
+  .ex-artifact-uri__dir {
+    /* Shrinks (and only shrinks) so the two parts stay adjacent when they fit. */
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--iz-ink-3);
+  }
+
+  /* The file name is what distinguishes one artifact from another, so it keeps
+     its width; only if it alone exceeds the cell does it truncate. */
+  .ex-artifact-uri__name {
+    flex: 0 0 auto;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--iz-ink-1);
+  }
+
+  /*
+   * An integrity failure means the bytes on disk are not the bytes the ledger
+   * recorded. That row is an alert row: tinted, with the sentence beside the
+   * label so the state cannot be read as a formatting quirk.
+   */
+  .ex-artifacts tbody tr[data-integrity='failed'] td {
+    background: var(--iz-status-failed-bg);
+  }
+
+  .ex-artifacts td[data-align='right'] {
+    white-space: nowrap;
+  }
+
+  /*
+   * At 390 the download control becomes its 24px glyph: the button keeps one
+   * accessible name (`aria-label="Download <uri>"`), so hiding the word costs a
+   * sighted label but not the name, and the uri gets the width instead.
+   */
+  .ex-download {
+    gap: var(--iz-space-4);
+  }
+
+  .ex-download__icon {
+    display: none;
+  }
+
+  @media (max-width: 767.98px) {
+    .ex-download {
+      width: var(--iz-control-sm);
+      padding: 0;
+    }
+
+    .ex-download .ex-download__label {
+      display: none;
+    }
+
+    .ex-download .ex-download__icon {
+      display: inline-flex;
+    }
+
+    .ex-artifacts th:nth-child(4),
+    .ex-artifacts td:nth-child(4) {
+      width: 100px;
+    }
+
+    .ex-artifacts th:nth-child(5),
+    .ex-artifacts td:nth-child(5) {
+      width: 44px;
+    }
+  }
+
+  .ex-artifacts__alarm {
+    display: block;
+    margin-top: var(--iz-space-2);
+    font-size: var(--iz-text-xs);
+    line-height: var(--iz-leading-xs);
+    color: var(--iz-ink-1);
+  }
+
+  .ex-artifacts__alarm strong {
+    font-weight: var(--iz-weight-semibold);
+    color: var(--iz-status-failed-fg);
+  }
+
+  .ex-artifact-failure {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--iz-space-12);
+    padding: var(--iz-space-12) var(--iz-space-16);
+    border-top: 1px solid color-mix(in oklab, var(--iz-status-failed-fg) 32%, transparent);
+    background: var(--iz-status-failed-bg);
+  }
+
+  .ex-artifact-failure__text {
+    display: flex;
+    flex-direction: column;
+    gap: var(--iz-space-2);
+    min-width: 0;
+    flex: 1 1 380px;
+  }
+
+  .ex-artifact-failure__title {
+    display: flex;
+    align-items: center;
+    gap: var(--iz-space-6);
+    font-size: var(--iz-text-sm);
+    line-height: var(--iz-leading-sm);
+    font-weight: var(--iz-weight-semibold);
+    color: var(--iz-ink-1);
+  }
+
+  .ex-artifact-failure__title svg {
+    flex-shrink: 0;
+    color: var(--iz-status-failed-fg);
+  }
+
+  .ex-artifact-failure__body {
+    font-size: var(--iz-text-sm);
+    line-height: var(--iz-leading-sm);
+    color: var(--iz-ink-2);
+    max-width: 72ch;
+    text-wrap: pretty;
+    overflow-wrap: anywhere;
+  }
+
+  .ex-artifact-failure__meta {
+    font-size: var(--iz-text-xs);
+    line-height: var(--iz-leading-xs);
+    color: var(--iz-ink-3);
+  }
+
+  .ex-artifact-failure__actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--iz-space-8);
+    flex-shrink: 0;
+  }
+
+  /* --- workspace ------------------------------------------------------- */
+
+  .ex-workspace-empty {
+    padding: var(--iz-space-16) 0;
+    max-width: 72ch;
+  }
+
+  .ex-workspace-empty__title {
+    font-size: var(--iz-text-sm);
+    line-height: var(--iz-leading-sm);
+    font-weight: var(--iz-weight-medium);
+    color: var(--iz-ink-1);
+  }
+
+  .ex-workspace-empty__body {
+    margin-top: var(--iz-space-4);
+    font-size: var(--iz-text-sm);
+    line-height: var(--iz-leading-sm);
+    color: var(--iz-ink-2);
+    text-wrap: pretty;
+  }
+
+  /* --- region error ---------------------------------------------------- */
+
+  .ex-region-error {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--iz-space-4);
+    padding: var(--iz-space-24) var(--iz-space-16);
+    max-width: 72ch;
   }
 }

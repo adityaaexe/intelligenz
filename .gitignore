@@ -23,6 +23,9 @@ test-results/
 # Local runtime state (contract §4, §15 A5) — never committed, never backed up
 .temporal/
 .artifacts/
+# Disposable execution workspaces (`WORKSPACE_ROOT`). One directory per agent run,
+# deleted by the cleaner; never committed, never backed up.
+.workspaces/
 
 # Turbo (not used today; harmless if a later unit adds it)
 .turbo/

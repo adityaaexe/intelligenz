@@ -1,0 +1,172 @@
+import { randomUUID } from 'node:crypto';
+
+import { createPrismaClient, type PrismaClient } from '@intelligenz/database';
+
+import { loadNearestEnvFile } from '../../src/config';
+
+/**
+ * Worker-test database access.
+ *
+ * Same two guards as the other integration suites: the URL comes from
+ * `TEST_DATABASE_URL`, and the database name must end in `_test` — a test that
+ * truncates or writes into the wrong database is worse than a failing one.
+ *
+ * Unlike the API suites, these tests **never truncate**: the root `vitest run` executes
+ * `packages/database`'s and this package's files concurrently against the same test
+ * database, so each test owns a randomly-suffixed tenant and removes only that tenant.
+ */
+
+loadNearestEnvFile();
+
+export interface TestDatabase {
+  readonly client: PrismaClient;
+  readonly url: string;
+}
+
+export function testDatabaseUrl(): string | undefined {
+  const url = process.env['TEST_DATABASE_URL']?.trim();
+  if (url === undefined || url.length === 0) return undefined;
+
+  const databaseName = new URL(url).pathname.replace(/^\//, '');
+
+  if (!databaseName.endsWith('_test')) {
+    throw new Error(
+      `Refusing to run worker tests against "${databaseName}": TEST_DATABASE_URL must name a *_test database.`,
+    );
+  }
+
+  return url;
+}
+
+/**
+ * Points the activity code at the test database.
+ *
+ * `getPrismaClient()` and `getWorkerConfig()` are lazy singletons that read
+ * `process.env` on first use, so this must run before the first activity call — not
+ * before the imports.
+ */
+export function useTestDatabase(): TestDatabase {
+  const url = testDatabaseUrl();
+
+  if (url === undefined) {
+    throw new Error('TEST_DATABASE_URL is not set; integration tests need a *_test database.');
+  }
+
+  process.env['DATABASE_URL'] = url;
+
+  return { client: createPrismaClient(url), url };
+}
+
+export interface TenantFixture {
+  readonly orgId: string;
+  readonly workspaceId: string;
+  readonly projectId: string;
+  readonly userId: string;
+}
+
+export interface TaskFixture {
+  readonly taskId: string;
+  readonly workflowRunId: string;
+}
+
+export async function createTenant(client: PrismaClient, label: string): Promise<TenantFixture> {
+  const suffix = randomUUID().slice(0, 8);
+  const slug = `${label}-${suffix}`;
+
+  const organization = await client.organization.create({
+    data: { name: `${label} ${suffix}`, slug },
+  });
+
+  const workspace = await client.workspace.create({
+    data: { orgId: organization.id, name: `${label} workspace`, slug: 'main' },
+  });
+
+  const project = await client.project.create({
+    data: {
+      orgId: organization.id,
+      workspaceId: workspace.id,
+      key: 'TEST',
+      name: `${label} project`,
+      environment: 'dev',
+    },
+  });
+
+  const user = await client.user.create({
+    data: { email: `${slug}@example.test`, name: `${label} user`, passwordHash: 'not-a-hash' },
+  });
+
+  return {
+    orgId: organization.id,
+    workspaceId: workspace.id,
+    projectId: project.id,
+    userId: user.id,
+  };
+}
+
+export async function createTask(
+  client: PrismaClient,
+  tenant: TenantFixture,
+  input: {
+    readonly title: string;
+    readonly goal?: string;
+    readonly status?: 'draft' | 'ready' | 'queued';
+    readonly riskClass?: 'LOW' | 'HIGH';
+  },
+): Promise<TaskFixture> {
+  const suffix = randomUUID().slice(0, 8);
+
+  const task = await client.task.create({
+    data: {
+      orgId: tenant.orgId,
+      projectId: tenant.projectId,
+      workspaceId: tenant.workspaceId,
+      title: input.title,
+      goal: input.goal ?? 'Fix the failing test in src/sum.js and prove it passes.',
+      status: input.status ?? 'ready',
+      riskClass: input.riskClass ?? 'LOW',
+      acceptanceCriteria: [],
+      createdById: tenant.userId,
+      idempotencyKey: `worker-${suffix}`,
+    },
+  });
+
+  const run = await client.workflowRun.create({
+    data: {
+      orgId: tenant.orgId,
+      taskId: task.id,
+      workflowId: `task-${task.id}`,
+      temporalRunId: `test-run-${suffix}`,
+      status: 'running',
+      startedAt: new Date(),
+    },
+  });
+
+  return { taskId: task.id, workflowRunId: run.id };
+}
+
+/**
+ * Removes one tenant and everything it owns, in dependency order.
+ *
+ * `ExecutionAttempt.orgId` and `ExecutionWorkspace.orgId` are `Restrict`, so the
+ * organization cannot be deleted until those rows are gone. `AgentRun.workspaceId`
+ * is `SetNull`, so it must be nulled before the workspace rows are removed.
+ */
+export async function dropTenant(client: PrismaClient, fixture: TenantFixture): Promise<void> {
+  const orgId = fixture.orgId;
+
+  await client.toolInvocation.deleteMany({ where: { orgId } });
+  await client.executionAttempt.deleteMany({ where: { orgId } });
+  await client.agentRun.updateMany({ where: { orgId }, data: { workspaceId: null } });
+  await client.executionWorkspace.deleteMany({ where: { orgId } });
+  // `ApprovalRequest.task` and `AuditEvent.organization` are `Restrict`: the history
+  // must outlive the aggregate, so it has to be removed explicitly before the org.
+  await client.approvalRequest.deleteMany({ where: { orgId } });
+  await client.auditEvent.deleteMany({ where: { orgId } });
+  await client.organization.delete({ where: { id: orgId } });
+
+  // `User` is not owned by an organisation — deleting the organisation removes the
+  // membership, not the account. Leaving the row behind makes the seed test's global
+  // `User` count depend on which suites ran first, which is exactly the kind of
+  // order-dependent assertion this suite is supposed to avoid.
+  await client.user.delete({ where: { id: fixture.userId } }).catch(() => undefined);
+}

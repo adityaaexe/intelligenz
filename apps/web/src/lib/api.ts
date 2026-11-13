@@ -1,6 +1,8 @@
 import type {
   Approval,
   DataEnvelope,
+  ExecutionAttempt,
+  ExecutionAttemptDetail,
   HealthReady,
   LoginResponse,
   Page,
@@ -39,6 +41,8 @@ export type ApiErrorCode =
   | 'WORKFLOW_ALREADY_RUNNING'
   | 'INVALID_TRANSITION'
   | 'ORCHESTRATOR_UNAVAILABLE'
+  | 'ARTIFACT_INTEGRITY_FAILED'
+  | 'ARTIFACT_GONE'
   | 'INTERNAL_ERROR'
   /** Client-side: the request never reached the API. */
   | 'NETWORK_ERROR'
@@ -97,6 +101,8 @@ const KNOWN_CODES: ReadonlySet<string> = new Set<ApiErrorCode>([
   'WORKFLOW_ALREADY_RUNNING',
   'INVALID_TRANSITION',
   'ORCHESTRATOR_UNAVAILABLE',
+  'ARTIFACT_INTEGRITY_FAILED',
+  'ARTIFACT_GONE',
   'INTERNAL_ERROR',
 ]);
 
@@ -322,4 +328,67 @@ export class ApiClient {
   async listApprovals(orgId: string, limit = 50): Promise<Page<Approval>> {
     return this.requestPage<Approval>(`/v1/orgs/${orgId}/approvals?limit=${limit}`, orgId);
   }
+
+  /**
+   * Attempts for one task, newest first. `api-contract.md` §Executions makes this a
+   * plain `{ data }` envelope: it is deliberately not paginated, so reading it as a
+   * page would reject a valid response (the same defect `listProjects` documents).
+   */
+  async listExecutions(orgId: string, taskId: string): Promise<readonly ExecutionAttempt[]> {
+    return this.request<readonly ExecutionAttempt[]>(
+      `/v1/orgs/${orgId}/tasks/${taskId}/executions`,
+      {},
+      orgId,
+    );
+  }
+
+  /** One attempt plus its redacted tool trace and its attributed artifacts. */
+  async getExecution(
+    orgId: string,
+    taskId: string,
+    attemptId: string,
+  ): Promise<ExecutionAttemptDetail> {
+    return this.request<ExecutionAttemptDetail>(
+      `/v1/orgs/${orgId}/tasks/${taskId}/executions/${attemptId}`,
+      {},
+      orgId,
+    );
+  }
+
+  /**
+   * Artifact bytes.
+   *
+   * The route is authenticated and the token lives in this tab, so a plain `<a href>`
+   * cannot be used: the browser would send no `Authorization` header. The bytes are
+   * fetched here and handed to the caller as a `Blob`.
+   *
+   * `api-contract.md` §Artifacts re-hashes before the first byte, which is why a
+   * corrupted file arrives as `409 ARTIFACT_INTEGRITY_FAILED` rather than as a
+   * truncated download. That distinction is the reason this method does not fall back
+   * to `response.blob()` on a non-2xx.
+   */
+  async artifactContent(orgId: string, artifactId: string): Promise<ArtifactDownload> {
+    const response = await this.send(
+      `/v1/orgs/${orgId}/artifacts/${artifactId}/content`,
+      { headers: { accept: '*/*' } },
+      orgId,
+    );
+    if (!response.ok) {
+      await this.fail(response);
+    }
+    return {
+      blob: await response.blob(),
+      // Not exposed by CORS today (`enableCors` has no `exposedHeaders`), so this is
+      // read opportunistically and the UI treats absence as unknown, not as a match.
+      mediaType: response.headers.get('content-type'),
+      checksum: response.headers.get('x-artifact-checksum'),
+    };
+  }
+}
+
+/** The bytes plus the headers a browser is allowed to read for them. */
+export interface ArtifactDownload {
+  readonly blob: Blob;
+  readonly mediaType: string | null;
+  readonly checksum: string | null;
 }

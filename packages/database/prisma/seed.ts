@@ -337,7 +337,7 @@ export async function seed(prisma: SeedPrisma): Promise<SeedSummary> {
 
     await prisma.agentRun.upsert({
       where: { id: stableUuid(`agent-run:${running.key}`) },
-      update: { status: 'running', startedAt },
+      update: { status: 'running', startedAt, simulated: true },
       create: {
         id: stableUuid(`agent-run:${running.key}`),
         orgId: organization.id,
@@ -351,6 +351,10 @@ export async function seed(prisma: SeedPrisma): Promise<SeedSummary> {
         tokensIn: running.tokensIn,
         tokensOut: running.tokensOut,
         costUsd: running.cost,
+        // Phase 3 column. Stated explicitly rather than left to the column default:
+        // the default is `false`, and a seeded fixture that quietly claims a real
+        // runtime ran is exactly the mislabelling the column exists to prevent.
+        simulated: true,
       },
     });
   }

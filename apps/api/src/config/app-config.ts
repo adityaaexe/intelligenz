@@ -1,4 +1,6 @@
 import type { Level } from 'pino';
+import { existsSync } from 'node:fs';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 
 /**
  * Configuration is read once, at boot, and injected — never read from
@@ -29,6 +31,18 @@ export interface AppConfig {
   readonly temporal: TemporalConfig;
   /** Bounds every readiness probe. A hung dependency must not hang the probe. */
   readonly readinessTimeoutMs: number;
+  /**
+   * Where the worker writes evidence (`ARTIFACT_ROOT`, contract §15 A5: the two
+   * services must agree). Absolute; a relative value resolves against the repository
+   * root, not the process cwd.
+   */
+  readonly artifactRoot: string;
+  /**
+   * Where real runs lease a disposable checkout (`WORKSPACE_ROOT`). Artifacts of a
+   * real run live at `<workspace>/artifacts`, so the API must know this root too — a
+   * run's transcript is evidence, and evidence is served, not guessed.
+   */
+  readonly workspaceRoot: string;
 }
 
 /**
@@ -191,6 +205,8 @@ function readPort(env: NodeJS.ProcessEnv): number {
  * can build one without touching the real process environment.
  */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
+  const repositoryRoot = findRepositoryRoot();
+
   return {
     nodeEnv: readString(env, 'NODE_ENV', 'development'),
     port: readPort(env),
@@ -210,5 +226,49 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       taskQueue: readString(env, 'TEMPORAL_TASK_QUEUE', 'intelligenz-tasks'),
     },
     readinessTimeoutMs: readInteger(env, 'READINESS_TIMEOUT_MS', 2_000),
+    artifactRoot: resolveRoot(env['ARTIFACT_ROOT'], '.artifacts', repositoryRoot),
+    workspaceRoot: resolveRoot(env['WORKSPACE_ROOT'], '.workspaces', repositoryRoot),
   };
+}
+
+/**
+ * A storage root as an absolute path.
+ *
+ * A relative `ARTIFACT_ROOT` must mean the same directory whether the API was started
+ * from the repository root or from `apps/api` — otherwise the worker writes evidence
+ * somewhere the API cannot find it, and the failure appears as a 410 on a file that
+ * plainly exists. Walking up to `pnpm-workspace.yaml` is how both services agree.
+ */
+export function resolveRoot(
+  value: string | undefined,
+  fallback: string,
+  repositoryRoot: string = findRepositoryRoot(),
+): string {
+  const configured = value?.trim();
+  const candidate = configured !== undefined && configured.length > 0 ? configured : fallback;
+
+  return isAbsolute(candidate) ? resolve(candidate) : resolve(repositoryRoot, candidate);
+}
+
+let repositoryRootCache: string | undefined;
+
+export function findRepositoryRoot(startDirectory: string = process.cwd()): string {
+  if (repositoryRootCache !== undefined) return repositoryRootCache;
+
+  let directory = resolve(startDirectory);
+
+  for (let depth = 0; depth < 6; depth += 1) {
+    if (existsSync(join(directory, 'pnpm-workspace.yaml'))) {
+      repositoryRootCache = directory;
+      return directory;
+    }
+
+    const parent = dirname(directory);
+    if (parent === directory) break;
+    directory = parent;
+  }
+
+  repositoryRootCache = resolve(startDirectory);
+
+  return repositoryRootCache;
 }

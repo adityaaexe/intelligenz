@@ -4,6 +4,7 @@ import type { Logger } from 'pino';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AppError } from '../src/common/errors';
+import type { ArtifactsService } from '../src/artifacts/artifacts.service';
 import type { AuditService } from '../src/audit/audit.service';
 import type { OrchestratorService } from '../src/orchestrator/orchestrator.service';
 import { HUMAN_TRANSITIONS, isHumanTransition } from '../src/tasks/human-transitions';
@@ -111,8 +112,11 @@ function makeHarness(): {
   } as unknown as Logger;
   const audit = { recordWithin: vi.fn(async () => undefined) } as unknown as AuditService;
   const orchestrator = {} as unknown as OrchestratorService;
+  // The service only renders a logical artifact uri for `detail`, which these tests do
+  // not exercise; the locator is still required by the constructor.
+  const artifacts = { logicalUri: (uri: string) => uri } as unknown as ArtifactsService;
 
-  const service = new TasksService(prisma, logger, audit, orchestrator);
+  const service = new TasksService(prisma, logger, audit, orchestrator, artifacts);
 
   return {
     service,

@@ -4,7 +4,7 @@ import type {
   ValidateTaskActivityInput,
   ValidateTaskActivityResult,
 } from '../shared/contracts';
-import { db } from './support';
+import { db, nonRetryableWithDetails } from './support';
 
 /**
  * `validateTaskActivity` — contract §16.
@@ -75,13 +75,22 @@ export async function validateTaskActivity(
     });
 
     if (approved === null) {
-      return {
-        runnable: false,
-        reason: 'approval_required',
-        status: task.status,
-        projectId: task.projectId,
-        detail: `Task ${task.id} is ${task.riskClass} and has no APPROVED approval request.`,
-      };
+      // **Thrown, not returned.** A caller that started this workflow directly — no
+      // API, no `POST /run` — must not be able to distinguish "refused" from "nothing
+      // to do": the refusal is an exception that ends the workflow, and the details
+      // carry the project id so the workflow can still write the audit event without a
+      // second query. The API's own gate is checked first; this is the gate that cannot
+      // be bypassed (Phase 3 §7, path 3).
+      throw nonRetryableWithDetails(
+        'APPROVAL_REQUIRED',
+        `Task ${task.id} is ${task.riskClass} and has no APPROVED approval request.`,
+        {
+          reason: 'approval_required',
+          taskId: task.id,
+          projectId: task.projectId,
+          riskClass: task.riskClass,
+        },
+      );
     }
   }
 

@@ -55,11 +55,28 @@ async function main(): Promise<void> {
   );
 
   const runtime = getAgentRuntime(config);
-  const capabilities = await runtime.capabilities();
+  const [capabilities, health] = await Promise.all([runtime.capabilities(), runtime.health()]);
 
   logger.info(
-    { runtimeId: runtime.id, simulated: true, capabilities },
-    'agent runtime registered — SIMULATED, performs no real work',
+    {
+      runtimeId: runtime.id,
+      simulated: health.simulated,
+      health: health.status,
+      detail: health.detail,
+      capabilities,
+      // Real runs are opt-in; log the boundary they will execute in, not just the id.
+      ...(health.simulated
+        ? {}
+        : {
+            workspaceRoot: config.workspace.root,
+            sourceRepoConfigured: config.workspace.sourceRepo !== undefined,
+            model: config.execution.model ?? '(adapter default)',
+            maxUsd: config.execution.maxUsd ?? '(adapter default)',
+          }),
+    },
+    health.simulated
+      ? 'agent runtime registered — SIMULATED, performs no real work'
+      : 'agent runtime registered — REAL execution enabled (opt-in via AGENT_RUNTIME)',
   );
 
   let connection: NativeConnection;

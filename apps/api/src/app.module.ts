@@ -2,6 +2,7 @@ import { Module, type DynamicModule } from '@nestjs/common';
 import { APP_FILTER, APP_GUARD } from '@nestjs/core';
 
 import { ApprovalsModule } from './approvals/approvals.module';
+import { ArtifactsModule } from './artifacts/artifacts.module';
 import { AuditModule } from './audit/audit.module';
 import { AuthModule } from './auth/auth.module';
 import { JwtAuthGuard } from './auth/jwt-auth.guard';
@@ -11,6 +12,7 @@ import { LoggingModule } from './common/logging.module';
 import { ConfigModule } from './config/config.module';
 import type { AppConfig } from './config/app-config';
 import { DatabaseModule } from './database/database.module';
+import { ExecutionsModule } from './executions/executions.module';
 import { HealthModule } from './health/health.module';
 import { OrchestratorModule } from './orchestrator/orchestrator.module';
 import { OrgsModule } from './orgs/orgs.module';
@@ -59,6 +61,8 @@ export class AppModule {
         ProjectsModule,
         TasksModule,
         ApprovalsModule,
+        ArtifactsModule.forRoot(),
+        ExecutionsModule,
         HealthModule,
       ],
       providers: [

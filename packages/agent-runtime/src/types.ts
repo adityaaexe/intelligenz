@@ -29,6 +29,20 @@ export type FilesystemAccess = z.infer<typeof FilesystemAccess>;
 /**
  * What an adapter can actually do. This is a **precondition**, not documentation:
  * the dispatch activity checks it before spending money (ADR-006).
+ *
+ * ## `network` — read this before interpreting it
+ *
+ * `network: false` means the **agent** has **no general egress**: every process it can
+ * spawn runs in a network namespace with no interfaces, so TCP, UDP and DNS all fail.
+ * It does *not* mean the agent's traffic is impossible — a real adapter may own one
+ * narrow, adapter-controlled channel for model transport. For `opencode-cli` that is a
+ * host proxy reachable through a bound unix socket that accepts `CONNECT` only to an
+ * exact allowlist of provider hosts and only on port 443; every other destination and
+ * port is refused and logged.
+ *
+ * The precise claim, and the one that should appear in operator documentation, is:
+ * **no general egress; model traffic only via an allowlisted 443 proxy; all other
+ * sockets blocked.** A bare `network: false` without that qualifier overstates it.
  */
 export const RuntimeCapabilities = z
   .object({
@@ -76,6 +90,19 @@ export const ExecutionRequest = z
     /** Advisory only — recorded, never enforced (contract §15 A7). */
     budgetUsd: z.number().nonnegative(),
     correlationId: z.string().min(1),
+    /**
+     * Phase 3 addition, optional so every Phase 2 caller stays valid.
+     *
+     * The absolute directory an adapter is allowed to work in — a `repo/` inside
+     * `WORKSPACE_ROOT`, leased by `ExecutionWorkspace`. It is on the *request*, not on
+     * the adapter, because two runs of the same adapter must be able to execute in two
+     * different directories without the adapter being rebuilt.
+     *
+     * An adapter that needs a filesystem must refuse a request without it. Running
+     * against "wherever the process happens to be" is how a coding agent edits the
+     * host checkout instead of the disposable clone.
+     */
+    workspaceRoot: z.string().min(1).optional(),
   })
   .strict();
 
@@ -156,6 +183,27 @@ export const ExecutionUsage = z
 
 export type ExecutionUsage = z.infer<typeof ExecutionUsage>;
 
+/**
+ * One observable tool call, already redacted. Shape-compatible with the
+ * `ToolInvocation` table (minus the tenant columns the worker adds), so the worker
+ * persists these rows without reinterpreting them.
+ *
+ * `summary` is capped at 500 characters because that is `ToolInvocation.summary`'s
+ * `VarChar(500)`: a database that truncates silently and an adapter that truncates
+ * loudly are different bugs, and only one of them is debuggable.
+ */
+export const ToolInvocationRecord = z
+  .object({
+    /** Monotonic within one execution, starting at 1. */
+    sequence: z.number().int().positive(),
+    tool: z.string().min(1),
+    summary: z.string().min(1).max(500),
+    occurredAt: z.string().min(1),
+  })
+  .strict();
+
+export type ToolInvocationRecord = z.infer<typeof ToolInvocationRecord>;
+
 export const ExecutionResult = z
   .object({
     status: ExecutionStatus,
@@ -167,6 +215,16 @@ export const ExecutionResult = z
     /** ADR-006 labelling: which adapter produced this, and whether it is real. */
     runtimeId: z.string().min(1),
     simulated: z.boolean(),
+    /**
+     * Phase 3, optional: provider-shaped detail the platform records but does not
+     * interpret — model id, session id, cache reads. `AgentRun.providerMeta` is JSON
+     * for the same reason.
+     */
+    providerMeta: z.record(z.string(), z.unknown()).optional(),
+    /** Which build of the vendor produced the run (`AgentRun.runtimeVersion`). */
+    runtimeVersion: z.string().min(1).optional(),
+    /** Redacted, ordered trace for `ToolInvocation`. Absent means "nothing observed". */
+    toolInvocations: z.array(ToolInvocationRecord).optional(),
   })
   .strict();
 
