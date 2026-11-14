@@ -13,12 +13,18 @@ import {
   type ToolInvocationRecord,
 } from '@intelligenz/agent-runtime';
 import {
+  ISOLATION_TIER_UNAVAILABLE,
+  type ExecutionIsolation,
+  type IsolationRefusalError,
+} from '@intelligenz/contracts';
+import {
   enforceTextCap,
   readVolumeUsage,
   type TruncationMarker,
   type WorkspaceHandle,
 } from '@intelligenz/workspace-manager';
 import { getWorkerConfig } from '../config';
+import { detectIsolationCapability, isolationRefusalMessage, planIsolation } from '../isolation';
 import {
   applyIoMax,
   applyLimits,
@@ -170,15 +176,106 @@ export async function executeAgentActivity(
 
   // ── Resource policy, resolved before anything runs ────────────────────────────
   //
-  // Four decisions, in this order, and none of them is the agent's:
-  //   1. is cgroup isolation real on this host right now (probed once per process);
-  //   2. is there a bounded workspace volume, i.e. a real disk quota (Gate D);
-  //   3. which profile does the server's policy pick for this task;
-  //   4. is that profile allowed to run with the controls that are actually available
+  // Five decisions, all of them before any work, and none of them the agent's:
+  //   1. which profile does the server's policy pick for this task (and its tier);
+  //   2. can this host launch the isolation tier that profile declares (D-007);
+  //   3. is cgroup isolation real on this host right now (probed once per process);
+  //   4. is there a bounded workspace volume, i.e. a real disk quota (Gate D);
+  //   5. is that profile allowed to run with the controls that are actually available
   //      (HEAVY is not, when either aggregate control is missing).
   //
   // A refusal here is a `nonRetryable` failure: retrying cannot make a HEAVY profile
-  // safe on a host with no aggregate limit.
+  // safe on a host with no aggregate limit, and it cannot make a virtual machine exist.
+  const profile: ResourceProfile = selectResourceProfile({
+    riskClass: task.riskClass,
+    realRuntime: !simulatedAdapter,
+    configured: config.resources.profile,
+  }).profile;
+
+  // ── The isolation gate — first, and impossible to bypass ──────────────────────
+  //
+  // ADR D-007 decided that a profile requiring a virtual machine fails closed **before
+  // the agent is launched**, and until now nothing enforced it: no code read `/dev/kvm`,
+  // so a VM-requiring profile would have run under a shared kernel with nothing in the
+  // record saying so.
+  //
+  // "Before" is literal. This runs before the cgroup probe, before `assertProfileAvailable`,
+  // before the workspace lease, before the cgroup is created, before `runtime.execute` and
+  // before the broker exists. The one write a refusal makes is the attempt row that records
+  // the refusal; there is no workspace, no agent process and no broker request to undo.
+  //
+  // Three things make it unbypassable:
+  //   - the requirement is `profile.isolation`, and the profile is chosen from the task's
+  //     risk class and operator configuration, never from a request or activity field;
+  //   - availability comes from `detectIsolationCapability()`, which reads files and never
+  //     `process.env` — a forged `WORKER_VM_AVAILABLE=1` changes nothing;
+  //   - this is the only path to `runtime.execute` in the worker, so there is no second
+  //     launch site that could skip it.
+  //
+  // The capability is re-measured on every attempt rather than cached: it is two file
+  // reads, and a worker that saw `/dev/kvm` appear (or disappear) should say so.
+  const isolationCapability = await detectIsolationCapability();
+  const isolation = planIsolation(profile, isolationCapability);
+
+  if (isolation.refused) {
+    const message = isolationRefusalMessage(profile, isolation);
+
+    const refusal = {
+      code: ISOLATION_TIER_UNAVAILABLE,
+      message,
+      retryable: false,
+      isolation,
+    } satisfies IsolationRefusalError;
+
+    // The attempt is settled `failed` and nothing else happens. It is written here, rather
+    // than left to the workflow's failure path, because the workflow cannot know which
+    // attempt was refused — and it goes through `startAttempt` so the attempt `POST /run`
+    // reserved is the row that carries the verdict, instead of a phantom second one.
+    const refusedRun = await resolveWorkflowRun({
+      orgId: input.orgId,
+      taskId: input.taskId,
+      workflowRunId: input.workflowRunId,
+    });
+
+    const refusedAttempt = await startAttempt({
+      orgId: input.orgId,
+      taskId: input.taskId,
+      workflowRunId: refusedRun.id,
+      runtimeId: runtime.id,
+      // No model call happened and none will: `simulated` is literal, not a placeholder.
+      simulated: true,
+      startedAt: new Date(),
+    });
+
+    await finalizeAttempt({
+      orgId: input.orgId,
+      attemptId: refusedAttempt.id,
+      status: RUN_STATUS.failed,
+      simulated: true,
+      error: refusal,
+      resources: {
+        // What was asked for. Nothing bounded this attempt, so no usage is claimed.
+        executionProfile: profile.name.toLowerCase(),
+        cpuTimeMs: null,
+        memoryPeakBytes: null,
+        pidsPeak: null,
+        terminationReason: 'isolation_unavailable',
+      },
+    });
+
+    workerLogger().warn(
+      {
+        taskId: input.taskId,
+        attemptId: refusedAttempt.id,
+        profile: profile.name,
+        isolation,
+      },
+      message,
+    );
+
+    throw nonRetryable(ISOLATION_TIER_UNAVAILABLE, message);
+  }
+
   const capability = await getCgroupCapability({ root: config.resources.cgroupRoot });
   const cgroupMode: CgroupMode = capability.mode;
 
@@ -195,15 +292,9 @@ export async function executeAgentActivity(
     );
   }
 
-  const selection = selectResourceProfile({
-    riskClass: task.riskClass,
-    realRuntime: !simulatedAdapter,
-    configured: config.resources.profile,
-  });
-
-  const profile: ResourceProfile = selection.profile;
-
   try {
+    // `profile` was resolved once, above, and gated by `planIsolation`. Re-selecting here
+    // would suggest a second, independent choice; there is one.
     assertProfileAvailable(profile, cgroupMode, { mode: diskMode });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -334,6 +425,7 @@ export async function executeAgentActivity(
         retryable: false,
       },
       simulated: simulatedAdapter,
+      isolation,
     });
 
     await finalize('cancelled', simulatedAdapter, result.error, 'cancelled');
@@ -612,6 +704,22 @@ export async function executeAgentActivity(
 
     result = capped.result;
 
+    // ── The tier this attempt actually ran under (D-007) ─────────────────────────
+    //
+    // Attached **after** the output ceiling, deliberately: the ceiling can replace
+    // `providerMeta` wholesale when it is too large, and a result that lost its tier would
+    // be reported as "not recorded" — a different and misleading statement. `providerMeta`
+    // is where it lands because the attempt has no JSON column of its own and this phase
+    // adds no migration; `GET /executions` reads it back as `isolation`.
+    //
+    // It is the plan, not the capability: a vm-capable host that served a
+    // `restricted-shared-kernel` profile reports `restricted-shared-kernel`, because that
+    // is what ran.
+    result = {
+      ...result,
+      providerMeta: { ...(result.providerMeta ?? {}), isolation },
+    };
+
     // ── Accounting, then the verdict ─────────────────────────────────────────────
     //
     // The numbers come from the cgroup files after the tree is gone: `memory.peak`,
@@ -815,6 +923,7 @@ export async function executeAgentActivity(
           diskFreeBytes,
         }),
         simulated: simulatedAdapter,
+        isolation,
       });
     }
 
@@ -830,6 +939,7 @@ export async function executeAgentActivity(
       summary: `Execution failed before it could start: ${normalised.message}`,
       error: normalised,
       simulated: simulatedAdapter,
+      isolation,
     });
   } finally {
     activityCancellation.removeEventListener('abort', abort);
@@ -1015,13 +1125,22 @@ function safeCancellationSignal(): AbortSignal {
   }
 }
 
-/** A result the platform produced, not the adapter: no artifacts, no usage. */ function bannerResult(
+/**
+ * A result the platform produced, not the adapter: no artifacts, no usage.
+ *
+ * `isolation` is carried on every one of these because they are persisted as an
+ * `AgentRun` like any other result: a pre-start failure that omitted its tier would be
+ * reported as "not recorded" even though the platform knew which tier the attempt was
+ * admitted under.
+ */
+function bannerResult(
   runtimeId: string,
   input: {
     readonly status: ExecutionResult['status'];
     readonly summary: string;
     readonly error: ExecutionResult['error'];
     readonly simulated: boolean;
+    readonly isolation: ExecutionIsolation;
   },
 ): ExecutionResult {
   return {
@@ -1031,6 +1150,7 @@ function safeCancellationSignal(): AbortSignal {
     events: [],
     usage: {},
     error: input.error,
+    providerMeta: { isolation: input.isolation },
     runtimeId,
     simulated: input.simulated,
   };

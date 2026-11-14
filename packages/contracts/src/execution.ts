@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 import { RunStatus } from './enums';
+import { ExecutionIsolation } from './isolation';
 
 /**
  * Execution identity, as the client sees it (Phase 3).
@@ -128,6 +129,19 @@ export const ExecutionAttemptSummary = z
     costUsd: z.string().nullable(),
     error: ExecutionErrorShape.nullable(),
     workspace: ExecutionWorkspaceSummary.nullable(),
+    /**
+     * Phase 5 (D-007). The tier this attempt required, the tier it actually ran under,
+     * and the controls it does not provide.
+     *
+     * `null` means **not recorded** — an attempt written before the tier existed, or one
+     * that never reached the launch decision. It is not `restricted-shared-kernel` by
+     * default: defaulting would let a client label an unrecorded run as sandboxed.
+     *
+     * A refused attempt (`effective: null, refused: true`) is a run the platform declined
+     * to start because its profile required a tier this host cannot launch. The attempt is
+     * the record; there is no `AgentRun`, because nothing ran.
+     */
+    isolation: ExecutionIsolation.nullable(),
   })
   .strict();
 

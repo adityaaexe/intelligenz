@@ -1,4 +1,10 @@
-import type { RiskClass, TaskPriority, TaskStatus } from '@intelligenz/contracts';
+import type {
+  ExecutionIsolation,
+  RiskClass,
+  RunStatus,
+  TaskPriority,
+  TaskStatus,
+} from '@intelligenz/contracts';
 
 export type { TaskStatus };
 
@@ -81,9 +87,24 @@ export interface TaskDetailResponse extends TaskResponse {
   readonly workspace: { readonly id: string; readonly name: string; readonly slug: string };
   /** Contract §6: "task detail incl. latest run + artifacts". */
   readonly latestRun: RunSummary | null;
+  /**
+   * Phase 5 (D-007): the newest execution attempt, and the isolation tier it ran under.
+   *
+   * An attempt, not an agent run, because a refused attempt has no agent run — and a
+   * refusal is exactly the case a reader must be able to see on this screen instead of
+   * inferring "isolated" from an absence. `isolation: null` means the tier was not
+   * recorded, which is distinct from `effective: null`, which means it was refused.
+   */
+  readonly latestAttempt: LatestAttemptSummary | null;
   readonly artifacts: readonly ArtifactSummary[];
   /** Not in the table, but the approval gate is invisible without it on the detail screen. */
   readonly approvals: readonly ApprovalSummary[];
+}
+
+export interface LatestAttemptSummary {
+  readonly id: string;
+  readonly status: RunStatus;
+  readonly isolation: ExecutionIsolation | null;
 }
 
 export interface PageMeta {

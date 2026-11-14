@@ -12,3 +12,4 @@ export * from './dto';
 export * from './task-state-machine';
 export * from './approval';
 export * from './execution';
+export * from './isolation';

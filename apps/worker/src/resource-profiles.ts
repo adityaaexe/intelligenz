@@ -25,12 +25,37 @@
  * allows, the quota was not in force and the platform must not claim it was.
  */
 
-export const RESOURCE_PROFILE_NAMES = ['SMALL', 'STANDARD', 'HEAVY'] as const;
+import type { IsolationTier } from '@intelligenz/contracts';
+
+export const POLICY_PROFILE_NAMES = ['SMALL', 'STANDARD', 'HEAVY'] as const;
+
+export type PolicyProfileName = (typeof POLICY_PROFILE_NAMES)[number];
+
+/**
+ * Every profile an operator may name.
+ *
+ * `VM` is declared and selectable, and it cannot run on this host: its tier is refused by
+ * the isolation gate (`isolation.ts`) before anything is provisioned. It exists so that
+ * "this deployment requires a virtual machine" is *expressible* — an operator setting
+ * `WORKER_RESOURCE_PROFILE=VM` gets a refusal that names `/dev/kvm`, not a silent run
+ * under a weaker tier. It is used by tests until a real VM backend exists.
+ */
+export const RESOURCE_PROFILE_NAMES = [...POLICY_PROFILE_NAMES, 'VM'] as const;
 
 export type ResourceProfileName = (typeof RESOURCE_PROFILE_NAMES)[number];
 
 export interface ResourceProfile {
   readonly name: ResourceProfileName;
+  /**
+   * The tier this profile's ceilings are meaningful under (D-007).
+   *
+   * This is a **declaration**, not a measurement: `SMALL`, `STANDARD` and `HEAVY` are all
+   * `restricted-shared-kernel`, because the only backend that exists confines a process
+   * inside namespaces on the host kernel. A profile that declares `vm` is refused on a
+   * host that cannot launch one — `resource-profiles.ts` decides what may be asked for,
+   * `isolation.ts` decides whether it can be granted, and nothing downgrades between them.
+   */
+  readonly isolation: IsolationTier;
   /** `memory.max` — aggregate RSS for the whole process tree. */
   readonly memoryMaxBytes: number;
   /** `pids.max` — every thread and process in the tree counts as one. */
@@ -98,9 +123,10 @@ const VOLUME_BYTES = 1024 * MIB;
  * not *permission to spin*. `HEAVY` at 2 CPU for ten minutes could otherwise consume
  * twenty CPU-minutes; a twelve-CPU-minute budget is already generous for a coding task.
  */
-export const RESOURCE_PROFILES: Readonly<Record<ResourceProfileName, ResourceProfile>> = {
+export const RESOURCE_PROFILES: Readonly<Record<PolicyProfileName, ResourceProfile>> = {
   SMALL: {
     name: 'SMALL',
+    isolation: 'restricted-shared-kernel',
     memoryMaxBytes: 512 * MIB,
     pidsMax: 64,
     cpuQuotaMicros: 50_000,
@@ -115,6 +141,7 @@ export const RESOURCE_PROFILES: Readonly<Record<ResourceProfileName, ResourcePro
   },
   STANDARD: {
     name: 'STANDARD',
+    isolation: 'restricted-shared-kernel',
     memoryMaxBytes: 1024 * MIB,
     pidsMax: 128,
     cpuQuotaMicros: 100_000,
@@ -129,6 +156,7 @@ export const RESOURCE_PROFILES: Readonly<Record<ResourceProfileName, ResourcePro
   },
   HEAVY: {
     name: 'HEAVY',
+    isolation: 'restricted-shared-kernel',
     memoryMaxBytes: 2048 * MIB,
     pidsMax: 256,
     cpuQuotaMicros: 200_000,
@@ -141,6 +169,31 @@ export const RESOURCE_PROFILES: Readonly<Record<ResourceProfileName, ResourcePro
     ioWriteBps: 200 * MIB,
     usdCapUsd: 2.0,
   },
+};
+
+/**
+ * The VM-isolated profile — declared, selectable, and unlaunchable here.
+ *
+ * Its numbers are `STANDARD`'s on purpose. They describe the **host-side envelope** the
+ * attempt would be admitted under, not a guest size: choosing guest memory or vCPU counts
+ * before a VM backend exists would be inventing numbers and presenting them as a policy.
+ * When a backend is added, this row is where its guest sizing belongs, and the isolation
+ * gate stops refusing it because `detectIsolationCapability` reports `vmAvailable: true`.
+ *
+ * Nothing in the selection policy can return it by risk class. The only way to reach it is
+ * an explicit operator override, and on every host without `/dev/kvm` that override fails
+ * closed before provisioning.
+ */
+export const VM_PROFILE: ResourceProfile = {
+  ...RESOURCE_PROFILES.STANDARD,
+  name: 'VM',
+  isolation: 'vm',
+};
+
+/** Every profile, selectable or not. `getResourceProfile` reads this table. */
+const PROFILES: Readonly<Record<ResourceProfileName, ResourceProfile>> = {
+  ...RESOURCE_PROFILES,
+  VM: VM_PROFILE,
 };
 
 /** The risk vocabulary the selection uses. Mirrors `RiskClass` without importing it. */
@@ -178,7 +231,7 @@ export function isResourceProfileName(value: unknown): value is ResourceProfileN
 }
 
 export function getResourceProfile(name: ResourceProfileName): ResourceProfile {
-  const profile = RESOURCE_PROFILES[name];
+  const profile = PROFILES[name];
 
   if (profile === undefined) {
     throw new ResourceProfileError(
@@ -196,7 +249,10 @@ export function getResourceProfile(name: ResourceProfileName): ResourceProfile {
  * configuration.
  *
  * - An explicit `WORKER_RESOURCE_PROFILE` wins. Operators have context this function
- *   does not, and a wrong explicit value is a deployment decision, not a bug.
+ *   does not, and a wrong explicit value is a deployment decision, not a bug. That
+ *   includes `VM`, which this function will happily return and the isolation gate will
+ *   refuse on every host that cannot launch a virtual machine — a refusal, not a
+ *   downgrade.
  * - `CRITICAL` gets `HEAVY`: a task the policy engine classified as critical is the one
  *   case where the larger ceiling is worth the larger blast radius — and `HEAVY` is
  *   refused outright when cgroups are unavailable.

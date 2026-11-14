@@ -15,6 +15,7 @@ import {
 import { summariseArtifact, type ArtifactSummaryWithMedia } from '../artifacts/artifact-summary';
 import { AppError } from '../common/errors';
 import { PRISMA_CLIENT } from '../database/database.module';
+import { readIsolationReport } from './isolation-report';
 
 /**
  * Execution history.
@@ -59,6 +60,9 @@ const ATTEMPT_SELECT = {
       costUsd: true,
       simulated: true,
       error: true,
+      // Phase 5 (D-007). The worker records the effective isolation tier here; without it
+      // the API could only guess a tier from the profile label.
+      providerMeta: true,
       executionWorkspace: {
         select: {
           id: true,
@@ -236,6 +240,12 @@ function toAttemptSummary(row: AttemptRow): ExecutionAttemptSummary {
     // Decimal → string, not number: `0.1985` must not become `0.19850000000000001`.
     costUsd: run?.costUsd?.toString() ?? null,
     error: row.error ?? run?.error ?? null,
+    // Phase 5 (D-007): the tier the attempt required, the tier it ran under, and what that
+    // tier does not provide. `null` is "not recorded", never a default.
+    isolation: readIsolationReport({
+      providerMeta: run?.providerMeta ?? null,
+      error: row.error ?? null,
+    }),
     workspace: run?.executionWorkspace === null || run?.executionWorkspace === undefined
       ? null
       : toWorkspaceSummary(run.executionWorkspace),

@@ -4,6 +4,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import {
   type CreateTaskInput,
   type PaginationQuery,
+  type RunStatus,
   type RunTaskInput,
   type UpdateTaskStatusInput,
   canTransition,
@@ -25,6 +26,7 @@ import { LOGGER } from '../common/logger';
 import { isUniqueConstraintError } from '../common/prisma-errors';
 import { APP_CONFIG, type AppConfig } from '../config/app-config';
 import { PRISMA_CLIENT } from '../database/database.module';
+import { readIsolationReport } from '../executions/isolation-report';
 import {
   OrchestratorService,
   OrchestratorUnavailableError,
@@ -451,6 +453,19 @@ export class TasksService {
             },
           },
         },
+        // Phase 5 (D-007). The newest attempt carries the isolation verdict: an attempt
+        // that ran has it in the run's `providerMeta`, and a refused attempt — which has no
+        // run — carries it in its own `error`. `readIsolationReport` reads both.
+        executionAttempts: {
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+          select: {
+            id: true,
+            status: true,
+            error: true,
+            agentRun: { select: { providerMeta: true } },
+          },
+        },
         artifacts: {
           orderBy: { createdAt: 'desc' },
           take: 20,
@@ -489,6 +504,7 @@ export class TasksService {
     if (task === null) throw AppError.notFound('Task');
 
     const [latestRun] = task.workflowRuns;
+    const [latestAttempt] = task.executionAttempts;
 
     return {
       ...toTaskResponse(task),
@@ -517,6 +533,18 @@ export class TasksService {
                 tokensOut: agentRun.tokensOut,
                 costUsd: agentRun.costUsd?.toString() ?? null,
               })),
+            },
+      latestAttempt:
+        latestAttempt === undefined
+          ? null
+          : {
+              id: latestAttempt.id,
+              status: latestAttempt.status satisfies RunStatus,
+              // Effective tier, or the refusal that replaced it. `null` = not recorded.
+              isolation: readIsolationReport({
+                providerMeta: latestAttempt.agentRun?.providerMeta ?? null,
+                error: latestAttempt.error ?? null,
+              }),
             },
       artifacts: task.artifacts.map((artifact) => ({
         id: artifact.id,
