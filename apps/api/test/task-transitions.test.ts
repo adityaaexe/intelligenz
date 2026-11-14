@@ -6,6 +6,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { AppError } from '../src/common/errors';
 import type { ArtifactsService } from '../src/artifacts/artifacts.service';
 import type { AuditService } from '../src/audit/audit.service';
+import type {
+  ApprovalGateResult,
+  ApprovalGateService,
+} from '../src/approvals/approval-gate.service';
+import type { AppConfig } from '../src/config/app-config';
 import type { OrchestratorService } from '../src/orchestrator/orchestrator.service';
 import { HUMAN_TRANSITIONS, isHumanTransition } from '../src/tasks/human-transitions';
 import { TasksService } from '../src/tasks/tasks.service';
@@ -28,6 +33,28 @@ const TASK_ID = '9d0e5c1a-1f2b-4c3d-8e4f-5a6b7c8d9e0f';
 const ORG_ID = '6f1d2c3b-4a59-4687-9a0b-1c2d3e4f5a6b';
 const PROJECT_ID = '1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d';
 const WORKSPACE_ID = '2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e';
+
+/**
+ * The config `TasksService` is constructed with. `updateStatus` reads none of it (the two
+ * fields below are stated because `AppConfig` is a closed contract), so these are the
+ * documented defaults, not tuned values.
+ */
+const config: AppConfig = {
+  nodeEnv: 'test',
+  port: 4100,
+  host: '127.0.0.1',
+  databaseUrl: 'postgresql://unused/unused',
+  jwtSecret: 'Kq7-tR2#vLm9!pXz4w8@nB3yS6',
+  jwtTtlSeconds: 900,
+  logLevel: 'silent',
+  corsOrigins: [],
+  temporal: { address: 'localhost:7233', namespace: 'default', taskQueue: 'intelligenz-tasks' },
+  readinessTimeoutMs: 2_000,
+  artifactRoot: '/tmp/intelligenz-test-artifacts',
+  workspaceRoot: '/tmp/intelligenz-test-workspaces',
+  approvalTtlHours: 24,
+  trustedSourceRepos: [],
+};
 
 interface Row {
   id: string;
@@ -112,11 +139,30 @@ function makeHarness(): {
   } as unknown as Logger;
   const audit = { recordWithin: vi.fn(async () => undefined) } as unknown as AuditService;
   const orchestrator = {} as unknown as OrchestratorService;
+  /**
+   * Every task here is `LOW` risk, so `requiresApproval` is false and `updateStatus` never
+   * consults the gate. The stub throws rather than resolving: if a future change starts
+   * asking approvals for a `LOW` transition, this fixture fails loudly instead of
+   * approving by accident.
+   */
+  const approvals = {
+    requireLiveApproval: vi.fn(async (): Promise<ApprovalGateResult> => {
+      throw new Error('the approval gate must not be reachable from a LOW-risk transition');
+    }),
+  } as unknown as ApprovalGateService;
   // The service only renders a logical artifact uri for `detail`, which these tests do
   // not exercise; the locator is still required by the constructor.
   const artifacts = { logicalUri: (uri: string) => uri } as unknown as ArtifactsService;
 
-  const service = new TasksService(prisma, logger, audit, orchestrator, artifacts);
+  const service = new TasksService(
+    prisma,
+    logger,
+    audit,
+    orchestrator,
+    artifacts,
+    approvals,
+    config,
+  );
 
   return {
     service,

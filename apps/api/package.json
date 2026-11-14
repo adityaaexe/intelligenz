@@ -6,7 +6,7 @@
     "dev": "tsx watch src/main.ts",
     "build": "tsc --noEmit -p tsconfig.json",
     "start": "tsx src/main.ts",
-    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
     "typecheck:test": "tsc --noEmit -p tsconfig.test.json",
     "test": "vitest run --passWithNoTests",
     "test:e2e": "vitest run --passWithNoTests --dir test",

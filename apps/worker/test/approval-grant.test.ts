@@ -69,10 +69,10 @@ if (!enabled) {
   console.warn('[approval-grant] suite skipped — TEST_DATABASE_URL is not set');
 }
 
-/** A HIGH task, ready to run, with the binding the hash covers. */
+/** A HIGH task, ready to run, with the binding the hash covers and its reserved attempt. */
 async function createHighTask(
   label: string,
-): Promise<{ taskId: string; hash: string }> {
+): Promise<{ taskId: string; hash: string; attemptId: string; workflowRunId: string }> {
   if (client === undefined || tenant === undefined) throw new Error('suite not initialised');
 
   const task = await client.task.create({
@@ -90,6 +90,31 @@ async function createHighTask(
     },
   });
 
+  // Phase 5: the attempt the API would have reserved in the transaction that spent the
+  // grant. `validateTaskActivity` now refuses a grant that does not name a queued attempt,
+  // so every fixture needs one.
+  const run = await client.workflowRun.create({
+    data: {
+      orgId: tenant.orgId,
+      taskId: task.id,
+      workflowId: `task-${task.id}`,
+      temporalRunId: `gate-run-${randomUUID()}`,
+      status: 'queued',
+    },
+  });
+
+  const attempt = await client.executionAttempt.create({
+    data: {
+      orgId: tenant.orgId,
+      taskId: task.id,
+      workflowRunId: run.id,
+      attemptNumber: 1,
+      runtimeId: 'unassigned',
+      simulated: true,
+      status: 'queued',
+    },
+  });
+
   // The same preimage the API hashes — imported, not re-derived.
   const hash = computeTaskContentHash({
     title: task.title,
@@ -101,7 +126,7 @@ async function createHighTask(
     baseCommit: null,
   });
 
-  return { taskId: task.id, hash };
+  return { taskId: task.id, hash, attemptId: attempt.id, workflowRunId: run.id };
 }
 
 async function createApproval(input: {
@@ -109,6 +134,8 @@ async function createApproval(input: {
   hash: string | null;
   status?: 'PENDING' | 'APPROVED' | 'REJECTED' | 'EXPIRED' | 'REVOKED';
   consumedAt?: Date | null;
+  /** Which attempt spent the grant. Omitted means "the API did not record one". */
+  consumedByAttemptId?: string | null;
   revokedAt?: Date | null;
   expiresAt?: Date | null;
 }): Promise<void> {
@@ -126,16 +153,21 @@ async function createApproval(input: {
       policyVersion: '2026-11-14.1',
       executionProfile: 'standard',
       consumedAt: input.consumedAt === undefined ? new Date() : input.consumedAt,
+      consumedByAttemptId: input.consumedByAttemptId ?? null,
       revokedAt: input.revokedAt ?? null,
       expiresAt: input.expiresAt === undefined ? new Date(Date.now() + 3_600_000) : input.expiresAt,
     },
   });
 }
 
-function validate(taskId: string): Promise<unknown> {
+function validate(taskId: string, attemptId?: string): Promise<unknown> {
   if (tenant === undefined) throw new Error('suite not initialised');
 
-  return validateTaskActivity({ taskId, orgId: tenant.orgId });
+  return validateTaskActivity({
+    taskId,
+    orgId: tenant.orgId,
+    ...(attemptId === undefined ? {} : { attemptId }),
+  });
 }
 
 describe.skipIf(!enabled)('validateTaskActivity approval gate', () => {
@@ -196,10 +228,10 @@ describe.skipIf(!enabled)('validateTaskActivity approval gate', () => {
   });
 
   it('accepts a consumed, unrevoked, unexpired grant bound to the current content', async () => {
-    const { taskId, hash } = await createHighTask('live grant');
-    await createApproval({ taskId, hash });
+    const { taskId, hash, attemptId } = await createHighTask('live grant');
+    await createApproval({ taskId, hash, consumedByAttemptId: attemptId });
 
-    const result = await validate(taskId);
+    const result = await validate(taskId, attemptId);
 
     expect(result).toMatchObject({ runnable: true });
   });
@@ -207,12 +239,12 @@ describe.skipIf(!enabled)('validateTaskActivity approval gate', () => {
   it('does not consume the approval: the worker must not be a second writer', async () => {
     if (client === undefined || tenant === undefined) throw new Error('suite not initialised');
 
-    const { taskId, hash } = await createHighTask('no double spend');
+    const { taskId, hash, attemptId } = await createHighTask('no double spend');
     const consumedAt = new Date(Date.now() - 5_000);
 
-    await createApproval({ taskId, hash, consumedAt });
+    await createApproval({ taskId, hash, consumedAt, consumedByAttemptId: attemptId });
 
-    await expect(validate(taskId)).resolves.toMatchObject({ runnable: true });
+    await expect(validate(taskId, attemptId)).resolves.toMatchObject({ runnable: true });
 
     const row = await client.approvalRequest.findFirstOrThrow({
       where: { orgId: tenant.orgId, taskId },

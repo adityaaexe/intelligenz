@@ -18,7 +18,7 @@ import {
   ApprovalGateService,
   type ApprovalGateTask,
 } from '../approvals/approval-gate.service';
-import { computeTaskContentHash } from '../approvals/approval-binding';
+import { computeTaskContentHash, readTaskBinding, resolveBinding } from '../approvals/approval-binding';
 import { ArtifactsService } from '../artifacts/artifacts.service';
 import { AppError } from '../common/errors';
 import { LOGGER } from '../common/logger';
@@ -682,24 +682,43 @@ export class TasksService {
    *
    * Order of operations matters and is the reason this is longer than it looks:
    *
-   *  1. gate + reserve — in **one** transaction: spend the approval (CAS) and move the
-   *     task `ready → queued`, writing the `WorkflowRun`. Doing the spend in the same
-   *     transaction as the reservation is what makes "one approval, one run" true even
-   *     when the reservation loses a race: the loser's consumption rolls back with it.
-   *  2. start the workflow with the deterministic id. The reuse policy permits replacing
-   *     a *closed failed* execution but not a running one, so a retry after a failure can
-   *     run while a duplicate of a live run is still refused (`409`);
+   *  0. idempotent replay — a retry carrying the same `Idempotency-Key` is answered from
+   *     the run the first request created, so it can never reserve a second attempt;
+   *  1. reserve — in **one** transaction: create the `WorkflowRun`, create the
+   *     `ExecutionAttempt` that owns this execution, spend the approval (CAS) **naming
+   *     that attempt**, and move the task `ready → queued`. All four commit together, so a
+   *     lost race leaves no run, no attempt and no consumption behind. The grant is tried
+   *     before the task compare-and-swap so a double-click reports `APPROVAL_CONSUMED`
+   *     rather than a generic conflict caused by its sibling.
+   *  2. start the workflow with the deterministic id, passing the attempt id. The reuse
+   *     policy permits replacing a *closed failed* execution but not a running one, so a
+   *     retry after a failure can run while a duplicate of a live run is still refused
+   *     (`409`);
    *  3. on success, record the Temporal run id;
-   *  4. on failure, compensate: the task goes back to `ready` and the run is marked
-   *     failed. A task is never left `running` when nothing is running it.
+   *  4. on failure, compensate: the task goes back to `ready`, the run is marked failed,
+   *     and the reserved attempt is marked `failed` with `terminationReason:
+   *     'start_failed'`. A task is never left `running` when nothing is running it, and
+   *     an attempt is never left claiming to be queued for a run that will never start.
+   *
+   * ## Why the attempt is reserved here, before Temporal is contacted
+   *
+   * Phase 4 consumed the approval with `consumedByAttemptId = NULL`: the attempt did not
+   * exist yet, so `consumedAt` proved *a* reservation had happened but not that **this**
+   * run made it. That left a second execution able to proceed on the same grant, held off
+   * only by Temporal's workflow-id dedupe — a guarantee owned by a system outside this
+   * transaction. The attempt is therefore created first, and its id is written into the
+   * grant in the same transaction. The worker verifies the link
+   * (`approval.consumedByAttemptId === attemptId`) before it dispatches anything.
    *
    * ## A failed start still spends the grant
    *
    * The reservation commits before Temporal is contacted, so an `ORCHESTRATOR_UNAVAILABLE`
-   * leaves the approval consumed. That is deliberate: refunding it would need a second
-   * compare-and-swap against a run that may have started after all, and a refund that
-   * loses that race authorises two executions. The cost of the conservative choice is
-   * one re-approval after an outage; the cost of the other is the control.
+   * leaves the approval consumed and the attempt `failed/start_failed`. That is
+   * deliberate: refunding it would need a second compare-and-swap against a run that may
+   * have started after all, and a refund that loses that race authorises two executions.
+   * A consumed grant with no running agent is auditable; an unconsumed grant with a
+   * running agent is not. The cost of the conservative choice is one re-approval after an
+   * outage; the cost of the other is the control.
    */
   async run(params: {
     orgId: string;
@@ -707,8 +726,18 @@ export class TasksService {
     input: RunTaskInput;
     correlationId: string;
     actorId: string;
+    idempotencyKey?: string | undefined;
   }): Promise<RunResponse> {
     const { orgId, taskId, input, correlationId, actorId } = params;
+    const idempotencyKey = normaliseOptionalIdempotencyKey(params.idempotencyKey);
+
+    // Before every pre-check: a replay must not be answered `422`/`409` for a state the
+    // first request itself produced (the task is `queued`, a run is active).
+    if (idempotencyKey !== null) {
+      const replayed = await this.replayRun({ orgId, taskId, idempotencyKey });
+
+      if (replayed !== null) return replayed;
+    }
 
     const task = await this.prisma.task.findFirst({
       // Tenant scoping.
@@ -734,78 +763,147 @@ export class TasksService {
 
     const workflowId = `${WORKFLOW_ID_PREFIX}${taskId}`;
 
-    const reserved = await this.prisma.$transaction(async (transaction) => {
-      if (requiresApproval(task.riskClass)) {
-        // Inside the transaction on purpose: a lost reservation must not spend the
-        // grant, and the CAS predicates make concurrent runs safe regardless.
-        await this.approvals.requireLiveApproval({
-          task: toGateTask(task),
-          correlationId,
-          actorId,
-          consume: true,
-          // The attempt row does not exist yet — the worker creates it. `consumedAt`
-          // is what makes the grant spent; the worker fills the link in when it can.
-          attemptId: null,
-          // What the caller asserts this run will use. Compared against the binding,
-          // never trusted: a grant for `standard` must not authorise `heavy`.
-          assertion: {
-            ...(input.executionProfile === undefined
-              ? {}
-              : { executionProfile: input.executionProfile }),
-            ...(input.sourceRef === undefined ? {} : { sourceRef: input.sourceRef }),
-            ...(input.baseCommit === undefined ? {} : { baseCommit: input.baseCommit }),
-          },
-          transaction,
+    // What the caller asserts this run will use. Compared against the binding, never
+    // trusted: a grant for `standard` must not authorise `heavy`.
+    const assertion = {
+      ...(input.executionProfile === undefined
+        ? {}
+        : { executionProfile: input.executionProfile }),
+      ...(input.sourceRef === undefined ? {} : { sourceRef: input.sourceRef }),
+      ...(input.baseCommit === undefined ? {} : { baseCommit: input.baseCommit }),
+    };
+
+    let reserved: { readonly runId: string; readonly attemptId: string };
+
+    try {
+      reserved = await this.prisma.$transaction(async (transaction) => {
+        // Order inside the transaction is deliberate: create the run and the attempt that
+        // will own the execution, spend the grant naming that attempt, and claim the task
+        // last. Trying the grant before the task compare-and-swap keeps the refusal for a
+        // double-click precise (`APPROVAL_CONSUMED`) instead of reporting a generic
+        // conflict because the sibling request moved the task. Everything rolls back
+        // together, so a refusal at any step leaves no run, no attempt and no consumption.
+        const run = await transaction.workflowRun.create({
+          // orgId from the request context, taskId from the path — both already
+          // resolved inside this tenant.
+          data: { orgId, taskId, workflowId, status: 'queued', idempotencyKey },
+          select: { id: true },
         });
-      }
 
-      const reservedTask = await transaction.task.updateMany({
-        where: { id: taskId, orgId, status: 'ready' },
-        data: { status: 'queued' },
+        const attempt = await transaction.executionAttempt.create({
+          data: {
+            orgId,
+            taskId,
+            workflowRunId: run.id,
+            // The run was created in this transaction, so its first attempt is #1 by
+            // construction; `@@unique([workflowRunId, attemptNumber])` is the authority
+            // if that ever stops being true.
+            attemptNumber: 1,
+            // The adapter is chosen by the worker at dispatch (`AGENT_RUNTIME`), not by
+            // the API. Recording a concrete adapter here would be a guess presented as a
+            // fact; `unassigned` says "reserved, not yet dispatched", and adoption in
+            // `startAttempt` replaces it with the adapter that actually ran.
+            runtimeId: RUNTIME_UNASSIGNED,
+            // No model call has happened, and this column's definition is literal: true
+            // means no real model call happened. A reservation that is never adopted
+            // keeps this value, which is then exactly right.
+            simulated: true,
+            status: 'queued',
+            // The profile the grant authorises. The worker rewrites this at finalize
+            // with what actually bounded the attempt (a profile name or `rlimit-only`),
+            // so a disagreement between authorisation and enforcement stays visible.
+            executionProfile: resolveBinding(readTaskBinding(task.riskFactors), assertion)
+              .executionProfile,
+          },
+          select: { id: true },
+        });
+
+        if (requiresApproval(task.riskClass)) {
+          // Inside the transaction on purpose: a lost reservation must not spend the
+          // grant, and the CAS predicates make concurrent runs safe regardless.
+          await this.approvals.requireLiveApproval({
+            task: toGateTask(task),
+            correlationId,
+            actorId,
+            consume: true,
+            // Phase 5: the grant is bound to this attempt, in this transaction. The
+            // worker refuses a run whose attempt is not the one recorded here.
+            attemptId: attempt.id,
+            assertion,
+            transaction,
+          });
+        }
+
+        const reservedTask = await transaction.task.updateMany({
+          where: { id: taskId, orgId, status: 'ready' },
+          data: { status: 'queued' },
+        });
+
+        if (reservedTask.count === 0) {
+          throw new AppError(
+            409,
+            'CONFLICT',
+            'The task changed while it was being started. Reload and try again.',
+          );
+        }
+
+        await this.audit.recordWithin(transaction, {
+          orgId,
+          projectId: task.projectId,
+          actor: { type: 'user', id: actorId },
+          action: 'task.status_changed',
+          eventType: 'task.status_changed.v1',
+          aggregateType: 'Task',
+          aggregateId: taskId,
+          correlationId,
+          payload: {
+            from: 'ready',
+            to: 'queued',
+            cause: 'run_requested',
+            workflowRunId: run.id,
+            attemptId: attempt.id,
+          },
+        });
+
+        return { runId: run.id, attemptId: attempt.id };
       });
-
-      if (reservedTask.count === 0) {
+    } catch (error) {
+      // Two requests with the same Idempotency-Key racing past the replay lookup: the
+      // unique index is the authority, and the loser created nothing (the transaction
+      // rolled back), so the honest answer is a conflict rather than a second attempt.
+      // Scoped to the column: a P2002 on any other constraint is a bug and must surface
+      // as one instead of being reported as a duplicate request.
+      if (isIdempotencyKeyCollision(error)) {
         throw new AppError(
           409,
           'CONFLICT',
-          'The task changed while it was being started. Reload and try again.',
+          'A run for this task was already started with that Idempotency-Key.',
         );
       }
 
-      const run = await transaction.workflowRun.create({
-        // orgId from the request context, taskId from the path — both already
-        // resolved inside this tenant.
-        data: { orgId, taskId, workflowId, status: 'queued' },
-        select: { id: true },
-      });
-
-      await this.audit.recordWithin(transaction, {
-        orgId,
-        projectId: task.projectId,
-        actor: { type: 'user', id: actorId },
-        action: 'task.status_changed',
-        eventType: 'task.status_changed.v1',
-        aggregateType: 'Task',
-        aggregateId: taskId,
-        correlationId,
-        payload: { from: 'ready', to: 'queued', cause: 'run_requested' },
-      });
-
-      return run;
-    });
+      throw error;
+    }
 
     try {
-      const started = await this.orchestrator.startTaskWorkflow({ taskId, orgId, correlationId });
+      const started = await this.orchestrator.startTaskWorkflow({
+        taskId,
+        orgId,
+        correlationId,
+        attemptId: reserved.attemptId,
+      });
 
       await this.prisma.$transaction(async (transaction) => {
         const updated = await transaction.workflowRun.updateMany({
           // Tenant scoping on the write.
-          where: { id: reserved.id, orgId },
+          where: { id: reserved.runId, orgId },
           data: { temporalRunId: started.runId },
         });
 
         if (updated.count === 0) {
-          this.logger.error({ orgId, taskId, workflowRunId: reserved.id }, 'workflow run vanished');
+          this.logger.error(
+            { orgId, taskId, workflowRunId: reserved.runId },
+            'workflow run vanished',
+          );
         }
 
         await this.audit.recordWithin(transaction, {
@@ -815,15 +913,21 @@ export class TasksService {
           action: 'workflow.started',
           eventType: 'workflow.started.v1',
           aggregateType: 'WorkflowRun',
-          aggregateId: reserved.id,
+          aggregateId: reserved.runId,
           correlationId,
-          payload: { workflowId, temporalRunId: started.runId, taskId },
+          payload: {
+            workflowId,
+            temporalRunId: started.runId,
+            taskId,
+            attemptId: reserved.attemptId,
+          },
         });
       });
 
       return {
         taskId,
-        workflowRunId: reserved.id,
+        workflowRunId: reserved.runId,
+        attemptId: reserved.attemptId,
         workflowId,
         temporalRunId: started.runId,
         status: 'queued',
@@ -847,10 +951,18 @@ export class TasksService {
       if (failure === undefined) {
         // Not an orchestration failure: still compensate, then let the filter record
         // a 500 with the stack. Leaving the task queued would strand it.
-        await this.compensateFailedStart(orgId, taskId, task.projectId, reserved.id, correlationId, {
-          code: 'START_FAILED',
-          message: 'The workflow could not be started.',
-        });
+        await this.compensateFailedStart(
+          orgId,
+          taskId,
+          task.projectId,
+          reserved.runId,
+          reserved.attemptId,
+          correlationId,
+          {
+            code: 'START_FAILED',
+            message: 'The workflow could not be started.',
+          },
+        );
         throw error;
       }
 
@@ -858,7 +970,8 @@ export class TasksService {
         orgId,
         taskId,
         task.projectId,
-        reserved.id,
+        reserved.runId,
+        reserved.attemptId,
         correlationId,
         { code: failure.code, message: failure.message },
       );
@@ -955,11 +1068,116 @@ export class TasksService {
     };
   }
 
+  /**
+   * Answers a retry that carries the `Idempotency-Key` of a `POST /run` already seen.
+   *
+   * Returns the original acceptance for a run that is still queued or running, replays
+   * the original failure for a run whose start failed, and refuses anything terminal —
+   * a `202` for a run that already succeeded or was cancelled would tell the client it
+   * had just queued work it did not queue. Returns `null` when the key is unknown, which
+   * is the only case that goes on to reserve.
+   */
+  private async replayRun(params: {
+    orgId: string;
+    taskId: string;
+    idempotencyKey: string;
+  }): Promise<RunResponse | null> {
+    const existing = await this.prisma.workflowRun.findFirst({
+      // Tenant scoping. `taskId` is in the predicate because the unique key is
+      // `(taskId, idempotencyKey)`: the same client key on another task is a different
+      // run, not a replay.
+      where: { orgId: params.orgId, taskId: params.taskId, idempotencyKey: params.idempotencyKey },
+      select: {
+        id: true,
+        workflowId: true,
+        temporalRunId: true,
+        status: true,
+        error: true,
+        attempts: {
+          orderBy: { attemptNumber: 'asc' },
+          take: 1,
+          select: { id: true },
+        },
+      },
+    });
+
+    if (existing === null) return null;
+
+    const attemptId = existing.attempts[0]?.id;
+
+    if (attemptId === undefined) {
+      // A keyed run with no attempt cannot exist: Phase 5 creates both in one
+      // transaction. Refusing loudly is better than inventing an attempt id.
+      throw new AppError(
+        409,
+        'CONFLICT',
+        'The run recorded for this Idempotency-Key has no reserved attempt.',
+      );
+    }
+
+    if (existing.status === 'queued' || existing.status === 'running') {
+      return {
+        taskId: params.taskId,
+        workflowRunId: existing.id,
+        attemptId,
+        workflowId: existing.workflowId,
+        temporalRunId: existing.temporalRunId,
+        status: 'queued',
+      };
+    }
+
+    if (existing.status === 'failed') {
+      // Replay the original outcome, not a fresh attempt: that is what idempotency means
+      // for a request whose only effect was a start that did not happen.
+      const code = errorCodeOf(existing.error);
+
+      if (code === 'ORCHESTRATOR_UNAVAILABLE') {
+        throw new AppError(
+          503,
+          'ORCHESTRATOR_UNAVAILABLE',
+          'The orchestrator is unavailable. Nothing was started.',
+        );
+      }
+
+      if (code === 'WORKFLOW_ALREADY_RUNNING') {
+        throw new AppError(
+          409,
+          'WORKFLOW_ALREADY_RUNNING',
+          'A workflow with this task id already exists.',
+        );
+      }
+
+      throw new AppError(
+        409,
+        'CONFLICT',
+        `The run started by this Idempotency-Key already closed as failed (${code ?? 'START_FAILED'}).`,
+      );
+    }
+
+    throw new AppError(
+      409,
+      'CONFLICT',
+      `The run started by this Idempotency-Key already closed as ${existing.status}.`,
+    );
+  }
+
+  /**
+   * The reservation committed but nothing started. Mark the run failed, put the task
+   * back where it was, and — Phase 5 — mark the **reserved attempt** failed with
+   * `terminationReason: 'start_failed'` so it is recoverable and cannot be mistaken for
+   * an execution that is still coming.
+   *
+   * The attempt write is guarded by `status: 'queued'`: if the start RPC timed out but
+   * Temporal did start the workflow, the worker may already have adopted the attempt
+   * (`queued → running`). Overwriting that with `failed` would relabel a live execution
+   * as one that never happened.
+   */
   private async compensateFailedStart(
     orgId: string,
     taskId: string,
     projectId: string,
     workflowRunId: string,
+    attemptId: string,
     correlationId: string,
     error: { code: string; message: string },
   ): Promise<void> {
@@ -967,6 +1185,18 @@ export class TasksService {
       await transaction.workflowRun.updateMany({
         where: { id: workflowRunId, orgId },
         data: { status: 'failed', finishedAt: new Date(), error: { ...error } },
+      });
+
+      await transaction.executionAttempt.updateMany({
+        // Guarded by `queued`: an attempt the worker already adopted is a live
+        // execution, not a failed start.
+        where: { id: attemptId, orgId, status: 'queued' },
+        data: {
+          status: 'failed',
+          finishedAt: new Date(),
+          terminationReason: 'start_failed',
+          error: { ...error },
+        },
       });
 
       // Rollback of the reservation, not a user-visible transition: the task returns
@@ -986,7 +1216,7 @@ export class TasksService {
         aggregateType: 'WorkflowRun',
         aggregateId: workflowRunId,
         correlationId,
-        payload: { code: error.code, from: 'queued', to: 'ready', taskId },
+        payload: { code: error.code, from: 'queued', to: 'ready', taskId, attemptId },
       });
     });
   }
@@ -998,6 +1228,17 @@ export class TasksService {
  * A fixed v5-shaped UUID keeps it greppable and valid for `EventEnvelope.actor.id`.
  */
 const SYSTEM_ACTOR_ID = '00000000-0000-5000-8000-000000000000';
+
+/**
+ * The `ExecutionAttempt.runtimeId` written at reservation time.
+ *
+ * The adapter is a worker decision (`AGENT_RUNTIME`), and the API does not have — and
+ * must not grow — a second copy of it. `unassigned` says exactly what is true of a
+ * reserved attempt: an adapter will run it, and which one is not yet known. The worker's
+ * `startAttempt` overwrites this with the adapter that actually ran when it adopts the
+ * row.
+ */
+const RUNTIME_UNASSIGNED = 'unassigned';
 
 /** The narrow shape the gate consumes. Keeps that service ignorant of the ORM model. */
 function toGateTask(task: TaskGateRow): ApprovalGateTask {
@@ -1036,6 +1277,69 @@ function normaliseIdempotencyKey(value: string | undefined): string {
   }
 
   return key;
+}
+
+/**
+ * The same key rules for `POST /run`, where `null` means "this request did not ask to be
+ * idempotent" rather than "generate one". Run rows are not unique by key: a generated key
+ * per request would make every run deduplicable by accident and would say nothing true.
+ */
+function normaliseOptionalIdempotencyKey(value: string | undefined): string | null {
+  const key = value?.trim();
+
+  if (key === undefined || key.length === 0) return null;
+
+  if (key.length > MAX_IDEMPOTENCY_KEY_LENGTH) {
+    throw new AppError(
+      400,
+      'VALIDATION_ERROR',
+      'The Idempotency-Key header is too long.',
+      { 'Idempotency-Key': [`Must be at most ${MAX_IDEMPOTENCY_KEY_LENGTH} characters.`] },
+    );
+  }
+
+  return key;
+}
+
+/** The `code` a stored `WorkflowRun.error` carries, if it carries one. */
+function errorCodeOf(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null || Array.isArray(error)) return undefined;
+
+  const code = (error as { code?: unknown }).code;
+
+  return typeof code === 'string' && code.length > 0 ? code : undefined;
+}
+
+/**
+ * Is this unique-constraint collision the `(taskId, idempotencyKey)` index?
+ *
+ * The shape of `meta` depends on the driver, and this code must not assume one:
+ *
+ *   - Prisma's query engine reports `meta.target: ['taskId', 'idempotencyKey']`;
+ *   - the `@prisma/adapter-pg` driver adapter reports
+ *     `meta.driverAdapterError.cause.constraint.index: 'WorkflowRun_taskId_idempotencyKey_key'`
+ *     with no `target` at all — observed against Postgres in this repository.
+ *
+ * So the check walks the metadata for a mention of the column rather than reading a field
+ * that may not exist. Anything else — a collision we cannot attribute — is a bug, and must
+ * not be disguised as a duplicate request: the caller rethrows it and the filter records a
+ * 500.
+ */
+function isIdempotencyKeyCollision(error: unknown): boolean {
+  if (!isUniqueConstraintError(error)) return false;
+
+  return mentionsIdempotencyKey((error as { meta?: unknown }).meta);
+}
+
+function mentionsIdempotencyKey(value: unknown, depth = 0): boolean {
+  if (depth > 5) return false;
+  if (typeof value === 'string') return /idempotencykey/i.test(value);
+  if (Array.isArray(value)) return value.some((entry) => mentionsIdempotencyKey(entry, depth + 1));
+  if (typeof value === 'object' && value !== null) {
+    return Object.values(value).some((entry) => mentionsIdempotencyKey(entry, depth + 1));
+  }
+
+  return false;
 }
 
 function toTaskResponse(task: TaskRow): TaskResponse {

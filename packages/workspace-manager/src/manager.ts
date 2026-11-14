@@ -15,6 +15,14 @@ import {
 } from './paths';
 import { canTransition, assertTransition, type WorkspaceState } from './state';
 import { buildSandboxCommand, execSandboxed } from './sandbox';
+import {
+  createVolumePool,
+  discoverVolumes,
+  isBounded,
+  type VolumeDiscovery,
+  type VolumeLease,
+  type VolumePool,
+} from './volumes';
 
 const execFileAsync = promisify(execFile);
 
@@ -71,10 +79,44 @@ export interface WorkspaceHandle {
   readonly branch: string | null;
   /** Not in the Prisma row's shape verbatim; the worker maps it to `state`. */
   readonly state: WorkspaceState;
-  /** `<rootPath>/repo`. Convenience, never a second source of truth. */
+  /**
+   * The checkout the sandbox gets as `/workspace`.
+   *
+   * In the default layout this is `<rootPath>/repo`. When a bounded volume is leased
+   * (Gate D) it is `<volume>/repo`, i.e. the same path *shape* on a fixed-size block
+   * device — which is what makes `ENOSPC` real rather than reported. The workspace root
+   * itself stays at the id-derived path so the reaper's re-derivation, the artifact
+   * directory and `assertOwnPath` keep working unchanged.
+   */
   readonly repoPath: string;
   readonly createdAt: string;
+  /** Present only when this workspace's checkout lives on a leased bounded volume. */
+  readonly volume?: WorkspaceVolumeBinding;
   readonly error?: WorkspaceFailure;
+}
+
+/** What a bounded volume contributes to a handle. A statement, not a promise. */
+export interface WorkspaceVolumeBinding {
+  /** `vol-<n>`. Stable for the life of the mount, and the lock is keyed on it. */
+  readonly id: string;
+  readonly mountPath: string;
+  /** `<major>:<minor>` of the backing loop device — the key `io.max` is written to. */
+  readonly device: string;
+  /** What `statfs` reports for the mounted filesystem, not the image's nominal size. */
+  readonly totalBytes: number;
+  /** True when a previous attempt on this volume left a checkout that was adopted. */
+  readonly warmStart: boolean;
+}
+
+export interface WorkspaceVolumeOptions {
+  /** `WORKSPACE_VOLUMES_ROOT`; default `/var/lib/intelligenz/mnt`. */
+  readonly root?: string;
+  /** `WORKSPACE_VOLUMES_REGISTRY`; default the setup script's manifest. */
+  readonly registry?: string;
+  /** A volume smaller than this is refused. `profile.diskQuotaBytes` in the worker. */
+  readonly minBytes?: number;
+  /** `false` disables volume mode even when the environment asks for it. */
+  readonly enabled?: boolean;
 }
 
 export interface CleanupOptions {
@@ -106,6 +148,16 @@ export interface WorkspaceManagerOptions {
    * crash `recover()` exists to repair. Production passes nothing.
    */
   readonly provisionGate?: () => Promise<void>;
+  /**
+   * Bounded volumes (Gate D). `false` opts out; omitted means "use the environment",
+   * which is `WORKSPACE_VOLUMES_ROOT` and `WORKSPACE_VOLUMES` — the same way
+   * `WORKSPACE_ROOT` is resolved. This is a manager-level decision, not a per-call one:
+   * an attempt cannot ask for a bigger disk any more than it can ask for a bigger
+   * memory profile.
+   */
+  readonly volumes?: WorkspaceVolumeOptions | false;
+  /** Test seam: skip the filesystem probe and use this discovery result. */
+  readonly volumeDiscovery?: VolumeDiscovery;
 }
 
 export interface WorkspaceManager {
@@ -118,6 +170,10 @@ export interface WorkspaceManager {
   adopt(handle: WorkspaceHandle): WorkspaceHandle;
   recover(workspaceId: string): Promise<WorkspaceHandle>;
   get(workspaceId: string): WorkspaceHandle | undefined;
+  /** What the disk boundary actually is on this host. Read by the boot log. */
+  volumes(): Promise<VolumeDiscovery>;
+  /** Leases this process currently holds, for diagnostics and the auditor. */
+  volumeLeases(): Promise<readonly VolumeLease[]>;
 }
 
 const DIRECTORY_MODE = 0o700;
@@ -135,6 +191,57 @@ export function createWorkspaceManager(options: WorkspaceManagerOptions = {}): W
   const root = resolveWorkspaceRoot(options.root);
   const gitBinary = options.gitBinary ?? 'git';
   const handles = new Map<string, WorkspaceHandle>();
+
+  // ── Bounded volumes (Gate D) ──────────────────────────────────────────────────
+  //
+  // Discovered lazily and once. A discovery that throws is a discovery that reports
+  // `unavailable`, never one that silently leaves the workspace unbounded-but-labelled:
+  // `provision` refuses to run a volume-requiring profile without it, and the boot log
+  // prints the reason.
+  let poolPromise: Promise<VolumePool> | undefined;
+
+  async function volumePool(): Promise<VolumePool> {
+    poolPromise ??= (async () => {
+      const discovery =
+        options.volumeDiscovery ??
+        (await discoverVolumes(
+          options.volumes === false
+            ? { disabled: true }
+            : {
+                ...(options.volumes === undefined ? {} : { enabled: true }),
+                ...(options.volumes?.root === undefined ? {} : { root: options.volumes.root }),
+                ...(options.volumes?.registry === undefined
+                  ? {}
+                  : { registry: options.volumes.registry }),
+                ...(options.volumes?.minBytes === undefined
+                  ? {}
+                  : { minBytes: options.volumes.minBytes }),
+                ...(options.volumes?.enabled === undefined
+                  ? {}
+                  : { enabled: options.volumes.enabled }),
+              },
+        ));
+
+      return createVolumePool(discovery, { owner: `manager:${String(process.pid)}` });
+    })();
+
+    return poolPromise;
+  }
+
+  function volumeBinding(lease: VolumeLease): WorkspaceVolumeBinding {
+    return {
+      id: lease.volume.id,
+      mountPath: lease.volume.mountPath,
+      device: lease.volume.device,
+      totalBytes: lease.usage.totalBytes,
+      warmStart: lease.warmStart,
+    };
+  }
+
+  /** The paths a handle's own fields imply — one place, so they cannot drift. */
+  function repoPathOf(handle: Pick<WorkspaceHandle, 'rootPath' | 'repoPath'>): string {
+    return handle.repoPath.length > 0 ? handle.repoPath : repositoryPath(handle.rootPath);
+  }
 
   async function git(cwd: string, args: readonly string[]): Promise<string> {
     try {
@@ -183,10 +290,10 @@ export function createWorkspaceManager(options: WorkspaceManagerOptions = {}): W
    * earlier run, which is exactly the untrusted case.
    */
   async function readHeadSandboxed(
-    rootPath: string,
+    workspace: Pick<WorkspaceHandle, 'rootPath' | 'repoPath'>,
   ): Promise<{ commit: string | null; branch: string | null }> {
     const command = buildSandboxCommand(
-      { rootPath },
+      { rootPath: workspace.rootPath, repoPath: repoPathOf(workspace) },
       [
         'git',
         '-c',
@@ -285,20 +392,58 @@ export function createWorkspaceManager(options: WorkspaceManagerOptions = {}): W
     const rootPath = workspacePath(root, { orgId, taskId, workspaceId });
     await assertContained(root, rootPath);
 
-    const repoPath = repositoryPath(rootPath);
-
     // Idempotency, part 1: this process already has the handle.
     const known = handles.get(workspaceId);
-    if (known !== undefined && (await exists(repoPath))) {
+    if (known !== undefined && (await exists(known.repoPath))) {
       return known;
     }
 
-    // Idempotency, part 2: a previous process provisioned it and the directory is
+    // ── The disk boundary, claimed before the first byte ───────────────────────
+    //
+    // The volume is leased before anything is written, so the checkout's ceiling is a
+    // property of the device from the first `clone` rather than something applied later.
+    // A pool with no free volume refuses here — admission control, not a retry loop: the
+    // aggregate a set of concurrent attempts can consume is (volumes × size), and
+    // overcommitting it would make the quota a lie under load.
+    const pool = await volumePool();
+    const discovery = pool.discovery;
+    let lease: VolumeLease | undefined;
+
+    if (isBounded(discovery)) {
+      try {
+        lease = await pool.claim({ workspaceId });
+      } catch (error) {
+        const failure: WorkspaceFailure = {
+          stage: 'volume',
+          message: error instanceof Error ? error.message : String(error),
+          code: error instanceof Error && 'code' in error ? String(error.code) : 'VOLUME_EXHAUSTED',
+        };
+
+        return remember({
+          id: workspaceId,
+          orgId,
+          taskId,
+          rootPath,
+          sourceKind: request.source.kind,
+          baseCommit: null,
+          branch: null,
+          state: 'failed',
+          repoPath: repositoryPath(rootPath),
+          createdAt: new Date().toISOString(),
+          error: failure,
+        });
+      }
+    }
+
+    const repoPath = lease === undefined ? repositoryPath(rootPath) : lease.repoPath;
+    const volume = lease === undefined ? undefined : volumeBinding(lease);
+
+    // Idempotency, part 2: a previous process provisioned it and the checkout is
     // usable. A worker restart must not fail because the row outlived the manager.
     // The directory may also carry whatever a previous agent wrote into `.git`, so the
     // query runs inside the sandbox — never as a host `git` against agent content.
     if (await exists(join(repoPath, '.git'))) {
-      const head = await readHeadSandboxed(rootPath);
+      const head = await readHeadSandboxed({ rootPath, repoPath });
 
       return remember({
         id: workspaceId,
@@ -310,6 +455,7 @@ export function createWorkspaceManager(options: WorkspaceManagerOptions = {}): W
         branch: head.branch,
         state: 'ready',
         repoPath,
+        ...(volume === undefined ? {} : { volume }),
         createdAt: new Date().toISOString(),
       });
     }
@@ -324,6 +470,7 @@ export function createWorkspaceManager(options: WorkspaceManagerOptions = {}): W
       branch: null,
       state: 'requested',
       repoPath,
+      ...(volume === undefined ? {} : { volume }),
       createdAt: new Date().toISOString(),
     };
 
@@ -343,7 +490,9 @@ export function createWorkspaceManager(options: WorkspaceManagerOptions = {}): W
       stage = 'source';
 
       if (request.source.kind === 'clone') {
-        await git(rootPath, ['clone', '--no-hardlinks', request.source.repoPath, 'repo']);
+        // The destination is the volume when one is leased: `git clone` writes the whole
+        // checkout, so this is the write the disk quota has to cover.
+        await git(rootPath, ['clone', '--no-hardlinks', request.source.repoPath, repoPath]);
 
         if (request.source.baseCommit) {
           await git(repoPath, ['checkout', '--detach', request.source.baseCommit]);
@@ -390,6 +539,13 @@ export function createWorkspaceManager(options: WorkspaceManagerOptions = {}): W
       // Leave nothing that looks usable: a half-cloned directory that later passes
       // for `ready` is worse than a clean failure. The error is recorded, not hidden.
       await rm(rootPath, { recursive: true, force: true }).catch(() => undefined);
+
+      // The volume is released on a failed provision: holding it would turn one bad
+      // clone into a permanently unavailable slot. `clear` is default-on, which also
+      // removes the half-written checkout from the volume.
+      if (lease !== undefined) {
+        await pool.release(lease).catch(() => undefined);
+      }
 
       const failure: WorkspaceFailure = {
         stage,
@@ -456,6 +612,22 @@ export function createWorkspaceManager(options: WorkspaceManagerOptions = {}): W
       await rm(resolved, { recursive: true, force: true });
     }
 
+    // ── The volume goes back to the pool ────────────────────────────────────────
+    //
+    // Released last, and only for a handle this process leases. `release` clears the
+    // device and removes the lock — never the workspace root, which is on the host and
+    // holds `artifacts/`. Clearing a volume that was never leased by us is refused by
+    // the pool (it is not in `held()`), which is what stops a forged handle from wiping
+    // another attempt's checkout.
+    if (handle.volume !== undefined) {
+      const pool = await volumePool();
+      const lease = pool.held().find((candidate) => candidate.volume.id === handle.volume?.id);
+
+      if (lease !== undefined) {
+        await pool.release(lease);
+      }
+    }
+
     const latest = handles.get(handle.id) ?? current;
 
     // Where a removed directory belongs in the lifecycle depends on where it came from.
@@ -495,7 +667,7 @@ export function createWorkspaceManager(options: WorkspaceManagerOptions = {}): W
     if (handle.state !== 'provisioning') return handle;
 
     const dirExists = await exists(handle.rootPath);
-    const repoExists = await exists(join(handle.repoPath, '.git'));
+    const repoExists = await exists(join(repoPathOf(handle), '.git'));
 
     if (!dirExists) {
       // Died before the first byte was written. Indistinguishable from "never
@@ -517,7 +689,7 @@ export function createWorkspaceManager(options: WorkspaceManagerOptions = {}): W
       });
     }
 
-    const head = await readHeadSandboxed(handle.rootPath);
+    const head = await readHeadSandboxed(handle);
     assertTransition('provisioning', 'ready');
 
     return remember({
@@ -532,5 +704,13 @@ export function createWorkspaceManager(options: WorkspaceManagerOptions = {}): W
     return handles.get(workspaceId);
   }
 
-  return { root, provision, transition, cleanup, adopt, recover, get };
+  async function volumes(): Promise<VolumeDiscovery> {
+    return (await volumePool()).discovery;
+  }
+
+  async function volumeLeases(): Promise<readonly VolumeLease[]> {
+    return (await volumePool()).held();
+  }
+
+  return { root, provision, transition, cleanup, adopt, recover, get, volumes, volumeLeases };
 }

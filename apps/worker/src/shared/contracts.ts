@@ -14,11 +14,20 @@ import type { EventEnvelope, RiskClass, TaskStatus } from '@intelligenz/contract
  * unchanged.
  */
 
-/** Contract §16, verbatim. */
+/**
+ * Contract §16 signature, extended in Phase 5 with `attemptId`.
+ *
+ * `attemptId` is **optional in the type and required in practice**: the API always sends
+ * it, but a workflow started directly through Temporal can omit it, and that case must be
+ * a *refusal* the gate can name — not a workflow that fails to deserialize. An old
+ * execution recorded before the field existed replays with `undefined` and is refused the
+ * same way, which is the honest answer: its grant was never bound to an attempt.
+ */
 export interface RunTaskWorkflowInput {
   readonly taskId: string;
   readonly orgId: string;
   readonly correlationId: string;
+  readonly attemptId?: string;
 }
 
 /** Contract §16, verbatim. `status` is the workflow's verdict, not the task's history. */
@@ -32,6 +41,13 @@ export interface RunTaskWorkflowResult {
 export interface ValidateTaskActivityInput {
   readonly taskId: string;
   readonly orgId: string;
+  /**
+   * Phase 5. The attempt the API reserved before starting this workflow. The grant this
+   * task's approval was spent on must name this same attempt; absent or different is a
+   * refusal, because otherwise a second execution could run on a grant that was already
+   * spent.
+   */
+  readonly attemptId?: string;
 }
 
 /** Everything the workflow needs to build an event envelope without touching the DB. */

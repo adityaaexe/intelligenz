@@ -13,6 +13,10 @@ import type { CgroupUsage } from './cgroup';
  *   pids            a fork was refused because pids.max was reached
  *   cpu             more CPU was consumed than cpu.max allows — i.e. the quota was
  *                   not in force, which is an enforcement failure, not a busy run
+ *   cpu_budget      the attempt spent its cumulative CPU budget and the platform killed
+ *                   the cgroup. Distinct from `timeout` (the clock, not the CPU) and
+ *                   from `cpu` (a rate ceiling that was not applied)
+ *   disk            a write failed because the workspace volume hit ENOSPC
  *   crashed         the process died without a verdict (signal, non-zero exit, throw)
  *   workspace_error nothing ran: provisioning, cgroup placement or the lease failed
  *
@@ -26,6 +30,8 @@ export const TERMINATION_REASONS = [
   'oom',
   'pids',
   'cpu',
+  'cpu_budget',
+  'disk',
   'crashed',
   'workspace_error',
 ] as const;
@@ -42,6 +48,23 @@ export interface TerminationInput {
   readonly cpuCeilingUs: number;
   /** True when the sandbox process never made it into its cgroup. */
   readonly placementFailed: boolean;
+  /**
+   * True when the CPU-budget sampler fired and the platform killed the cgroup.
+   *
+   * This is a **decision the platform made**, not an inference: the sampler observed
+   * `usage_usec > budget`, called `cgroup.kill`, and set this flag. That is why it
+   * outranks `crashed` — the process died because we stopped it, and recording a
+   * deliberate stop as a crash would hide the only interesting fact about the run.
+   */
+  readonly cpuBudgetExceeded?: boolean;
+  /** The sampler's last measurement, for the error message and the attempt log. */
+  readonly cpuBudget?: { readonly usageUs: number; readonly budgetUs: number } | undefined;
+  /**
+   * True when the attempt's writes failed with `ENOSPC` on its workspace volume: the
+   * disk quota is real and the run hit it. Recorded separately from `crashed` because
+   * "the agent ran out of room" is a capacity fact, not an agent bug.
+   */
+  readonly diskExhausted?: boolean;
 }
 
 export interface TerminationVerdict {
@@ -62,9 +85,17 @@ export function classifyTermination(input: TerminationInput): TerminationVerdict
     return { reason: 'workspace_error', resourceKill: false, overridesAdapter: true };
   }
 
+  // A CPU-budget kill is the most specific fact available *after* placement: the platform
+  // killed this run on purpose, at a measured `usage_usec`. It has to be decided before
+  // the adapter's own status, because a killed tree usually reports `threw` or `failed`
+  // and both are true but neither explains anything.
+  if (input.cpuBudgetExceeded === true) {
+    return { reason: 'cpu_budget', resourceKill: true, overridesAdapter: true };
+  }
+
   const usage = input.usage;
 
-  // OOM first: the kernel's kill is the most specific fact available, and an adapter
+  // OOM next: the kernel's kill is the most specific fact available, and an adapter
   // that reports "failed" after its process tree was shot is not telling us why.
   if (usage !== null && usage.oomKills > 0) {
     return { reason: 'oom', resourceKill: true, overridesAdapter: true };
@@ -88,6 +119,13 @@ export function classifyTermination(input: TerminationInput): TerminationVerdict
     return { reason: 'cpu', resourceKill: true, overridesAdapter: true };
   }
 
+  // Disk last among the resource verdicts: a run that hit ENOSPC usually failed for that
+  // reason, but if it also lost a process to the kernel the kernel's fact is more
+  // specific and is already returned above.
+  if (input.diskExhausted === true) {
+    return { reason: 'disk', resourceKill: true, overridesAdapter: true };
+  }
+
   if (input.adapter === 'succeeded') {
     return { reason: 'completed', resourceKill: false, overridesAdapter: false };
   }
@@ -97,8 +135,9 @@ export function classifyTermination(input: TerminationInput): TerminationVerdict
 
 /**
  * `RunStatus` for the attempt, given the verdict. A resource kill is never a success and
- * never an agent failure: `oom`/`pids`/`cpu` become `failed` with a `terminationReason`
- * that says who ended it, and only the wall clock produces `timed_out`.
+ * never an agent failure: `oom`/`pids`/`cpu`/`cpu_budget`/`disk` become `failed` with a
+ * `terminationReason` that says who ended it, and only the wall clock produces
+ * `timed_out`.
  */
 export function statusForTermination(
   verdict: TerminationVerdict,
@@ -113,6 +152,8 @@ export function statusForTermination(
     case 'oom':
     case 'pids':
     case 'cpu':
+    case 'cpu_budget':
+    case 'disk':
     case 'crashed':
     case 'workspace_error':
       return 'failed';

@@ -1,9 +1,10 @@
-import { execFile, spawnSync } from 'node:child_process';
+import { execFile, spawn, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { WorkspaceError } from './errors';
 import { repositoryPath } from './paths';
+import { BoundedCapture, type TruncationMarker } from './output-cap';
 
 /**
  * The sandbox, as an argv builder plus one measurement function.
@@ -279,10 +280,13 @@ function rlimitArgs(limits: SandboxRlimits | undefined): string[] {
  * Build the `bwrap` invocation for one workspace.
  *
  * @param workspace anything with a `rootPath`; a full `WorkspaceHandle` satisfies it.
+ *   A `repoPath`, when present, is the directory bound to `/workspace` — that is how a
+ *   checkout on a bounded volume becomes the sandbox's only writable mount without the
+ *   sandbox needing to know what a volume is.
  * @param argv the command to run inside, as separate arguments.
  */
 export function buildSandboxCommand(
-  workspace: { readonly rootPath: string },
+  workspace: { readonly rootPath: string; readonly repoPath?: string },
   argv: readonly string[],
   options: SandboxOptions,
 ): SandboxCommand {
@@ -291,7 +295,7 @@ export function buildSandboxCommand(
   }
 
   const file = resolveBwrap(options.bwrapPath);
-  const repoPath = repositoryPath(workspace.rootPath);
+  const repoPath = workspace.repoPath ?? repositoryPath(workspace.rootPath);
   const args: string[] = [];
 
   for (const path of BASE_READ_ONLY) {
@@ -343,11 +347,47 @@ export function buildSandboxCommand(
  * Rejects on a non-zero exit, matching `child_process.execFile`'s promise contract:
  * callers that treat "not a git repository" as *no evidence* catch, and callers that
  * treat it as a failure let it propagate.
+ *
+ * ## `outputCapBytes` — the difference between a ceiling and a wish
+ *
+ * Without it, `execFile`'s `maxBuffer` is the only bound: the child's entire stdout is
+ * buffered, the buffer grows to `maxBuffer`, and the call then fails having already paid
+ * the memory. With `outputCapBytes` the streams are read with a `BoundedCapture` instead:
+ * every chunk is counted, only the first `capBytes` are kept, the rest are dropped, and
+ * the call **succeeds** with a truncated body plus a structured marker. That is the
+ * behaviour a transcript wants — "here is the first 5 MiB and how much more there was"
+ * — rather than an error that loses the bytes it charged for.
  */
+export interface ExecSandboxedOptions {
+  readonly timeoutMs: number;
+  /** Only used on the non-streaming path; the streaming path bounds memory by the cap. */
+  readonly maxBuffer: number;
+  /** When set, stdout/stderr are read through this ceiling instead of buffered. */
+  readonly outputCapBytes?: number;
+  /** Which output this is, for the marker. Defaults to the first argv token. */
+  readonly capScope?: string;
+  /** Hard stop for a producer that ignores the cap. Defaults to 64 × the cap. */
+  readonly maxOutputBytes?: number;
+}
+
+export interface ExecSandboxedResult {
+  readonly stdout: string;
+  readonly stderr: string;
+  /** Present only on the streaming path, and only when something was dropped. */
+  readonly truncation?: {
+    readonly stdout: TruncationMarker | null;
+    readonly stderr: TruncationMarker | null;
+  };
+}
+
 export function execSandboxed(
   command: SandboxCommand,
-  options: { readonly timeoutMs: number; readonly maxBuffer: number },
-): Promise<{ stdout: string; stderr: string }> {
+  options: ExecSandboxedOptions,
+): Promise<ExecSandboxedResult> {
+  if (options.outputCapBytes !== undefined) {
+    return execSandboxedStreaming(command, options, options.outputCapBytes);
+  }
+
   return new Promise((resolvePromise, reject) => {
     execFile(
       command.file,
@@ -367,6 +407,106 @@ export function execSandboxed(
         resolvePromise({ stdout, stderr });
       },
     );
+  });
+}
+
+/** Grace between SIGTERM and SIGKILL when the deadline expires. */
+const STREAMING_KILL_GRACE_MS = 250;
+
+function execSandboxedStreaming(
+  command: SandboxCommand,
+  options: ExecSandboxedOptions,
+  capBytes: number,
+): Promise<ExecSandboxedResult> {
+  const scope = options.capScope ?? command.args[0] ?? 'sandbox';
+  const maxBytes = options.maxOutputBytes ?? capBytes * 64;
+
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(command.file, [...command.args], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: command.env,
+      // No shell, no detached group: this helper is for short, host-side commands
+      // (git plumbing, probes), not for agent trees. A timeout kill is enough.
+      shell: false,
+    });
+
+    const out = new BoundedCapture(capBytes, `${scope}:stdout`);
+    const err = new BoundedCapture(capBytes, `${scope}:stderr`);
+
+    let timedOut = false;
+    let settled = false;
+    let killTimer: NodeJS.Timeout | undefined;
+
+    const deadline = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGTERM');
+      killTimer = setTimeout(() => child.kill('SIGKILL'), STREAMING_KILL_GRACE_MS);
+      killTimer.unref();
+    }, options.timeoutMs);
+
+    deadline.unref();
+
+    // Flow, count, drop. The streams are never paused: backpressure on a flooding child
+    // would turn a truncated capture into a timeout.
+    child.stdout.on('data', (chunk: Buffer) => {
+      out.write(chunk);
+      if (out.originalBytes > maxBytes) child.stdout.destroy();
+    });
+
+    child.stderr.on('data', (chunk: Buffer) => {
+      err.write(chunk);
+      if (err.originalBytes > maxBytes) child.stderr.destroy();
+    });
+
+    const settle = (code: number | null, signal: NodeJS.Signals | null): void => {
+      if (settled) return;
+      settled = true;
+
+      clearTimeout(deadline);
+      if (killTimer !== undefined) clearTimeout(killTimer);
+
+      const stdout = out.result();
+      const stderr = err.result();
+      const payload: ExecSandboxedResult = {
+        stdout: stdout.text,
+        stderr: stderr.text,
+        ...(stdout.truncated || stderr.truncated
+          ? { truncation: { stdout: stdout.marker, stderr: stderr.marker } }
+          : {}),
+      };
+
+      if (code === 0) {
+        resolvePromise(payload);
+        return;
+      }
+
+      // Same shape `execFile` rejected with, so existing callers keep working: `code`,
+      // `killed`, `signal`, plus the (possibly truncated) output for diagnosis.
+      const error = Object.assign(
+        new Error(
+          `Command failed: ${command.file} ${command.args.slice(0, 4).join(' ')} ` +
+            `(exit ${String(code)}${signal === null ? '' : `, signal ${signal}`})`,
+        ),
+        {
+          code: code ?? (timedOut ? 'ETIMEDOUT' : 1),
+          killed: timedOut,
+          signal,
+          stdout: payload.stdout,
+          stderr: payload.stderr,
+        },
+      );
+
+      reject(error);
+    };
+
+    child.once('error', (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      reject(error);
+    });
+
+    child.once('close', (code, signal) => settle(code, signal));
   });
 }
 

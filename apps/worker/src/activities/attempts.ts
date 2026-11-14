@@ -13,6 +13,23 @@ import { db, nonRetryable } from './support';
  * that: `(workflowRunId, attemptNumber)` is unique in the schema, and this module is
  * the only writer of that pair.
  *
+ * ## Phase 5: the first attempt is reserved by the API, not created here
+ *
+ * `POST /run` creates the attempt inside the transaction that consumes the approval, so
+ * the grant names an attempt before any workflow exists. `startAttempt` therefore
+ * **adopts** that row (`queued → running`) instead of inserting attempt #1 beside it;
+ * inserting would leave a phantom queued attempt and make the run's accounting disagree
+ * with the grant. When no reserved attempt exists — a direct Temporal start, or a retry
+ * after a previous attempt was finalized — it falls back to allocating `max + 1`, which
+ * is the Phase 3 behaviour and is correct for both of those cases.
+ *
+ * ## Why the adopted row is claimed with a compare-and-swap
+ *
+ * Two executions of one workflow run can reach this function with the same reservation.
+ * The `updateMany` predicate (`status: 'queued'`, `agentRunId: null`) makes exactly one
+ * of them win; the loser throws before anything is provisioned. Falling through to a new
+ * attempt there would be the residual this closes: one grant, two agents.
+ *
  * ## Why the number is read, not derived from a counter
  *
  * A counter in memory would reset with the worker and collide with an existing row
@@ -87,6 +104,9 @@ export async function startAttempt(input: {
 }): Promise<AttemptRef> {
   const prisma = db();
 
+  const adopted = await adoptReservedAttempt(input);
+  if (adopted !== null) return adopted;
+
   for (let attempt = 0; attempt < MAX_ATTEMPT_INSERT_ATTEMPTS; attempt += 1) {
     const previous = await prisma.executionAttempt.findFirst({
       where: { workflowRunId: input.workflowRunId },
@@ -124,6 +144,75 @@ export async function startAttempt(input: {
     'EXECUTION_ATTEMPT_CONTENDED',
     `Could not allocate an attempt number for workflow run ${input.workflowRunId}.`,
   );
+}
+
+/**
+ * Claims the attempt `POST /run` reserved, if there is one.
+ *
+ * Returns `null` when this workflow run has no queued reservation — which is the honest
+ * description of a direct Temporal start and of a retry after a finalized attempt, and
+ * lets the caller use the Phase 3 allocation path unchanged.
+ *
+ * A reservation that exists but cannot be claimed is **not** `null`: the only way to lose
+ * this compare-and-swap is another execution adopting the same row, and the correct answer
+ * to that is a refusal, not a second attempt.
+ */
+async function adoptReservedAttempt(input: {
+  readonly orgId: string;
+  readonly taskId: string;
+  readonly workflowRunId: string;
+  readonly runtimeId: string;
+  readonly simulated: boolean;
+  readonly startedAt: Date;
+}): Promise<AttemptRef | null> {
+  const prisma = db();
+
+  const reserved = await prisma.executionAttempt.findFirst({
+    where: {
+      // Tenant scoping, and the run the reservation belongs to: an unstarted attempt for
+      // a different run is not this execution's to take.
+      orgId: input.orgId,
+      taskId: input.taskId,
+      workflowRunId: input.workflowRunId,
+      status: 'queued',
+      agentRunId: null,
+    },
+    // Deterministic if a run somehow holds more than one: the earliest reservation is
+    // the one the grant points at, because attempts are numbered in creation order.
+    orderBy: { attemptNumber: 'asc' },
+    select: { id: true, attemptNumber: true },
+  });
+
+  if (reserved === null) return null;
+
+  const claimed = await prisma.executionAttempt.updateMany({
+    where: {
+      id: reserved.id,
+      orgId: input.orgId,
+      // The CAS. Both predicates are load-bearing: `status` stops a second adoption, and
+      // `agentRunId` stops adoption of an attempt that already produced a run.
+      status: 'queued',
+      agentRunId: null,
+    },
+    data: {
+      status: 'running',
+      startedAt: input.startedAt,
+      // Replace the `unassigned` placeholder the API wrote with the adapter that is
+      // actually about to run.
+      runtimeId: input.runtimeId,
+      simulated: input.simulated,
+    },
+  });
+
+  if (claimed.count === 0) {
+    throw nonRetryable(
+      'EXECUTION_ATTEMPT_TAKEN',
+      `Attempt ${reserved.id} was already claimed by another execution of workflow run ` +
+        `${input.workflowRunId}. One reservation authorises one execution.`,
+    );
+  }
+
+  return reserved;
 }
 
 /**

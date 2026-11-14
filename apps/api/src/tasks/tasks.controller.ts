@@ -111,6 +111,11 @@ export class TasksController {
    * binding recorded on the grant and refuses a run that intends to use different
    * ones (`409 APPROVAL_STALE`). `RunTaskInput.default({})` is what keeps a body-less
    * `POST /run` working exactly as before.
+   *
+   * `Idempotency-Key` is optional. When present, a retry of the same request is
+   * answered from the run the first one created — same `workflowRunId`, same
+   * `attemptId` — so a client that retries after a timeout cannot reserve a second
+   * attempt from the same grant.
    */
   @Roles('MEMBER')
   @Post(':taskId/run')
@@ -119,11 +124,19 @@ export class TasksController {
     @Param('orgId') orgId: string,
     @Param('taskId') taskId: string,
     @ZodBody(RunTaskInput.default({})) input: RunTaskInputType,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
     @CurrentUser() user: AuthenticatedUser,
     @CorrelationId() correlationId: string,
   ): Promise<{ data: RunResponse }> {
     return {
-      data: await this.tasks.run({ orgId, taskId, input, correlationId, actorId: user.userId }),
+      data: await this.tasks.run({
+        orgId,
+        taskId,
+        input,
+        correlationId,
+        actorId: user.userId,
+        idempotencyKey,
+      }),
     };
   }
 

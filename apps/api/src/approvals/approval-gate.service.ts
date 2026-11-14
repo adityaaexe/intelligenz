@@ -38,6 +38,12 @@ import {
  *   5. `taskContentHash` matches the task's content, class, profile and source **as
  *      they are now**
  *
+ * Phase 5 adds a sixth, at the *write*: the caller must name the attempt the grant is
+ * being spent by, and `requireLiveApproval` refuses to consume without one (a consumed
+ * grant attributable to nobody was the residual). The worker then checks the other half —
+ * that the attempt named by a running workflow is the one recorded here, and that it is
+ * still `queued`.
+ *
  * ## Consumption is a compare-and-swap, never an update by id
  *
  * `updateMany({ where: { id, orgId, status: 'APPROVED', consumedAt: null, revokedAt:
@@ -88,9 +94,12 @@ export interface ApprovalGateParams {
   /** `true` for `POST /run`; `false` for a read-only precondition check. */
   readonly consume: boolean;
   /**
-   * The attempt that spends the grant, when it already exists. `null`/absent means
-   * "not yet attributable": `POST /run` happens before the worker creates the attempt.
-   * `consumedAt` still makes the grant spent; the worker fills the link in later.
+   * The attempt that spends the grant. **Required when `consume` is true**, since
+   * Phase 5: `POST /run` reserves the `ExecutionAttempt` inside the same transaction
+   * that consumes the approval, so the grant is bound to a specific attempt before any
+   * workflow exists. A consumed grant with no attempt link is exactly the residual this
+   * closes — `consumedAt` alone proved a reservation happened, not that *this run* made
+   * it. A read-only check (`consume: false`) may omit it: nothing is spent.
    */
   readonly attemptId?: string | null;
   /** What the execution request asserts it will use. Compared, never trusted blindly. */
@@ -111,6 +120,19 @@ export class ApprovalGateService {
 
   async requireLiveApproval(params: ApprovalGateParams): Promise<ApprovalGateResult> {
     const { task, correlationId, actorId, consume } = params;
+
+    // Phase 5 invariant: a spend must name the attempt that spends it. This is not a
+    // client error — `POST /run` always creates the attempt first — so it surfaces as an
+    // opaque 500 with a stack rather than as a refusal a client could act on. Making it
+    // loud is the point: a future caller that consumes without an attempt would silently
+    // recreate the "consumed, attributable to nobody" residual.
+    const spendingAttemptId = consume ? params.attemptId ?? null : null;
+
+    if (consume && spendingAttemptId === null) {
+      throw new Error(
+        'requireLiveApproval(consume: true) requires attemptId: a consumed grant must name the attempt that spent it.',
+      );
+    }
 
     const recorded = readTaskBinding(task.riskFactors);
     const effective = resolveBinding(recorded, params.assertion);
@@ -223,7 +245,7 @@ export class ApprovalGateService {
           consumedAt: null,
           revokedAt: null,
         },
-        data: { consumedAt, consumedByAttemptId: params.attemptId ?? null },
+        data: { consumedAt, consumedByAttemptId: spendingAttemptId },
       });
 
       if (consumed.count === 0) {
@@ -237,7 +259,7 @@ export class ApprovalGateService {
         task,
         approvalId: approval.id,
         consumedAt,
-        attemptId: params.attemptId ?? null,
+        attemptId: spendingAttemptId,
         correlationId,
         actorId,
         transaction: params.transaction,

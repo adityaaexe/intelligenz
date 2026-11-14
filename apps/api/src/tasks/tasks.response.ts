@@ -100,8 +100,20 @@ export interface TaskPage {
 export interface RunResponse {
   readonly taskId: string;
   readonly workflowRunId: string;
+  /**
+   * Phase 5. The attempt reserved **before** the workflow was started, and the row the
+   * approval's `consumedByAttemptId` points at. Returned so a client (and a test) can
+   * follow the grant to the exact execution it authorised, instead of inferring it from
+   * "the newest attempt".
+   */
+  readonly attemptId: string;
   readonly workflowId: string;
-  readonly temporalRunId: string;
+  /**
+   * Null while the run is queued and the start RPC has not returned yet — which is the
+   * state an idempotent replay of a `POST /run` can observe. Widened from `string` in
+   * Phase 5 rather than papering over the window with an empty string.
+   */
+  readonly temporalRunId: string | null;
   readonly status: 'queued';
 }
 

@@ -33,6 +33,10 @@ const config: AppConfig = {
   readinessTimeoutMs: 2_000,
   artifactRoot: '/tmp/intelligenz-test-artifacts',
   workspaceRoot: '/tmp/intelligenz-test-workspaces',
+  // Defaults from `app-config.ts`. Irrelevant to claim verification, but the config is
+  // a closed contract: a fixture that omits a field is a fixture that can drift from it.
+  approvalTtlHours: 24,
+  trustedSourceRepos: [],
 };
 
 /** Signs without the module's default `expiresIn`, so the payload is exact. */

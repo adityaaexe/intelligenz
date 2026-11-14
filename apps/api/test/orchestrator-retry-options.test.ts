@@ -57,12 +57,19 @@ const config: AppConfig = {
   readinessTimeoutMs: 2_000,
   artifactRoot: '/tmp/intelligenz-test-artifacts',
   workspaceRoot: '/tmp/intelligenz-test-workspaces',
+  // Defaults from `app-config.ts`. The mocked client never reads them; they are here
+  // because `AppConfig` is a closed contract and a fixture must state every field.
+  approvalTtlHours: 24,
+  trustedSourceRepos: [],
 };
 
 const input: RunTaskWorkflowInput = {
   taskId: TASK_ID,
   orgId: '6f1d2c3b-4a59-4687-9a0b-1c2d3e4f5a6b',
   correlationId: '7a2e3d4c-5b60-4798-8b1c-2d3e4f5a6b7c',
+  // Phase 5: the attempt the API reserved before starting. Required, because a start
+  // that cannot name its attempt is a start the worker's gate refuses.
+  attemptId: '0b9f2a1c-3d4e-4f50-8a9b-1c2d3e4f5a6b',
 };
 
 /** The options object the service handed to `client.workflow.start`. */

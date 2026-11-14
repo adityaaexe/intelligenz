@@ -15,6 +15,12 @@
 //   - `Task` records where its risk class came from.
 // No evaluation tables: the Phase 4 eval harness stores JSON on disk.
 //
+// Phase 5 (BE-501) adds one column, for one reason: `WorkflowRun.idempotencyKey` lets a
+// retried `POST /run` be answered from the run the first request created instead of
+// reserving a second `ExecutionAttempt`. The approval→attempt link itself needs no column:
+// `ApprovalRequest.consumedByAttemptId` already points at `ExecutionAttempt`, and
+// `ExecutionAttempt.workflowRunId` already points at the run, so the chain is complete.
+//
 // Conventions enforced here, not just documented:
 //   - every tenant-owned table carries a non-null `orgId`, indexed;
 //   - composite indexes lead with `orgId` so a tenant list query is a range scan;
@@ -319,11 +325,23 @@ model WorkflowRun {
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
 
+  // ─── Phase 5: request identity ───────────────────────────────────────────
+  /// The client's `Idempotency-Key` for the `POST /run` that created this row. Nullable
+  /// because every run created before the column existed carried no key, and back-filling
+  /// one would assert a request nobody made. A retry that supplies the same key is
+  /// answered from this row — same `WorkflowRun`, same `ExecutionAttempt`, no second
+  /// attempt — instead of starting a second execution. Postgres treats NULLs as distinct
+  /// in a unique index, so the legacy rows coexist while duplicate keys collide.
+  idempotencyKey String?
+
   organization Organization       @relation(fields: [orgId], references: [id], onDelete: Cascade)
   task         Task               @relation(fields: [taskId], references: [id], onDelete: Cascade)
   agentRuns    AgentRun[]
   attempts     ExecutionAttempt[]
 
+  // One request key, one run. Scoped by task rather than org: two tasks may legitimately
+  // be started with the same client-generated key.
+  @@unique([taskId, idempotencyKey])
   @@index([orgId, createdAt])
   @@index([orgId, status])
   @@index([taskId, createdAt])

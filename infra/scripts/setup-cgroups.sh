@@ -154,7 +154,48 @@ for controller in "${REQUIRED_CONTROLLERS[@]}"; do
   fi
 done
 
-# ── 3b. The worker's own leaf ────────────────────────────────────────────────────
+# ── 3b. Optional controllers ─────────────────────────────────────────────────────
+# `io` is separate from the three the limits depend on: `io.max` support is a property of
+# the block device as much as of the kernel, so its absence is a degraded state to
+# *report*, not a reason to refuse the whole delegation. The worker probes it and says
+# "unsupported" with the errno if it is missing (apps/worker/src/capabilities.ts).
+#
+# Delegating it needs two writes, both here, both as root: `+io` at the root to make it
+# available to `intelligenz`, then `+io` in `intelligenz` to make `io.max` exist inside an
+# attempt cgroup. Doing it lazily at runtime is impossible: `cgroup.subtree_control` is
+# root-owned on purpose so a worker bug cannot widen its own boundary.
+OPTIONAL_CONTROLLERS=(io)
+
+for controller in "${OPTIONAL_CONTROLLERS[@]}"; do
+  if ! has_word "${PARENT_CONTROLLERS}" "${controller}"; then
+    echo "note: controller '${controller}' is not available at ${CGROUP_ROOT}; io.max will be reported as unsupported"
+    continue
+  fi
+
+  if ! has_word "$(cat "${CGROUP_ROOT}/cgroup.subtree_control")" "${controller}"; then
+    if echo "+${controller}" > "${CGROUP_ROOT}/cgroup.subtree_control" 2>/dev/null; then
+      echo "delegated +${controller} at ${CGROUP_ROOT}"
+    else
+      echo "note: could not delegate +${controller} at ${CGROUP_ROOT}; io.max will be reported as unsupported"
+      continue
+    fi
+  fi
+
+  if ! has_word "$(cat "${SUBTREE}/cgroup.controllers")" "${controller}"; then
+    echo "note: '${controller}' did not reach ${SUBTREE}; io.max will be reported as unsupported"
+    continue
+  fi
+
+  if ! has_word "$(cat "${SUBTREE}/cgroup.subtree_control" 2>/dev/null || true)" "${controller}"; then
+    if echo "+${controller}" > "${SUBTREE}/cgroup.subtree_control" 2>/dev/null; then
+      echo "delegated +${controller} to the children of ${SUBTREE}"
+    else
+      echo "note: could not delegate +${controller} to the children of ${SUBTREE}"
+    fi
+  fi
+done
+
+# ── 3c. The worker's own leaf ────────────────────────────────────────────────────
 # A leaf: it holds processes, so it must not have `cgroup.subtree_control` enabled.
 # Its own usage is charged to the (unlimited) parent, which is deliberate — the worker
 # must not be capped by an agent's profile.
@@ -196,6 +237,7 @@ echo "  root cgroup.controllers:  $(cat "${CGROUP_ROOT}/cgroup.controllers")"
 echo "  root subtree_control:     $(cat "${CGROUP_ROOT}/cgroup.subtree_control")"
 echo "  subtree cgroup.controllers: $(cat "${SUBTREE}/cgroup.controllers")"
 echo "  subtree subtree_control:    $(cat "${SUBTREE}/cgroup.subtree_control")"
+echo "  io.max in a child:          $( [[ -f "${SUBTREE}/worker/io.max" ]] && echo present || echo absent )"
 echo "  worker leaf:                ${WORKER_CGROUP} ($(stat -c '%U:%G' "${WORKER_CGROUP}"))"
 echo
 echo "The worker now creates ${SUBTREE}/<attemptId>/ and writes memory.max, pids.max"

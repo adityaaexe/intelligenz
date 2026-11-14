@@ -99,7 +99,14 @@ export async function runTaskWorkflow(
   let projectId: string | undefined;
 
   try {
-    const validation = await taskActivities.validateTaskActivity({ taskId, orgId });
+    const validation = await taskActivities.validateTaskActivity({
+      taskId,
+      orgId,
+      // Phase 5: forwarded verbatim. It is not trusted here — the activity checks it
+      // against the grant's `consumedByAttemptId` — but a workflow that dropped it would
+      // make every approval-gated run unrefusable-by-omission.
+      ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
+    });
 
     if (!validation.runnable) {
       projectId = validation.projectId;

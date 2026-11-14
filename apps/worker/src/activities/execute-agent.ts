@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { cancellationSignal } from '@temporalio/activity';
@@ -9,27 +9,47 @@ import {
   RuntimeResultError,
   missingCapabilities,
   toExecutionError,
+  type ExecutionEvent,
+  type ToolInvocationRecord,
 } from '@intelligenz/agent-runtime';
-
+import {
+  enforceTextCap,
+  readVolumeUsage,
+  type TruncationMarker,
+  type WorkspaceHandle,
+} from '@intelligenz/workspace-manager';
 import { getWorkerConfig } from '../config';
 import {
+  applyIoMax,
   applyLimits,
   createCgroup,
   killCgroup,
   readUsage,
   removeCgroup,
+  startCpuBudgetWatch,
   type CgroupHandle,
   type CgroupUsage,
+  type CpuBudgetSample,
+  type CpuBudgetWatch,
   type EffectiveLimits,
+  type IoMaxEffective,
 } from '../cgroup';
 import {
   assertProfileAvailable,
+  checkCpuBudget,
+  cpuBudgetMs,
   cpuCeilingFor,
   executionProfileLabel,
   selectResourceProfile,
   type ResourceProfile,
 } from '../resource-profiles';
-import { getCgroupCapability, type CgroupMode } from '../capabilities';
+import {
+  describeDiskCapability,
+  detectDiskCapability,
+  getCgroupCapability,
+  type CgroupMode,
+  type DiskCapability,
+} from '../capabilities';
 import { getAgentRuntime, runtimeRequiresWorkspace } from '../runtime';
 import type { ExecuteAgentActivityInput, ExecuteAgentActivityResult } from '../shared/contracts';
 import { classifyTermination, type TerminationReason } from '../termination';
@@ -104,6 +124,33 @@ import {
  */
 const MAX_AGENT_TIMEOUT_MS = 230_000;
 
+/**
+ * How often the CPU budget samples `cpu.stat usage_usec`.
+ *
+ * Short relative to the smallest budget (30 s), so the overshoot is bounded by
+ * scheduling jitter rather than by the interval; long enough that the sampler is one
+ * file read per tick instead of a busy loop of its own. 100 ms gives at most 300 extra
+ * samples per attempt at the smallest profile.
+ */
+const CPU_BUDGET_SAMPLE_INTERVAL_MS = 100;
+
+/**
+ * How many CPU-budget kills one workflow run may accumulate before it is refused.
+ *
+ * Zero on purpose. A budget kill is a deliberate platform decision, not a transient
+ * fault, so the retry policy that exists for transient faults must not apply to it. A
+ * deployment that wants one more try changes this constant — and then says so in a
+ * review, which is the point of it being a constant rather than an environment variable
+ * an operator can quietly turn up at 3am.
+ */
+const CPU_BUDGET_RESTART_LIMIT = 0;
+
+/** Per-field ceilings used by `enforceResultCap`, as fractions of the profile's cap. */
+const EVENT_MESSAGE_CAP = 8 * 1024;
+const EVENT_DATA_CAP = 16 * 1024;
+const PROVIDER_META_CAP_FRACTION = 4;
+const MAX_TOOL_INVOCATIONS = 2_000;
+
 export async function executeAgentActivity(
   input: ExecuteAgentActivityInput,
 ): Promise<ExecuteAgentActivityResult> {
@@ -123,15 +170,30 @@ export async function executeAgentActivity(
 
   // ── Resource policy, resolved before anything runs ────────────────────────────
   //
-  // Three decisions, in this order, and none of them is the agent's:
+  // Four decisions, in this order, and none of them is the agent's:
   //   1. is cgroup isolation real on this host right now (probed once per process);
-  //   2. which profile does the server's policy pick for this task;
-  //   3. is that profile allowed to run without cgroups (HEAVY is not).
+  //   2. is there a bounded workspace volume, i.e. a real disk quota (Gate D);
+  //   3. which profile does the server's policy pick for this task;
+  //   4. is that profile allowed to run with the controls that are actually available
+  //      (HEAVY is not, when either aggregate control is missing).
   //
   // A refusal here is a `nonRetryable` failure: retrying cannot make a HEAVY profile
   // safe on a host with no aggregate limit.
   const capability = await getCgroupCapability({ root: config.resources.cgroupRoot });
   const cgroupMode: CgroupMode = capability.mode;
+
+  const disk: DiskCapability = await detectDiskCapability();
+  const diskMode = disk.mode;
+
+  // The disk boundary is a boot-level fact an operator must be able to read from a log,
+  // not infer from behaviour. Logged once per attempt only when it is *not* enforced:
+  // the enforced case is visible on every attempt's `volume` field instead.
+  if (disk.mode === 'unavailable') {
+    workerLogger().warn(
+      { code: disk.code, reason: disk.reason, remediation: disk.remediation },
+      describeDiskCapability(disk),
+    );
+  }
 
   const selection = selectResourceProfile({
     riskClass: task.riskClass,
@@ -142,7 +204,7 @@ export async function executeAgentActivity(
   const profile: ResourceProfile = selection.profile;
 
   try {
-    assertProfileAvailable(profile, cgroupMode);
+    assertProfileAvailable(profile, cgroupMode, { mode: diskMode });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     // No attempt row: nothing ran, and an attempt row for a run that was never started
@@ -172,6 +234,28 @@ export async function executeAgentActivity(
     workflowRunId: input.workflowRunId,
   });
 
+  // ── A CPU-budget kill is not retryable ────────────────────────────────────────
+  //
+  // The marker is durable (a file under the artifact root) and keyed to the workflow run,
+  // so "the budget stopped this run" survives a worker restart, a new attempt number and
+  // Temporal's own retry policy. Without it, `maximumAttempts: 3` would give a runaway
+  // run three budgets — which makes the budget a suggestion.
+  //
+  // Checked before the attempt row: an attempt that is refused must not claim to have
+  // tried, exactly like a refused profile.
+  const priorBudgetStops = await countCpuBudgetStops(config.artifactRoot, workflowRun.id);
+
+  if (priorBudgetStops > CPU_BUDGET_RESTART_LIMIT) {
+    throw nonRetryable(
+      'CPU_BUDGET_EXCEEDED',
+      `Workflow run ${workflowRun.id} already exhausted its CPU budget on an earlier ` +
+        `attempt (${String(priorBudgetStops)} recorded stop(s), restart limit ` +
+        `${String(CPU_BUDGET_RESTART_LIMIT)}). Refusing to restart it: the budget exists to ` +
+        'stop a runaway run, and retrying it would just buy more CPU. Raise the task\'s ' +
+        'profile or split the task.',
+    );
+  }
+
   const attempt = await startAttempt({
     orgId: input.orgId,
     taskId: input.taskId,
@@ -196,6 +280,23 @@ export async function executeAgentActivity(
   let effectiveLimits: EffectiveLimits | undefined;
   let usage: CgroupUsage | null = null;
   let placementFailed = false;
+
+  // CPU lifetime budget (Gate C). The watch is started with the cgroup and stopped on
+  // every exit path; `budgetSample` is the last measurement, which is what the attempt
+  // and the error message quote.
+  let budgetWatch: CpuBudgetWatch | undefined;
+  let cpuBudgetExceeded = false;
+  let budgetSample: CpuBudgetSample | null = null;
+
+  // Disk (Gate D). `diskFloorBytes` is what `statfs` says was left on the volume after
+  // the run; zero free is the measured form of "the attempt hit ENOSPC".
+  let diskFreeBytes: number | null = null;
+  let diskExhausted = false;
+
+  // I/O (Gate D, partial). The effective `io.max` line the kernel kept, or the exact
+  // reason it refused — never a configured value described as an enforced one.
+  let ioEffective: IoMaxEffective | null = null;
+  let ioRefusal: string | null = null;
 
   async function finalize(
     status: ExecutionResult['status'],
@@ -338,6 +439,62 @@ export async function executeAgentActivity(
           cpuQuotaMicros: profile.cpuQuotaMicros,
           cpuPeriodMicros: profile.cpuPeriodMicros,
         });
+
+        // ── Gate C: the cumulative CPU budget ────────────────────────────────────
+        //
+        // `cpu.max` above is a rate. This is the total: `cpu.stat usage_usec` sampled
+        // every 100 ms against the profile's budget, and when it is gone the whole
+        // cgroup is killed — not signalled politely, killed, because a run that has
+        // burned its budget has already demonstrated it will not stop on its own.
+        //
+        // The kill happens here rather than after `execute()` returns: waiting for the
+        // adapter to notice would give the run another interval of CPU for free, and
+        // the point of a lifetime budget is that the lifetime is bounded.
+        budgetWatch = startCpuBudgetWatch({
+          handle: cgroup,
+          budgetUs: profile.cpuBudgetUs,
+          intervalMs: CPU_BUDGET_SAMPLE_INTERVAL_MS,
+          onExceeded: (sample) => {
+            cpuBudgetExceeded = true;
+            budgetSample = sample;
+
+            void killCgroup(cgroup as CgroupHandle).catch(() => undefined);
+
+            workerLogger().warn(
+              {
+                taskId: input.taskId,
+                attemptId: attempt.id,
+                cgroup: cgroup?.path,
+                usageUs: sample.usageUs,
+                budgetUs: sample.budgetUs,
+                fraction: Number(sample.fraction.toFixed(3)),
+                elapsedMs: sample.elapsedMs,
+              },
+              'CPU budget exhausted — cgroup killed',
+            );
+          },
+        });
+
+        // ── Gate D (I/O): `io.max` on the volume's backing device ───────────────
+        //
+        // Applied only when the checkout is on a bounded volume (so there is a device to
+        // throttle) and only when the kernel kept the value. `io.max` is written before
+        // the first process exists so the run never gets an unthrottled window.
+        const volume = lease.handle.volume;
+
+        if (volume !== undefined && profile.ioReadBps > 0 && profile.ioWriteBps > 0) {
+          try {
+            ioEffective = await applyIoMax(cgroup, {
+              device: volume.device,
+              rbps: profile.ioReadBps,
+              wbps: profile.ioWriteBps,
+            });
+          } catch (error) {
+            // Reported, never fatal: a kernel without `io` delegation still gets
+            // memory/pids/cpu/disk enforced, and the attempt log carries the refusal.
+            ioRefusal = error instanceof Error ? error.message : String(error);
+          }
+        }
       }
 
       stopHeartbeat = startWorkspaceHeartbeat({
@@ -355,10 +512,14 @@ export async function executeAgentActivity(
       goal: task.goal,
       // The caller owns the layout. A real run is confined to its lease; a simulated
       // one writes into the tenant-scoped artifact directory (Phase 2 behaviour).
+      //
+      // `handle.repoPath`, not `join(rootPath, 'repo')`: when a bounded volume is leased
+      // the checkout lives on the volume, and the sandbox's only writable mount has to be
+      // the volume — that is what makes `ENOSPC` apply to what the agent writes.
       allowedPaths:
         lease === undefined
           ? [join(config.artifactRoot, safeSegment(input.orgId), safeSegment(task.id))]
-          : [join(lease.handle.rootPath, 'repo')],
+          : [lease.handle.repoPath],
       allowedActions: [],
       riskClass: task.riskClass,
       timeoutMs: wallClockMs,
@@ -409,9 +570,13 @@ export async function executeAgentActivity(
       // workspace in a state that says "evidence may be mid-write", not `executing`.
       await markPreserving(lease, input.orgId);
 
+      // The ceiling (Gate E) applies to the copy, not to the adapter's claim: a
+      // transcript "of 2 GiB" is streamed through `outputCapBytes` and what lands is
+      // `min(fits, cap)` plus a marker carrying the original size.
       const materialized = await materializeArtifacts({
         artifactsDirectory: workspaceArtifactsDirectory(lease.handle),
         artifacts: result.artifacts,
+        outputCapBytes: profile.outputCapBytes,
       });
 
       result = {
@@ -422,9 +587,30 @@ export async function executeAgentActivity(
           workspaceId: lease.id,
           ...(materialized.missing.length === 0 ? {} : { artifactMissing: materialized.missing }),
           ...(materialized.transcriptPath === null ? { transcriptMissing: true } : {}),
+          ...(materialized.truncated.length === 0
+            ? {}
+            : {
+                artifactTruncated: materialized.truncated.map((entry) => ({
+                  kind: entry.kind,
+                  originalBytes: entry.originalBytes,
+                  capturedBytes: entry.capturedBytes,
+                  markerPath: entry.markerPath,
+                })),
+              }),
+          ...(materialized.budgetExhausted ? { artifactBudgetExhausted: true } : {}),
         },
       };
     }
+
+    // ── The output ceiling (Gate E) ──────────────────────────────────────────────
+    //
+    // Applied to what the worker is about to persist, which is the last point where the
+    // size is knowable: summary, normalised events, tool invocations and provider
+    // metadata. The artifacts went through `materializeArtifacts` above, which streams
+    // them through the same profile number.
+    const capped = enforceResultCap(result, profile.outputCapBytes);
+
+    result = capped.result;
 
     // ── Accounting, then the verdict ─────────────────────────────────────────────
     //
@@ -436,11 +622,43 @@ export async function executeAgentActivity(
       usage = await readUsage(cgroup);
     }
 
+    // A budget kill can land between the last sample and the adapter returning; the
+    // counter is the authority either way.
+    if (!cpuBudgetExceeded && usage !== null) {
+      const finalCheck = checkCpuBudget(usage.cpuUsageUs, profile.cpuBudgetUs);
+
+      if (finalCheck === 'exhausted') {
+        cpuBudgetExceeded = true;
+        budgetSample = {
+          usageUs: usage.cpuUsageUs,
+          budgetUs: profile.cpuBudgetUs,
+          elapsedMs: wallClockMs,
+          fraction: usage.cpuUsageUs / profile.cpuBudgetUs,
+        };
+      }
+    }
+
+    // ── Disk (Gate D), measured after the run ────────────────────────────────────
+    //
+    // `statfs` on the volume is the measurement: zero free bytes is the machine-readable
+    // form of "the attempt hit ENOSPC", and it is read whether or not the adapter
+    // mentioned it. A run may also fail with `ENOSPC` and free a little space again by
+    // the time we look, so the adapter's own error is checked too.
+    const diskState = await measureDisk(lease);
+
+    if (diskState !== null) {
+      diskFreeBytes = diskState.freeBytes;
+      diskExhausted = diskState.exhausted || mentionsNoSpace(result);
+    }
+
     const verdict = classifyTermination({
       adapter: result.status,
       usage,
       cpuCeilingUs: cpuCeilingFor(profile),
       placementFailed,
+      cpuBudgetExceeded,
+      ...(budgetSample === null ? {} : { cpuBudget: budgetSample }),
+      diskExhausted,
     });
 
     if (verdict.resourceKill && cgroup !== undefined) {
@@ -448,6 +666,13 @@ export async function executeAgentActivity(
       // nothing survived the breach (a child that ignored the memory event, a sister
       // process still holding a socket). Killing an already-empty cgroup is a no-op.
       await killCgroup(cgroup);
+
+      // The budget kill already happened in the sampler; reading usage again here is
+      // what makes the persisted number the *final* one rather than the last sample.
+      if (verdict.reason === 'cpu_budget') {
+        usage = (await readUsage(cgroup).catch(() => null)) ?? usage;
+      }
+
       logResourceKill(
         runtime.id,
         input.taskId,
@@ -455,7 +680,22 @@ export async function executeAgentActivity(
         usage,
         effectiveLimits,
         cgroup.path,
+        {
+          ...(budgetSample === null
+            ? {}
+            : { cpuBudgetUs: budgetSample.budgetUs, cpuBudgetMs: cpuBudgetMs(profile) }),
+          ...(diskFreeBytes === null ? {} : { diskFreeBytes }),
+          ioMax: ioEffective?.line ?? null,
+          ioRefusal,
+        },
       );
+    }
+
+    // A budget kill is remembered outside the attempt row: the row is per attempt, and
+    // the point is that the *next* attempt does not run. Written before `finalize` so a
+    // crash between the two cannot lose it.
+    if (verdict.reason === 'cpu_budget') {
+      await recordCpuBudgetStop(config.artifactRoot, workflowRun.id, attempt.id);
     }
 
     // The platform's record and the adapter's report must agree. A resource kill the
@@ -471,7 +711,11 @@ export async function executeAgentActivity(
       : result.status;
 
     const finalError = verdict.overridesAdapter
-      ? resourceKillError(verdict.reason, usage, effectiveLimits)
+      ? resourceKillError(verdict.reason, usage, effectiveLimits, {
+          profile,
+          budgetSample,
+          diskFreeBytes,
+        })
       : result.error;
 
     await finalize(finalStatus, result.simulated, finalError, verdict.reason);
@@ -502,12 +746,38 @@ export async function executeAgentActivity(
       usage = await readUsage(cgroup).catch(() => null);
     }
 
+    // A killed tree throws, so the budget flag set by the sampler has to win over the
+    // thrown error. The final counter read is the second opinion.
+    if (!cpuBudgetExceeded && usage !== null) {
+      if (checkCpuBudget(usage.cpuUsageUs, profile.cpuBudgetUs) === 'exhausted') {
+        cpuBudgetExceeded = true;
+        budgetSample = {
+          usageUs: usage.cpuUsageUs,
+          budgetUs: profile.cpuBudgetUs,
+          elapsedMs: wallClockMs,
+          fraction: usage.cpuUsageUs / profile.cpuBudgetUs,
+        };
+      }
+    }
+
+    const diskState = await measureDisk(lease);
+    if (diskState !== null) diskFreeBytes = diskState.freeBytes;
+
     const verdict = classifyTermination({
       adapter: placementFailed ? 'threw' : normalised.retryable ? 'threw' : 'failed',
       usage,
       cpuCeilingUs: cpuCeilingFor(profile),
       placementFailed,
+      cpuBudgetExceeded,
+      ...(budgetSample === null ? {} : { cpuBudget: budgetSample }),
+      diskExhausted:
+        (diskState?.exhausted ?? false) ||
+        mentionsNoSpace({ error: normalised } as Pick<ExecutionResult, 'error'>),
     });
+
+    if (verdict.reason === 'cpu_budget') {
+      await recordCpuBudgetStop(config.artifactRoot, workflowRun.id, attempt.id);
+    }
 
     if (verdict.resourceKill && cgroup !== undefined) {
       await killCgroup(cgroup).catch(() => undefined);
@@ -518,11 +788,35 @@ export async function executeAgentActivity(
         usage,
         effectiveLimits,
         cgroup.path,
+        {
+          ...(budgetSample === null
+            ? {}
+            : { cpuBudgetUs: budgetSample.budgetUs, cpuBudgetMs: cpuBudgetMs(profile) }),
+          ...(diskFreeBytes === null ? {} : { diskFreeBytes }),
+          ioMax: ioEffective?.line ?? null,
+          ioRefusal,
+        },
       );
     }
 
     await finalize('failed', simulatedAdapter, normalised, verdict.reason);
     workspaceOutcome = 'failed';
+
+    // A budget kill is terminal on purpose. `retryable` is the adapter's opinion of its
+    // own failure, and it cannot see the resource decision; rethrowing here would hand
+    // the run straight back to Temporal for another budget.
+    if (verdict.reason === 'cpu_budget') {
+      return bannerResult(runtime.id, {
+        status: 'failed',
+        summary: resourceKillSummary('cpu_budget'),
+        error: resourceKillError(verdict.reason, usage, effectiveLimits, {
+          profile,
+          budgetSample,
+          diskFreeBytes,
+        }),
+        simulated: simulatedAdapter,
+      });
+    }
 
     if (normalised.retryable) {
       // Let Temporal own the retry decision: maximumAttempts 3, exponential backoff.
@@ -540,6 +834,10 @@ export async function executeAgentActivity(
   } finally {
     activityCancellation.removeEventListener('abort', abort);
     stopHeartbeat?.();
+
+    // The sampler is stopped before the cgroup is read and removed: a sample taken
+    // after removal would read a missing file and report `null` over a real number.
+    budgetWatch?.stop();
 
     // The cgroup goes away on every path, including the crash paths above. It is
     // removed *after* the usage read (the files must still exist to be read) and
@@ -597,6 +895,11 @@ function resourceKillError(
   reason: TerminationReason,
   usage: CgroupUsage | null,
   limits: EffectiveLimits | undefined,
+  context: {
+    readonly profile: ResourceProfile;
+    readonly budgetSample: CpuBudgetSample | null;
+    readonly diskFreeBytes: number | null;
+  },
 ): ExecutionResult['error'] {
   const code =
     reason === 'oom'
@@ -605,9 +908,13 @@ function resourceKillError(
         ? 'RESOURCE_LIMIT_PIDS'
         : reason === 'cpu'
           ? 'RESOURCE_LIMIT_CPU'
-          : reason === 'timeout'
-            ? 'RESOURCE_LIMIT_WALL_CLOCK'
-            : 'RESOURCE_LIMIT_UNKNOWN';
+          : reason === 'cpu_budget'
+            ? 'RESOURCE_LIMIT_CPU_BUDGET'
+            : reason === 'disk'
+              ? 'RESOURCE_LIMIT_DISK'
+              : reason === 'timeout'
+                ? 'RESOURCE_LIMIT_WALL_CLOCK'
+                : 'RESOURCE_LIMIT_UNKNOWN';
 
   const detail = [
     usage === null || usage.memoryPeakBytes === null
@@ -618,6 +925,15 @@ function resourceKillError(
     limits === undefined ? 'limits=unavailable' : `memory.max=${limits.memoryMax}`,
     limits === undefined ? null : `pids.max=${limits.pidsMax}`,
     limits === undefined ? null : `cpu.max=${limits.cpuMax}`,
+    // The budget is quoted in both units on purpose: the file is microseconds and the
+    // attempt column is milliseconds, and an operator comparing the two should not have
+    // to do the arithmetic.
+    context.budgetSample === null
+      ? null
+      : `cpu.usage=${String(context.budgetSample.usageUs)}us ` +
+        `cpu.budget=${String(context.budgetSample.budgetUs)}us ` +
+        `(${String(cpuBudgetMs(context.profile))}ms)`,
+    context.diskFreeBytes === null ? null : `disk.free=${String(context.diskFreeBytes)}B`,
   ]
     .filter((part): part is string => part !== null)
     .join(' ');
@@ -637,6 +953,10 @@ function resourceKillSummary(reason: TerminationReason): string {
       return 'Terminated: the attempt reached its pids.max and could not fork.';
     case 'cpu':
       return "Terminated: CPU usage exceeded what the attempt's cpu.max permits.";
+    case 'cpu_budget':
+      return 'Terminated: the attempt spent its cumulative CPU budget and the cgroup was killed.';
+    case 'disk':
+      return 'Terminated: the attempt filled its workspace volume (ENOSPC).';
     case 'timeout':
       return 'Terminated: the attempt exceeded its wall clock.';
     default:
@@ -656,6 +976,13 @@ function logResourceKill(
   usage: CgroupUsage | null,
   limits: EffectiveLimits | undefined,
   cgroupPath: string,
+  extra: {
+    readonly cpuBudgetUs?: number;
+    readonly cpuBudgetMs?: number;
+    readonly diskFreeBytes?: number;
+    readonly ioMax: string | null;
+    readonly ioRefusal: string | null;
+  },
 ): void {
   workerLogger().warn(
     {
@@ -667,6 +994,13 @@ function logResourceKill(
         limits === undefined
           ? null
           : { memoryMax: limits.memoryMax, pidsMax: limits.pidsMax, cpuMax: limits.cpuMax },
+      cpuBudget:
+        extra.cpuBudgetUs === undefined
+          ? null
+          : { budgetUs: extra.cpuBudgetUs, budgetMs: extra.cpuBudgetMs ?? null },
+      diskFreeBytes: extra.diskFreeBytes ?? null,
+      ioMax: extra.ioMax,
+      ioRefusal: extra.ioRefusal,
       usage,
     },
     'attempt terminated by the resource supervisor',
@@ -724,6 +1058,221 @@ function safeSegment(value: string): string {
   }
 
   return value;
+}
+
+// ── Gate E: the result ceiling ──────────────────────────────────────────────────
+
+interface ResultCapOutcome {
+  readonly result: ExecutionResult;
+  readonly truncations: readonly TruncationMarker[];
+}
+
+/**
+ * Enforce `outputCapBytes` on the parts of a result the worker persists.
+ *
+ * The artifact bytes are handled by `materializeArtifacts` (streamed through the same
+ * number). This function covers the **in-memory** remainder, which is where unbounded
+ * data hides: a `summary` that is one line of a 400 MB build log, an event whose `data`
+ * carries a whole tool response, and `providerMeta`, which is `Json` in the database and
+ * therefore has no length of its own.
+ *
+ * Each field gets its own small ceiling (8–16 KiB) *and* the whole payload is measured
+ * against the profile's cap: a million 1 KiB events are as unbounded as one 1 GB event.
+ * Anything dropped leaves a marker with the original size, so "the transcript is short"
+ * and "we kept the first 5 MiB of it" stay distinguishable.
+ */
+function enforceResultCap(result: ExecutionResult, capBytes: number): ResultCapOutcome {
+  const truncations: TruncationMarker[] = [];
+
+  const summary = enforceTextCap(result.summary, Math.max(1_024, capBytes), 'result.summary');
+  if (summary.marker !== null) truncations.push(summary.marker);
+
+  let eventBytes = 0;
+  const events: ExecutionEvent[] = [];
+
+  for (const event of result.events) {
+    const message = enforceTextCap(event.message, EVENT_MESSAGE_CAP, `event:${event.type}`);
+    if (message.marker !== null) truncations.push(message.marker);
+
+    let data = event.data;
+
+    if (data !== undefined) {
+      const serialised = JSON.stringify(data);
+
+      if (serialised.length > EVENT_DATA_CAP) {
+        const capped = enforceTextCap(serialised, EVENT_DATA_CAP, `event:${event.type}:data`);
+
+        if (capped.marker !== null) truncations.push(capped.marker);
+
+        // The truncated body is a string, not the original shape: inventing a JSON
+        // object out of a sliced serialisation would produce something that parses and
+        // is wrong, which is worse than something that obviously is a marker.
+        data = { truncated: capped.text };
+      }
+    }
+
+    const size = message.capturedBytes + (data === undefined ? 0 : 1);
+
+    // The whole event list is bounded by half the profile's cap: an event stream is
+    // diagnostic, and the transcript artifact is the evidence that matters.
+    if (eventBytes + size > capBytes / 2) {
+      truncations.push({
+        scope: 'result.events',
+        capBytes,
+        capturedBytes: eventBytes,
+        originalBytes: result.events.length,
+        droppedBytes: result.events.length - events.length,
+        sha256: '',
+      });
+      break;
+    }
+
+    eventBytes += size;
+    events.push({ ...event, message: message.text, ...(data === undefined ? {} : { data }) });
+  }
+
+  const toolInvocations: ToolInvocationRecord[] | undefined =
+    result.toolInvocations === undefined
+      ? undefined
+      : result.toolInvocations.slice(0, MAX_TOOL_INVOCATIONS);
+
+  if (
+    result.toolInvocations !== undefined &&
+    result.toolInvocations.length > MAX_TOOL_INVOCATIONS
+  ) {
+    truncations.push({
+      scope: 'result.toolInvocations',
+      capBytes: MAX_TOOL_INVOCATIONS,
+      capturedBytes: MAX_TOOL_INVOCATIONS,
+      originalBytes: result.toolInvocations.length,
+      droppedBytes: result.toolInvocations.length - MAX_TOOL_INVOCATIONS,
+      sha256: '',
+    });
+  }
+
+  let providerMeta = result.providerMeta;
+
+  if (providerMeta !== undefined) {
+    const serialised = JSON.stringify(providerMeta);
+    const metaCap = Math.max(1_024, Math.floor(capBytes / PROVIDER_META_CAP_FRACTION));
+
+    if (serialised.length > metaCap) {
+      const capped = enforceTextCap(serialised, metaCap, 'result.providerMeta');
+
+      if (capped.marker !== null) truncations.push(capped.marker);
+
+      providerMeta = { truncated: capped.text };
+    }
+  }
+
+  const truncationMeta =
+    truncations.length === 0
+      ? {}
+      : {
+          outputTruncation: {
+            capBytes,
+            markers: truncations,
+          },
+        };
+
+  return {
+    result: {
+      ...result,
+      summary: summary.text,
+      events,
+      ...(toolInvocations === undefined ? {} : { toolInvocations }),
+      ...(providerMeta === undefined
+        ? {}
+        : { providerMeta: { ...providerMeta, ...truncationMeta } }),
+    },
+    truncations,
+  };
+}
+
+// ── Gate D: disk measurement ────────────────────────────────────────────────────
+
+/**
+ * Read the volume's remaining space after the run.
+ *
+ * `null` means "no bounded volume", which is a different fact from "plenty of space" —
+ * the attempt log prints them differently, and only one of them is evidence of a quota.
+ * `exhausted` is `freeBytes === 0` measured with `statfs`, or any free-space figure below
+ * one block, which is what `ENOSPC` looks like from the outside.
+ *
+ * Exported, with a structural parameter, so the disk verdict can be measured in a test
+ * without inventing a `WorkspaceManager` and a database row: the inputs it actually
+ * reads are the mount path and nothing else.
+ */
+export async function measureDisk(
+  lease: { readonly handle: Pick<WorkspaceHandle, 'volume'> } | undefined,
+): Promise<{ readonly freeBytes: number; readonly exhausted: boolean } | null> {
+  const mountPath = lease?.handle.volume?.mountPath;
+  if (mountPath === undefined) return null;
+
+  try {
+    const usage = await readVolumeUsage(mountPath);
+
+    return { freeBytes: usage.freeBytes, exhausted: usage.freeBytes < 4096 };
+  } catch {
+    return null;
+  }
+}
+
+/** `ENOSPC` as the adapter reported it, for the case where space was freed again. */
+export function mentionsNoSpace(result: Pick<ExecutionResult, 'error'>): boolean {
+  if (result.error === undefined) return false;
+
+  const haystack = `${result.error.code} ${result.error.message}`.toLowerCase();
+
+  return (
+    haystack.includes('enospc') ||
+    haystack.includes('no space left') ||
+    haystack.includes('disk quota exceeded')
+  );
+}
+
+// ── Gate C: the durable budget marker ───────────────────────────────────────────
+
+function cpuBudgetMarkerDirectory(artifactRoot: string): string {
+  return join(artifactRoot, '.cpu-budget');
+}
+
+/**
+ * How many budget kills this workflow run has already had.
+ *
+ * A directory of files, one per stop, named `<workflowRunId>-<attemptId>`. Counting is
+ * `readdir` + prefix match, which is O(attempts) and cannot be forged by an agent: the
+ * directory is under the artifact root, outside every workspace and outside the sandbox's
+ * writable mount.
+ */
+async function countCpuBudgetStops(artifactRoot: string, workflowRunId: string): Promise<number> {
+  try {
+    const entries = await readdir(cpuBudgetMarkerDirectory(artifactRoot));
+
+    return entries.filter((entry) => entry.startsWith(`${safeFileSegment(workflowRunId)}-`)).length;
+  } catch {
+    return 0;
+  }
+}
+
+async function recordCpuBudgetStop(
+  artifactRoot: string,
+  workflowRunId: string,
+  attemptId: string,
+): Promise<void> {
+  const directory = cpuBudgetMarkerDirectory(artifactRoot);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+
+  await writeFile(
+    join(directory, `${safeFileSegment(workflowRunId)}-${safeFileSegment(attemptId)}`),
+    JSON.stringify({ workflowRunId, attemptId, at: new Date().toISOString() }),
+    { mode: 0o600 },
+  );
+}
+
+/** A database id used as a file name. Ids are uuids, but a path is built from a variable. */
+function safeFileSegment(value: string): string {
+  return value.replace(/[^A-Za-z0-9_-]+/g, '_').slice(0, 96);
 }
 
 /**

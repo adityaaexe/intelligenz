@@ -37,20 +37,66 @@ export interface ResourceProfile {
   readonly pidsMax: number;
   readonly cpuQuotaMicros: number;
   readonly cpuPeriodMicros: number;
+  /**
+   * **Total** CPU this attempt may burn, in microseconds — a budget, not a rate.
+   *
+   * `cpu.max` alone says how fast, never how much: a run at 1 CPU for its whole 300 s
+   * wall clock legitimately consumes 300 CPU-seconds, which is an enormous amount of
+   * work for a task that should have taken ten. The budget is sampled from
+   * `cpu.stat usage_usec` while the attempt is running, and when it is exhausted the
+   * cgroup is killed and the reason is recorded as `cpu_budget` — distinct from
+   * `timeout` (wall clock) and from `cpu` (the rate ceiling was not in force).
+   *
+   * Each value is deliberately below `quota/period × wallClock`: a budget that cannot be
+   * reached before the deadline is a comment, not a limit. It also has to leave room for
+   * the process to be killed and read back, so it is not set to the theoretical maximum.
+   */
+  readonly cpuBudgetUs: number;
   /** Enforced by the adapter's own timeout, capped by the activity's deadline. */
   readonly wallClockMs: number;
-  /** Sum of bytes the attempt may leave behind as evidence. */
+  /** Sum of bytes the attempt may leave behind as evidence. Enforced in `output-cap`. */
   readonly outputCapBytes: number;
+  /**
+   * The disk ceiling the workspace checkout is bounded to, in bytes.
+   *
+   * This is a **requirement on the volume**, not a number the platform can apply to a
+   * directory: the quota is a property of a fixed-size block device (Gate D). A volume
+   * smaller than this is refused at lease time; the effective value is the volume's,
+   * read back with `statfs`, never this constant.
+   */
+  readonly diskQuotaBytes: number;
+  /**
+   * `io.max` on the volume's backing device, bytes per second. `0` disables it.
+   *
+   * A policy number, not a measurement: a bounded volume is shared by every attempt
+   * leasing it over time, and a single attempt that saturates the device makes every
+   * other attempt's `git clone` slow for reasons none of them can see. The values are
+   * below what this host's loop device sustains (~500 MiB/s measured), so the limit is
+   * reachable — a limit above the hardware is a comment.
+   */
+  readonly ioReadBps: number;
+  readonly ioWriteBps: number;
   /** Per-attempt spend ceiling, applied as `min(profile, configured)`. */
   readonly usdCapUsd: number;
 }
 
 const MIB = 1024 * 1024;
 
+/** Every profile's checkout lives on one bounded volume of this size. */
+const VOLUME_BYTES = 1024 * MIB;
+
 /**
- * The table from the Phase 4 directive, verbatim. `STANDARD` is the profile a real
- * adapter gets by default; `SMALL` is for cheap, simulated or fixture work; `HEAVY` is
- * opt-in through policy only.
+ * The table from the Phase 4 directive, plus the two Phase 5 numbers.
+ *
+ * | Profile | cpu.max | wall clock | **cpu budget** | ratio |
+ * |---|---|---|---|---|
+ * | SMALL | 0.5 CPU | 120 s | 30 s | 50% of the theoretical maximum |
+ * | STANDARD | 1 CPU | 300 s | 60 s | 20% |
+ * | HEAVY | 2 CPU | 600 s | 120 s | 10% |
+ *
+ * The ratio shrinks as the profile grows on purpose: a larger profile buys *headroom*,
+ * not *permission to spin*. `HEAVY` at 2 CPU for ten minutes could otherwise consume
+ * twenty CPU-minutes; a twelve-CPU-minute budget is already generous for a coding task.
  */
 export const RESOURCE_PROFILES: Readonly<Record<ResourceProfileName, ResourceProfile>> = {
   SMALL: {
@@ -59,8 +105,12 @@ export const RESOURCE_PROFILES: Readonly<Record<ResourceProfileName, ResourcePro
     pidsMax: 64,
     cpuQuotaMicros: 50_000,
     cpuPeriodMicros: 100_000,
+    cpuBudgetUs: 30_000_000,
     wallClockMs: 120_000,
     outputCapBytes: 5 * MIB,
+    diskQuotaBytes: VOLUME_BYTES,
+    ioReadBps: 50 * MIB,
+    ioWriteBps: 50 * MIB,
     usdCapUsd: 0.1,
   },
   STANDARD: {
@@ -69,8 +119,12 @@ export const RESOURCE_PROFILES: Readonly<Record<ResourceProfileName, ResourcePro
     pidsMax: 128,
     cpuQuotaMicros: 100_000,
     cpuPeriodMicros: 100_000,
+    cpuBudgetUs: 60_000_000,
     wallClockMs: 300_000,
     outputCapBytes: 5 * MIB,
+    diskQuotaBytes: VOLUME_BYTES,
+    ioReadBps: 100 * MIB,
+    ioWriteBps: 100 * MIB,
     usdCapUsd: 0.5,
   },
   HEAVY: {
@@ -79,8 +133,12 @@ export const RESOURCE_PROFILES: Readonly<Record<ResourceProfileName, ResourcePro
     pidsMax: 256,
     cpuQuotaMicros: 200_000,
     cpuPeriodMicros: 100_000,
+    cpuBudgetUs: 120_000_000,
     wallClockMs: 600_000,
     outputCapBytes: 10 * MIB,
+    diskQuotaBytes: VOLUME_BYTES,
+    ioReadBps: 200 * MIB,
+    ioWriteBps: 200 * MIB,
     usdCapUsd: 2.0,
   },
 };
@@ -192,17 +250,58 @@ export function cpuCeilingFor(profile: ResourceProfile): number {
 }
 
 /**
+ * The CPU budget in milliseconds, for logs and for the error an operator reads.
+ * `cpu.stat usage_usec` is microseconds; both units appear in the attempt record.
+ */
+export function cpuBudgetMs(profile: ResourceProfile): number {
+  return Math.round(profile.cpuBudgetUs / 1000);
+}
+
+/**
+ * What a sampled `usage_usec` means against the budget. Kept pure and separate from the
+ * sampler so the arithmetic is testable without a cgroup.
+ */
+export type CpuBudgetVerdict = 'within' | 'exhausted';
+
+export function checkCpuBudget(usageUs: number, budgetUs: number): CpuBudgetVerdict {
+  if (budgetUs <= 0) return 'within';
+
+  return usageUs > budgetUs ? 'exhausted' : 'within';
+}
+
+/**
  * `HEAVY` requires aggregate enforcement. Under rlimits alone the ceiling it promises
  * (2 GiB, 256 pids) is a per-process promise applied to an unbounded number of
  * processes, so the one profile whose promise is *most* dependent on cgroups is the one
  * refused when they are absent. `SMALL` and `STANDARD` still run — with their profiles
  * recorded as `rlimit-only`, which is what they actually are.
+ *
+ * ## Why disk joins the same refusal, and why it is opt-in
+ *
+ * `HEAVY` is the profile an operator reaches for when a task is expected to be large.
+ * Without bounded volumes its checkout is unbounded, so a `HEAVY` label would promise
+ * 2 GiB of memory and say nothing about a checkout that can fill the host. The rule is
+ * the same one as for cgroups: a profile is refused when a control it names cannot be
+ * enforced, rather than silently downgraded.
+ *
+ * `SMALL` and `STANDARD` keep running with disk declared-but-unenforced, and the
+ * attempt log says so. That is a deliberate asymmetry: refusing every run on a host
+ * without volumes would make the platform unusable for the ordinary case, while calling
+ * an unbounded checkout `HEAVY` would be the lie this phase exists to stop.
+ *
+ * `disk` is an options object rather than a positional string so that omitting it means
+ * "this caller has no opinion about disk" — the pre-Phase-5 behaviour — instead of
+ * quietly defaulting to a mode that is either a silent allow or a spurious refusal. The
+ * worker's activity passes it on every call.
  */
 export function assertProfileAvailable(
   profile: ResourceProfile,
   cgroupMode: 'enforced' | 'unavailable',
+  disk?: { readonly mode: 'bounded' | 'unavailable' },
 ): void {
-  if (profile.name === 'HEAVY' && cgroupMode === 'unavailable') {
+  if (profile.name !== 'HEAVY') return;
+
+  if (cgroupMode === 'unavailable') {
     throw new ResourceProfileError(
       'RESOURCE_PROFILE_UNAVAILABLE',
       'The HEAVY resource profile requires cgroup v2 enforcement (memory.max, pids.max, ' +
@@ -210,6 +309,17 @@ export function assertProfileAvailable(
         'HEAVY run would be an unbounded run with a HEAVY label. Refused. ' +
         'Run infra/scripts/setup-cgroups.sh and start the worker via ' +
         'infra/scripts/worker-with-cgroup.sh.',
+    );
+  }
+
+  if (disk?.mode === 'unavailable') {
+    throw new ResourceProfileError(
+      'RESOURCE_PROFILE_UNAVAILABLE',
+      'The HEAVY resource profile requires a bounded workspace volume: without one the ' +
+        'checkout is an unbounded directory on the host filesystem, so a HEAVY run would ' +
+        'promise 2 GiB of memory and no disk ceiling at all. Refused. Run ' +
+        'sudo bash infra/scripts/setup-workspace-volumes.sh once, then start the worker ' +
+        'with WORKSPACE_VOLUMES_ROOT=/var/lib/intelligenz/mnt.',
     );
   }
 }

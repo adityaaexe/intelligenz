@@ -27,6 +27,10 @@ const config: AppConfig = {
   readinessTimeoutMs: 2_000,
   artifactRoot: '/tmp/intelligenz-test-artifacts',
   workspaceRoot: '/tmp/intelligenz-test-workspaces',
+  // Defaults from `app-config.ts`. The readiness probe reads neither field — it is
+  // unreachable without them only because the config is a closed contract.
+  approvalTtlHours: 24,
+  trustedSourceRepos: [],
 };
 
 function responseStub(): ApiResponse & { statusCalls: number[] } {

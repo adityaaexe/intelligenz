@@ -59,7 +59,8 @@ export class CgroupError extends Error {
     | 'CGROUP_CREATE_FAILED'
     | 'CGROUP_LIMIT_FAILED'
     | 'CGROUP_PLACEMENT_FAILED'
-    | 'CGROUP_READ_FAILED';
+    | 'CGROUP_READ_FAILED'
+    | 'CGROUP_IO_UNSUPPORTED';
 
   constructor(code: CgroupError['code'], message: string, options?: { cause?: unknown }) {
     super(message, options);
@@ -380,6 +381,310 @@ export async function killCgroup(handle: CgroupHandle): Promise<void> {
       `Cannot kill ${handle.path}: ${code ?? String(error)}`,
       { cause: error },
     );
+  }
+}
+
+// ── CPU lifetime budget ─────────────────────────────────────────────────────────
+
+/**
+ * `cpu.stat usage_usec` — cumulative CPU consumed by the whole cgroup, in microseconds,
+ * summed across every process and every CPU.
+ *
+ * This is the number a *budget* needs and that `cpu.max` cannot provide. `cpu.max` is a
+ * bandwidth ceiling (`quota period`), so it answers "how fast" and never "how much": a
+ * run throttled to one CPU for its full wall clock legitimately consumes the entire wall
+ * clock in CPU-seconds, and from inside the quota there is no way to tell a busy run from
+ * a pathological one.
+ *
+ * `null` means the file could not be read, which is reported as unknown rather than as
+ * zero — a fabricated zero would look like a run that used no CPU.
+ */
+export async function readCpuUsageUs(handle: CgroupHandle): Promise<number | null> {
+  try {
+    const text = await readFile(join(handle.path, 'cpu.stat'), 'utf8');
+    const value = parseCgroupCounters(text).get('usage_usec');
+
+    return value ?? null;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+
+    throw new CgroupError(
+      'CGROUP_READ_FAILED',
+      `Cannot read cpu.stat from ${handle.path}: ${(error as NodeJS.ErrnoException).code ?? String(error)}`,
+      { cause: error },
+    );
+  }
+}
+
+export interface CpuBudgetSample {
+  readonly usageUs: number;
+  readonly budgetUs: number;
+  readonly elapsedMs: number;
+  /** 0..1+, so an operator can see *how far past* the budget the run got. */
+  readonly fraction: number;
+}
+
+export interface CpuBudgetWatch {
+  /** CPU-seconds consumed when the watch stopped. Always a measurement, never a guess. */
+  readonly lastSample: () => CpuBudgetSample | null;
+  /** Resolves when the budget is exceeded. Never resolves if it is not. */
+  readonly exceeded: Promise<CpuBudgetSample>;
+  /** Stop sampling. Safe to call twice, and safe to call after `exceeded` resolved. */
+  stop(): void;
+}
+
+/**
+ * Sample `usage_usec` and stop the attempt when the budget is gone.
+ *
+ * Three properties matter more than the interval:
+ *
+ * 1. **It observes, it does not predict.** The decision is a read of the kernel's own
+ *    counter, not an estimate from wall clock × quota. An attempt that spent its budget
+ *    in ten seconds is killed at ten seconds.
+ * 2. **It is cumulative, not instantaneous.** A short burst of CPU is not a breach; only
+ *    the total is. That is what makes this distinct from the `cpu` rate check in
+ *    `termination.ts`, which asks whether `cpu.max` was in force at all.
+ * 3. **A failed read is not a breach.** An unreadable `cpu.stat` stops the sampler and
+ *    reports nothing: killing a run because a file could not be read would be a resource
+ *    kill with no measurement behind it.
+ *
+ * The interval is deliberately short relative to the budget (100 ms against 30 s) so the
+ * overshoot is bounded by scheduling jitter, and deliberately not zero so the sampler
+ * costs one file read per tick rather than a busy loop of its own.
+ */
+export function startCpuBudgetWatch(input: {
+  readonly handle: CgroupHandle;
+  readonly budgetUs: number;
+  readonly intervalMs?: number;
+  /** Called once, synchronously, when the budget is found exhausted. */
+  readonly onExceeded?: (sample: CpuBudgetSample) => void;
+}): CpuBudgetWatch {
+  const intervalMs = Math.max(10, input.intervalMs ?? 100);
+  const startedAt = Date.now();
+
+  let timer: NodeJS.Timeout | undefined;
+  let stopped = false;
+  let last: CpuBudgetSample | null = null;
+  let resolveExceeded: ((sample: CpuBudgetSample) => void) | undefined;
+
+  const exceeded = new Promise<CpuBudgetSample>((resolvePromise) => {
+    resolveExceeded = resolvePromise;
+  });
+
+  const stop = (): void => {
+    stopped = true;
+    if (timer !== undefined) clearInterval(timer);
+    timer = undefined;
+  };
+
+  const tick = (): void => {
+    if (stopped) return;
+
+    void readCpuUsageUs(input.handle)
+      .then((usageUs) => {
+        // `stopped` can flip between the read and this callback; a sample taken after
+        // the stop would be charged to a run that has already ended.
+        if (stopped || usageUs === null) return;
+
+        const sample: CpuBudgetSample = {
+          usageUs,
+          budgetUs: input.budgetUs,
+          elapsedMs: Date.now() - startedAt,
+          fraction: input.budgetUs <= 0 ? 0 : usageUs / input.budgetUs,
+        };
+
+        last = sample;
+
+        if (input.budgetUs > 0 && usageUs > input.budgetUs) {
+          stop();
+          input.onExceeded?.(sample);
+          resolveExceeded?.(sample);
+        }
+      })
+      .catch(() => {
+        // A read that fails is not evidence of a breach. Stop rather than guess.
+        stop();
+      });
+  };
+
+  timer = setInterval(tick, intervalMs);
+  // Never hold the process open for a sampler: the attempt owns the lifetime, not this.
+  timer.unref();
+  tick();
+
+  return {
+    lastSample: () => last,
+    exceeded,
+    stop,
+  };
+}
+
+// ── I/O limits (`io.max`) ───────────────────────────────────────────────────────
+
+export interface IoMaxLimits {
+  /** `<major>:<minor>` of the backing device, from the mount table. */
+  readonly device: string;
+  readonly rbps?: number;
+  readonly wbps?: number;
+  readonly riops?: number;
+  readonly wiops?: number;
+}
+
+export interface IoMaxEffective {
+  /** The line the kernel kept, exactly as `io.max` reads it back. */
+  readonly line: string;
+  readonly device: string;
+  readonly rbps: string;
+  readonly wbps: string;
+  readonly riops: string;
+  readonly wiops: string;
+}
+
+/**
+ * Apply `io.max` to the device that backs a workspace volume.
+ *
+ * ## Why this is attempted rather than promised
+ *
+ * The `io` controller is delegated separately from `cpu`/`memory`/`pids`, and `io.max`
+ * support depends on the block device: a device with no request queue, or a kernel built
+ * without `blk-throttle`, accepts the write and enforces nothing — or refuses it
+ * outright. So the value is written and **read back**, and a refusal is reported as
+ * `CGROUP_IO_UNSUPPORTED` with the errno rather than swallowed. A platform that claims
+ * an I/O limit it did not measure is worse than one that reports none.
+ */
+export async function applyIoMax(
+  handle: CgroupHandle,
+  limits: IoMaxLimits,
+): Promise<IoMaxEffective> {
+  if (!/^\d+:\d+$/.test(limits.device)) {
+    throw new CgroupError(
+      'CGROUP_LIMIT_FAILED',
+      `io.max needs a <major>:<minor> device, received ${JSON.stringify(limits.device)}`,
+    );
+  }
+
+  const parts = [
+    limits.rbps === undefined ? null : `rbps=${String(limits.rbps)}`,
+    limits.wbps === undefined ? null : `wbps=${String(limits.wbps)}`,
+    limits.riops === undefined ? null : `riops=${String(limits.riops)}`,
+    limits.wiops === undefined ? null : `wiops=${String(limits.wiops)}`,
+  ].filter((part): part is string => part !== null);
+
+  if (parts.length === 0) {
+    throw new CgroupError('CGROUP_LIMIT_FAILED', 'io.max was called with no limits');
+  }
+
+  const value = `${limits.device} ${parts.join(' ')}`;
+
+  try {
+    await writeFile(join(handle.path, 'io.max'), value, 'utf8');
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    const detail = `${code ?? String(error)}: ${(error as Error).message ?? ''}`.trim();
+
+    throw new CgroupError(
+      'CGROUP_LIMIT_FAILED',
+      code === 'ENOENT'
+        ? `io.max does not exist in ${handle.path}: the io controller is not delegated to ` +
+          'the children of the delegation root. Run infra/scripts/setup-cgroups.sh.'
+        : `Cannot write io.max="${value}" to ${handle.path}: ${detail}. The backing device ` +
+          'does not support throttling (no request queue, or blk-throttle is absent).',
+      { cause: error },
+    );
+  }
+
+  const readBack = await readIoMax(handle);
+  const line = readBack.find((entry) => entry.device === limits.device);
+
+  if (line === undefined) {
+    throw new CgroupError(
+      'CGROUP_LIMIT_FAILED',
+      `io.max accepted "${value}" but reads back ${JSON.stringify(readBack)}: the device ` +
+        'is not tracked, so nothing is throttled.',
+    );
+  }
+
+  return line;
+}
+
+/** Every configured line in `io.max`, parsed. An empty array means "no limits". */
+export async function readIoMax(handle: CgroupHandle): Promise<readonly IoMaxEffective[]> {
+  const text = await readFile(join(handle.path, 'io.max'), 'utf8').catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return '';
+    throw error;
+  });
+
+  const lines: IoMaxEffective[] = [];
+
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+
+    const [device, ...pairs] = trimmed.split(/\s+/);
+    if (device === undefined || !/^\d+:\d+$/.test(device)) continue;
+
+    const fields = new Map<string, string>();
+
+    for (const pair of pairs) {
+      const [key, value] = pair.split('=');
+      if (key !== undefined && value !== undefined) fields.set(key, value);
+    }
+
+    lines.push({
+      line: trimmed,
+      device,
+      rbps: fields.get('rbps') ?? 'max',
+      wbps: fields.get('wbps') ?? 'max',
+      riops: fields.get('riops') ?? 'max',
+      wiops: fields.get('wiops') ?? 'max',
+    });
+  }
+
+  return lines;
+}
+
+/** `io.stat` for the cgroup, verbatim key→bytes pairs per device. Empty means no I/O. */
+export async function readIoStat(
+  handle: CgroupHandle,
+): Promise<Readonly<Record<string, Readonly<Record<string, number>>>>> {
+  const text = await readFile(join(handle.path, 'io.stat'), 'utf8').catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return '';
+    throw error;
+  });
+
+  const stats: Record<string, Record<string, number>> = {};
+
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+
+    const [device, ...pairs] = trimmed.split(/\s+/);
+    if (device === undefined) continue;
+
+    const fields: Record<string, number> = {};
+
+    for (const pair of pairs) {
+      const [key, value] = pair.split('=');
+      if (key === undefined || value === undefined) continue;
+
+      const parsed = Number.parseInt(value, 10);
+      if (Number.isFinite(parsed)) fields[key] = parsed;
+    }
+
+    stats[device] = fields;
+  }
+
+  return stats;
+}
+
+/** True when `io.max` exists in an attempt cgroup — i.e. `io` reached the children. */
+export async function ioControllerDelegated(handle: CgroupHandle): Promise<boolean> {
+  try {
+    await readFile(join(handle.path, 'io.max'), 'utf8');
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
   }
 }
 

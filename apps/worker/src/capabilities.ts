@@ -2,7 +2,24 @@ import { spawn } from 'node:child_process';
 import { readFile, rmdir, statfs, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { CgroupError, applyLimits, createCgroup, placeProcess, readUsage } from './cgroup';
+import {
+  describeVolumes,
+  discoverVolumes,
+  type VolumeDescriptor,
+  type VolumeDiscovery,
+  type VolumeUnavailableCode,
+} from '@intelligenz/workspace-manager';
+
+import {
+  CgroupError,
+  applyIoMax,
+  applyLimits,
+  createCgroup,
+  ioControllerDelegated,
+  placeProcess,
+  readIoMax,
+  readUsage,
+} from './cgroup';
 
 /**
  * Boot-time capability detection: is cgroup isolation **real** on this host, right now?
@@ -399,6 +416,161 @@ export async function writeKill(path: string): Promise<void> {
     if (errnoOf(error) === 'ENOENT') return;
     throw error;
   });
+}
+
+// ── Disk (Gate D) ───────────────────────────────────────────────────────────────
+
+/**
+ * Is there a real disk quota on this host, right now?
+ *
+ * Two different questions live here and the answer must not merge them:
+ *
+ * 1. **Can a bounded volume be mounted?** — measured by `discoverVolumes`: a registry
+ *    entry that is a mount point, writable, and reports a size with `statfs`.
+ * 2. **Does the platform claim a quota anyway?** — no. When (1) is false the mode is
+ *    `unavailable` and the reason is printed at boot; `assertProfileAvailable` then
+ *    refuses `HEAVY`, and the attempt log says `disk=declared-but-unenforced`.
+ *
+ * The distinction matters because "the directory is empty" and "the directory is
+ * bounded" are the same directory. Only the mount table and `statfs` tell them apart.
+ */
+export interface DiskBounded {
+  readonly mode: 'bounded';
+  readonly volumes: readonly VolumeDescriptor[];
+  readonly aggregateBytes: number;
+  readonly discovery: VolumeDiscovery;
+}
+
+export interface DiskUnavailable {
+  readonly mode: 'unavailable';
+  readonly code: VolumeUnavailableCode | 'VOLUME_PROBE_FAILED';
+  readonly reason: string;
+  readonly remediation: string;
+  readonly discovery: VolumeDiscovery;
+}
+
+export type DiskCapability = DiskBounded | DiskUnavailable;
+
+export async function detectDiskCapability(options: {
+  readonly root?: string;
+  readonly registry?: string;
+  readonly minBytes?: number;
+} = {}): Promise<DiskCapability> {
+  let discovery: VolumeDiscovery;
+
+  try {
+    discovery = await discoverVolumes({
+      ...(options.root === undefined ? {} : { root: options.root }),
+      ...(options.registry === undefined ? {} : { registry: options.registry }),
+      ...(options.minBytes === undefined ? {} : { minBytes: options.minBytes }),
+    });
+  } catch (error) {
+    return {
+      mode: 'unavailable',
+      code: 'VOLUME_PROBE_FAILED',
+      reason: `The volume probe threw: ${error instanceof Error ? error.message : String(error)}`,
+      remediation: 'Run: sudo bash infra/scripts/setup-workspace-volumes.sh',
+      discovery: {
+        mode: 'unavailable',
+        root: options.root ?? '/var/lib/intelligenz/mnt',
+        registry: options.registry ?? '/var/lib/intelligenz/volumes/registry.tsv',
+        code: 'VOLUME_NONE_MOUNTED',
+        reason: 'probe failed',
+        remediation: 'Run: sudo bash infra/scripts/setup-workspace-volumes.sh',
+      },
+    };
+  }
+
+  if (discovery.mode === 'unavailable') {
+    return {
+      mode: 'unavailable',
+      code: discovery.code,
+      reason: discovery.reason,
+      remediation: discovery.remediation,
+      discovery,
+    };
+  }
+
+  return {
+    mode: 'bounded',
+    volumes: discovery.volumes,
+    aggregateBytes: discovery.volumes.reduce((sum, volume) => sum + volume.bytes, 0),
+    discovery,
+  };
+}
+
+export function describeDiskCapability(capability: DiskCapability): string {
+  return capability.mode === 'bounded'
+    ? describeVolumes(capability.discovery)
+    : `disk quota: UNAVAILABLE [${capability.code}] ${capability.reason} ` +
+        'Attempts run with disk declared-but-unenforced, and the HEAVY profile is refused. ' +
+        capability.remediation;
+}
+
+// ── I/O (`io.max`) ──────────────────────────────────────────────────────────────
+
+export type IoMode = 'enforced' | 'unsupported';
+
+export interface IoEnforced {
+  readonly mode: 'enforced';
+  /** The `io.max` line the kernel kept, e.g. `7:6 rbps=10485760 wbps=10485760`. */
+  readonly line: string;
+}
+
+export interface IoUnsupported {
+  readonly mode: 'unsupported';
+  /** The exact errno and message — never "not supported" without evidence. */
+  readonly reason: string;
+}
+
+export type IoCapability = IoEnforced | IoUnsupported;
+
+/**
+ * Probe `io.max` on a real device by writing and reading it back.
+ *
+ * A capability that is claimed must be measured. `io` is delegated separately from
+ * `cpu`/`memory`/`pids`, and `io.max` depends on the block device: a device with no
+ * request queue accepts the write and throttles nothing. So the probe writes a
+ * deliberately tiny limit to the given device, reads the file back, and reports either
+ * the exact line the kernel kept or the exact error it returned.
+ */
+export async function probeIoCapability(
+  root: string,
+  device: string,
+): Promise<IoCapability> {
+  const id = `io-probe-${String(process.pid)}`;
+  let handle;
+
+  try {
+    handle = await createCgroup(root, id);
+  } catch (error) {
+    return { mode: 'unsupported', reason: `cannot create a probe cgroup: ${String(error)}` };
+  }
+
+  try {
+    if (!(await ioControllerDelegated(handle))) {
+      return {
+        mode: 'unsupported',
+        reason:
+          `io.max is absent from ${handle.path}: the io controller is not delegated to the ` +
+          'children of the delegation root (cgroup.subtree_control lacks +io).',
+      };
+    }
+
+    const effective = await applyIoMax(handle, { device, rbps: 1024 * 1024, wbps: 1024 * 1024 });
+    const readBack = await readIoMax(handle);
+
+    return { mode: 'enforced', line: readBack[0]?.line ?? effective.line };
+  } catch (error) {
+    return {
+      mode: 'unsupported',
+      reason: errnoOf(error) === 'CGROUP_LIMIT_FAILED'
+        ? (error instanceof Error ? error.message : String(error))
+        : `${errnoOf(error)}: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  } finally {
+    await rmdir(handle.path).catch(() => undefined);
+  }
 }
 
 let cached: Promise<CgroupCapability> | undefined;

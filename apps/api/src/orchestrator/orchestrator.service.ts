@@ -56,11 +56,18 @@ export const WORKFLOW_RUN_TIMEOUT = '10m';
  */
 export const WORKFLOW_ID_REUSE_POLICY = WorkflowIdReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY;
 
-/** Contract §16 signature. The API and the worker must agree on this object. */
+/** Contract §16 signature, extended in Phase 5. The API and the worker must agree. */
 export interface RunTaskWorkflowInput {
   readonly taskId: string;
   readonly orgId: string;
   readonly correlationId: string;
+  /**
+   * The `ExecutionAttempt` the API reserved for this start, in the same transaction that
+   * consumed the approval. Required, not optional: the workflow's first activity refuses
+   * a run that cannot name the attempt its grant is bound to, so an API start without one
+   * would be a start that is guaranteed to be refused.
+   */
+  readonly attemptId: string;
 }
 
 export interface StartedWorkflow {
