@@ -1,0 +1,18 @@
+{
+  "benchmarkId": "minimal-diff",
+  "benchmarkVersion": "1.0.0",
+  "outcome": "solved",
+  "note": "scripted fix: one string literal becomes a number literal, one file",
+  "writes": [
+    {
+      "path": "src/config.js",
+      "content": "/** Runtime configuration for the demo service. */\n\nexport const DEFAULT_PORT = 3100;\nexport const DEFAULT_HOST = '0.0.0.0';\nexport const MAX_CONNECTIONS = 100;\n\n/**\n * @returns {string} `host:port`\n */\nexport function describe() {\n  return `${DEFAULT_HOST}:${DEFAULT_PORT}`;\n}\n"
+    }
+  ],
+  "usage": {
+    "tokensIn": 980,
+    "tokensOut": 140
+  },
+  "toolInvocations": 3,
+  "retries": 0
+}

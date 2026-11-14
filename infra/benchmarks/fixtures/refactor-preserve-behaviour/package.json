@@ -1,0 +1,10 @@
+{
+  "name": "benchmark-refactor-preserve-behaviour",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Three functions, one repeated loop.",
+  "scripts": {
+    "test": "node --test"
+  }
+}

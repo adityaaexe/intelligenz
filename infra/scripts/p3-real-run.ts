@@ -9,8 +9,13 @@
  *
  *   npx tsx infra/scripts/p3-real-run.ts
  *
- * Cost: one run of `commandcode/deepseek/deepseek-v4-flash`, capped by `MAX_USD`.
- * The measured spend is printed; it is provider-reported, not estimated.
+ * Cost: one run of the configured model, capped by `MAX_USD`. The measured spend is
+ * printed; it is provider-reported, not estimated.
+ *
+ * Phase 4 note: authentication now happens in the host egress broker, not in the
+ * sandbox. The adapter therefore needs `AGENT_BROKER_UPSTREAM_URL` and a credential
+ * source (`AGENT_BROKER_CREDENTIAL` or `AGENT_BROKER_CREDENTIAL_ENV`); the defaults below
+ * match the host this script was last measured on. The sandbox holds no credential.
  */
 
 import { execFile } from 'node:child_process';
@@ -28,6 +33,7 @@ import {
 import {
   buildSandboxCommand,
   createWorkspaceManager,
+  execSandboxed,
   probeSandbox,
   type WorkspaceHandle,
 } from '../../packages/workspace-manager/src/index.ts';
@@ -37,7 +43,14 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, '../..');
 const FIXTURE = join(REPO_ROOT, 'infra/fixtures/sample-repo');
 
-const MODEL = 'commandcode/deepseek/deepseek-v4-flash';
+const MODEL = process.env['AGENT_MODEL'] ?? 'gemini-3.5-flash';
+const UPSTREAM =
+  process.env['AGENT_BROKER_UPSTREAM_URL'] ??
+  'https://generativelanguage.googleapis.com/v1beta/openai';
+const INTEGRATION = process.env['AGENT_BROKER_CREDENTIAL'] ?? 'google';
+const CREDENTIAL_DB =
+  process.env['AGENT_BROKER_CREDENTIAL_DB'] ??
+  join(process.env['HOME'] ?? '', '.local', 'share', 'opencode', 'opencode.db');
 const GOAL =
   'The test suite fails. Find the bug in src/sum.js, fix it, and run `node --test` to prove it passes. Do not change the test file.';
 const TIMEOUT_MS = 180_000;
@@ -93,17 +106,27 @@ async function runInSandbox(handle: WorkspaceHandle, argv: readonly string[]): P
     env: { PATH: `${join(nodeRoot, 'bin')}:/usr/local/bin:/usr/bin:/bin` },
   });
 
-  return new Promise((resolvePromise) => {
-    execFile(
-      command.file,
-      [...command.args],
-      { timeout: 120_000, maxBuffer: 4 * 1024 * 1024, encoding: 'utf8' },
-      (error, stdout, stderr) => {
-        const code = error === null ? 0 : typeof (error as { code?: unknown }).code === 'number' ? ((error as { code?: number }).code ?? 1) : 1;
-        resolvePromise({ code, stdout, stderr });
-      },
-    );
-  });
+  // SEC-403: a raw `execFile` here inherited the operator's whole environment,
+  // because Node's default is inheritance. `execSandboxed` is the one sanctioned
+  // spawn: it passes `command.env`, which `buildSandboxCommand` derived from the
+  // PATH/LANG/HOME/TMPDIR allowlist. bwrap itself therefore starts with four
+  // variables, not the worker's credential-bearing environment.
+  try {
+    const { stdout, stderr } = await execSandboxed(command, {
+      timeoutMs: 120_000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    return { code: 0, stdout, stderr };
+  } catch (error) {
+    // A failing `node --test` is the expected outcome of this step, not an error:
+    // report its exit code and output instead of throwing.
+    const failed = error as { code?: unknown; stdout?: string; stderr?: string };
+    return {
+      code: typeof failed.code === 'number' ? failed.code : 1,
+      stdout: failed.stdout ?? '',
+      stderr: failed.stderr ?? '',
+    };
+  }
 }
 
 async function main(): Promise<void> {
@@ -167,6 +190,10 @@ async function main(): Promise<void> {
     workspaceRoot,
     artifactsRoot,
     model: MODEL,
+    broker: {
+      upstreamBaseUrl: UPSTREAM,
+      credential: { kind: 'opencode-db', databasePath: CREDENTIAL_DB, integrationId: INTEGRATION },
+    },
     maxUsd: MAX_USD,
   });
 
@@ -214,8 +241,9 @@ async function main(): Promise<void> {
     const meta = result.providerMeta;
     out();
     out(`   providerMeta    model=${String(meta.model)} session=${String(meta.sessionId)} steps=${String(meta.steps)}`);
-    const egress = Array.isArray(meta.egress) ? meta.egress : [];
-    out(`   egress          ${egress.length === 0 ? '(none)' : egress.join(', ')}`);
+    const broker = meta.broker as { requests?: number; upstream?: string[] } | undefined;
+    out(`   broker          ${String(broker?.requests ?? 0)} request(s)`);
+    for (const entry of broker?.upstream ?? []) out(`                   ${entry}`);
   }
 
   out();

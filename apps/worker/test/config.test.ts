@@ -27,6 +27,17 @@ describe('resolveArtifactRoot', () => {
 });
 
 describe('loadWorkerConfig', () => {
+  /**
+   * The broker triple is part of a real runtime's boot contract since Phase 4: the
+   * sandbox holds no credential, so a deployment that selects `opencode-cli` without an
+   * upstream and a credential source has no model channel at all.
+   */
+  const brokerEnv = {
+    AGENT_BROKER_UPSTREAM_URL: 'https://provider.example/v1',
+    AGENT_BROKER_CREDENTIAL: 'test-integration',
+    AGENT_MODEL: 'test-model',
+  } as const;
+
   const base = {
     DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
   };
@@ -67,14 +78,19 @@ describe('loadWorkerConfig', () => {
    * default, and a real runtime refuses to boot with a non-positive value.
    */
   it('ships a default spend cap rather than leaving a real runtime uncapped', () => {
-    const config = loadWorkerConfig({ ...base, AGENT_RUNTIME: 'opencode-cli' });
+    const config = loadWorkerConfig({ ...base, ...brokerEnv, AGENT_RUNTIME: 'opencode-cli' });
 
     expect(config.execution.maxUsd).toBe(DEFAULT_AGENT_MAX_USD);
     expect(config.execution.maxUsd).toBeGreaterThan(0);
   });
 
   it('honours an explicit cap', () => {
-    const config = loadWorkerConfig({ ...base, AGENT_RUNTIME: 'opencode-cli', AGENT_MAX_USD: '1.25' });
+    const config = loadWorkerConfig({
+      ...base,
+      ...brokerEnv,
+      AGENT_RUNTIME: 'opencode-cli',
+      AGENT_MAX_USD: '1.25',
+    });
 
     expect(config.execution.maxUsd).toBe(1.25);
   });
@@ -89,6 +105,53 @@ describe('loadWorkerConfig', () => {
     const config = loadWorkerConfig({ ...base, AGENT_MAX_USD: '0' });
 
     expect(config.execution.runtimeId).toBe('local-simulated');
+  });
+
+  it('refuses a real runtime with no broker upstream, because there is no other auth path', () => {
+    expect(() =>
+      loadWorkerConfig({ ...base, AGENT_RUNTIME: 'opencode-cli', ...brokerEnv, AGENT_BROKER_UPSTREAM_URL: '' }),
+    ).toThrow(/AGENT_BROKER_UPSTREAM_URL is required/);
+  });
+
+  it('refuses a real runtime with no credential source', () => {
+    expect(() =>
+      loadWorkerConfig({
+        ...base,
+        AGENT_RUNTIME: 'opencode-cli',
+        ...brokerEnv,
+        AGENT_BROKER_CREDENTIAL: '',
+        AGENT_BROKER_CREDENTIAL_ENV: '',
+      }),
+    ).toThrow(/credential source is required/);
+  });
+
+  it('refuses a real runtime with no model, rather than defaulting to a charge', () => {
+    expect(() =>
+      loadWorkerConfig({ ...base, AGENT_RUNTIME: 'opencode-cli', ...brokerEnv, AGENT_MODEL: '' }),
+    ).toThrow(/AGENT_MODEL is required/);
+  });
+
+  it('accepts an environment credential source for deployments without a SQLite store', () => {
+    const config = loadWorkerConfig({
+      ...base,
+      AGENT_RUNTIME: 'opencode-cli',
+      ...brokerEnv,
+      AGENT_BROKER_CREDENTIAL: '',
+      AGENT_BROKER_CREDENTIAL_ENV: 'PROVIDER_KEY',
+    });
+
+    expect(config.execution.broker.credential).toEqual({ kind: 'env', name: 'PROVIDER_KEY' });
+  });
+
+  it('rejects a broker upstream that is not an http(s) URL', () => {
+    expect(() =>
+      loadWorkerConfig({
+        ...base,
+        AGENT_RUNTIME: 'opencode-cli',
+        ...brokerEnv,
+        AGENT_BROKER_UPSTREAM_URL: 'file:///etc/passwd',
+      }),
+    ).toThrow(/must be http or https/);
   });
 
   it('rejects a nonsense log level rather than silently logging everything', () => {

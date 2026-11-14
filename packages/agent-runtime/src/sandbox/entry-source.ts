@@ -8,36 +8,31 @@
  *
  * The shim does three things inside the sandbox:
  *
- *   1. listens on `127.0.0.1:$AGENT_PROXY_PORT` and pipes every byte to the unix
- *      socket the host bound in (`$AGENT_PROXY_SOCKET`). Loopback inside a fresh
- *      network namespace is real, so this is a working TCP endpoint that terminates
- *      at the host's allowlisting proxy — not at the internet;
+ *   1. listens on `127.0.0.1:$IZ_BROKER_PORT` and pipes every byte to the unix socket
+ *      the host bound in (`$IZ_BROKER_SOCKET`). Loopback inside a fresh network
+ *      namespace is real, so this is a working TCP endpoint that terminates at the
+ *      host's egress broker — not at the internet;
  *   2. applies resource ceilings with `prlimit` before exec'ing the agent, so a
  *      runaway tool call cannot take the host down with it;
- *   3. spawns the agent with `HTTPS_PROXY`/`HTTP_PROXY` pointing at the loopback
- *      listener.
+ *   3. spawns the agent with no proxy variables at all.
  *
- * Without it, the agent would have to be given the host network namespace, which is
- * exactly the capability the sandbox exists to remove.
+ * ## Why there is no `HTTPS_PROXY` any more
  *
- * ## Why `prlimit` and not `bwrap --rlimit-*`
- *
- * The installed `bwrap` (0.11.1 on Ubuntu) does not parse `--rlimit-*`; passing an
- * unknown option fails the whole sandbox. `buildSandboxCommand` therefore emits the
- * flags only when the local binary advertises them, and this wrapper is what actually
- * enforces the ceilings here. `prlimit` is util-linux, present in the read-only `/usr`
- * bind. If it is missing, the limits are skipped **and a line is written to stderr** —
- * a silently unlimited run would be the failure this exists to prevent.
+ * Phase 3 pointed the agent at a host proxy that tunnelled `CONNECT` to an allowlist of
+ * provider hosts on 443. That kept the credential *working* but it did not keep it
+ * *out*: opencode still read the key from the mounted database. Phase 4 moves
+ * authentication to the broker, so the relay only has to carry requests that the agent
+ * is already authorised to make, and a general TLS tunnel would be a second, unneeded
+ * egress path. There is now no proxy variable and no `CONNECT` tunnel: the only socket
+ * the sandbox can reach is this one, and the host decides where it goes.
  *
  * ## What `prlimit` cannot do
  *
  * `RLIMIT_NPROC` is per **real uid**, not per process tree. The sandbox runs as the
  * worker's uid (there is no user namespace on this host), so the ceiling counts every
  * process the worker already has. It is a coarse backstop against a fork bomb, not a
- * per-run quota; cgroup v2 `pids.max` inside a delegated scope is the correct control
- * and needs the deployment work ADR-010 owns. `RLIMIT_AS` bounds virtual address
- * space, not RSS, so it stops an allocation runaway but does not cap resident pages.
- * `RLIMIT_FSIZE` bounds a single file, not the total bytes a run may write.
+ * per-run quota; cgroup v2 `pids.max` inside a delegated scope is the correct control.
+ * `RLIMIT_AS` bounds virtual address space, not RSS.
  *
  * No template literals or `${` inside, deliberately: this string is embedded in one.
  */
@@ -46,12 +41,12 @@ import net from 'node:net';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 
-const socketPath = process.env.AGENT_PROXY_SOCKET;
-const port = Number(process.env.AGENT_PROXY_PORT || '8888');
+const socketPath = process.env.IZ_BROKER_SOCKET;
+const port = Number(process.env.IZ_BROKER_PORT || '8899');
 const argv = process.argv.slice(2);
 
 if (!socketPath) {
-  process.stderr.write('sandbox-entry: AGENT_PROXY_SOCKET is not set\\n');
+  process.stderr.write('sandbox-entry: IZ_BROKER_SOCKET is not set; refusing to start without a model channel\\n');
   process.exit(78);
 }
 
@@ -107,7 +102,10 @@ const server = net.createServer((client) => {
   upstream.pipe(client);
 
   client.on('error', () => upstream.destroy());
-  upstream.on('error', () => client.destroy());
+  upstream.on('error', () => {
+    // The broker is gone. Say so; do not retry elsewhere. There is nowhere else.
+    client.destroy();
+  });
 });
 
 await new Promise((resolve, reject) => {
@@ -115,18 +113,11 @@ await new Promise((resolve, reject) => {
   server.listen(port, '127.0.0.1', resolve);
 });
 
-const proxyUrl = 'http://127.0.0.1:' + port;
 const child = spawn(executable, childArgv, {
   stdio: 'inherit',
-  env: {
-    ...process.env,
-    HTTPS_PROXY: proxyUrl,
-    HTTP_PROXY: proxyUrl,
-    https_proxy: proxyUrl,
-    http_proxy: proxyUrl,
-    NO_PROXY: '',
-    no_proxy: '',
-  },
+  // No HTTPS_PROXY, no HTTP_PROXY, no NO_PROXY: the agent speaks plain HTTP to
+  // loopback, and the broker — not the agent — chooses the upstream.
+  env: { ...process.env },
 });
 
 const forward = (signal) => {

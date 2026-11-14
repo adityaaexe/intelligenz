@@ -35,14 +35,16 @@ export type FilesystemAccess = z.infer<typeof FilesystemAccess>;
  * `network: false` means the **agent** has **no general egress**: every process it can
  * spawn runs in a network namespace with no interfaces, so TCP, UDP and DNS all fail.
  * It does *not* mean the agent's traffic is impossible — a real adapter may own one
- * narrow, adapter-controlled channel for model transport. For `opencode-cli` that is a
- * host proxy reachable through a bound unix socket that accepts `CONNECT` only to an
- * exact allowlist of provider hosts and only on port 443; every other destination and
- * port is refused and logged.
+ * narrow, adapter-controlled channel for model transport. Since Phase 4 that channel
+ * for `opencode-cli` is a bound unix socket terminating at a **host egress broker**:
+ * per-attempt capability token, a fixed list of OpenAI-compatible paths, a destination
+ * the host chooses, and a credential the host injects. The sandbox names no host and
+ * holds no credential.
  *
  * The precise claim, and the one that should appear in operator documentation, is:
- * **no general egress; model traffic only via an allowlisted 443 proxy; all other
- * sockets blocked.** A bare `network: false` without that qualifier overstates it.
+ * **no general egress; model traffic only through a host broker that injects the
+ * credential; all other sockets blocked.** A bare `network: false` without that
+ * qualifier overstates it.
  */
 export const RuntimeCapabilities = z
   .object({
@@ -103,6 +105,28 @@ export const ExecutionRequest = z
      * host checkout instead of the disposable clone.
      */
     workspaceRoot: z.string().min(1).optional(),
+    /**
+     * Phase 4: the `cgroup.procs` file of the cgroup this attempt must run inside.
+     *
+     * On the request rather than on the adapter for the same reason as `workspaceRoot`:
+     * the cgroup is per attempt. An adapter that spawns a process tree must place it
+     * before the first `exec` (see `runInProcessGroup({ placement })`) — placement after
+     * spawn is a window, and a window is enough for a fork bomb.
+     *
+     * Absent means "no cgroup": the worker only omits it when its own capability probe
+     * reported that cgroup isolation is unavailable, and in that case the attempt is
+     * recorded as `rlimit-only` rather than as an enforced profile.
+     */
+    cgroupProcsPath: z.string().min(1).optional(),
+    /**
+     * Phase 4: the per-attempt spend ceiling, `min(profile, deployment cap)`.
+     *
+     * `budgetUsd` above is advisory and always has been (contract §15 A7). This one is
+     * the hard cap the adapter must not exceed: the worker computes it from the resource
+     * profile, which the agent cannot select, so a run cannot raise its own ceiling by
+     * claiming a bigger budget.
+     */
+    maxUsd: z.number().positive().optional(),
   })
   .strict();
 

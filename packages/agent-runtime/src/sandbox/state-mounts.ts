@@ -1,137 +1,78 @@
-import { access } from 'node:fs/promises';
-import { constants as fsConstants } from 'node:fs';
-import { join } from 'node:path';
-
 import type { SandboxMount } from '@intelligenz/workspace-manager';
 
 /**
- * The part of opencode's host state that a sandboxed run is allowed to see.
+ * The opencode state a sandboxed run is allowed to see: **none of the host's**.
  *
- * ## The failure this replaces
+ * ## What this replaces, and why the replacement is deletion
  *
- * The adapter mounted `$HOME/.local/share`, `$HOME/.local/state` and `$HOME/.cache`
- * wholesale. Measured from inside a run, that exposed six provider credentials (other
- * agents' tokens), 696 sessions of operator history, a 1.07 GB database, `mcp-auth.json`
- * with MCP OAuth tokens, the agentmemory secret and the browser's NSS `key4.db`. The
- * agent's tool output is written verbatim to a transcript, so "readable inside the
- * sandbox" and "downloadable from the platform" were the same sentence.
+ * Phase 3 mounted four host paths into the sandbox (`<data>/opencode`,
+ * `<state>/opencode`, `<cache>/opencode`, and a legacy `auth.json`), then masked the
+ * parts it could. The audit measured what remained readable from inside a run:
  *
- * ## The allowlist
+ * ```
+ * /xdg-data/opencode:
+ *   opencode.db      1,068,654,592 bytes   <- the provider credential
+ *   mcp-auth.json    masked
+ *   shell/ storage/ tool-output/ snapshot/ repos/ log/   masked
+ * ```
  *
- * Only opencode's own paths, and only the ones that exist:
+ * Masking could not be extended to the database, because authentication lived in it:
+ * opencode had to open the credential to call the model, so the agent could open it
+ * too. The residual was stated honestly in the Phase 3 addendum and it was still a
+ * live provider key, shared by every org's runs, inside a shell-capable sandbox.
  *
- * | Host path | Container path | Mode | Why |
- * |---|---|---|---|
- * | `<data>/opencode` | `/xdg-data/opencode` | ephemeral | the SQLite DB that holds provider auth |
- * | `<state>/opencode` | `/xdg-state/opencode` | ephemeral | locks and service metadata written at startup |
- * | `<cache>/opencode` | `/xdg-cache/opencode` | ephemeral | model catalogue cache |
- * | `<config>/opencode/auth.json` | `/xdg-config/opencode/auth.json` | ro | legacy credential file, if this version used it |
+ * Phase 4 removes the requirement instead of narrowing the mount. Authentication is
+ * terminated by the host egress broker (`@intelligenz/egress-broker`), so the agent
+ * never needs a credential and never needs this directory. What it gets is an empty,
+ * writable, per-run tree on the sandbox's own tmpfs:
  *
- * Nothing else under `$HOME` is mounted. `$HOME` itself never is.
+ * | Path | Content | Lifetime |
+ * |---|---|---|
+ * | `/xdg-data/opencode` | the run's own session SQLite file | dies with the sandbox |
+ * | `/xdg-state/opencode` | locks and service metadata | dies with the sandbox |
+ * | `/xdg-cache/opencode` | model catalogue cache | dies with the sandbox |
+ * | `/xdg-config` | writable, empty; the real config is read-only at `/cfg` | dies with the sandbox |
  *
- * ## Masks
+ * The consequence is deliberate: this run cannot see another run's session, cannot see
+ * the operator's history, and has no credential to leak. A session database written
+ * here contains only what this agent did.
  *
- * Inside `<data>/opencode`, two categories are replaced after the overlay mount:
+ * ## The signature is the control
  *
- * - `mcp-auth.json` (a file, masked with `/dev/null`): OAuth tokens for MCP servers
- *   this sandbox does not run and cannot use;
- * - `shell/`, `storage/`, `tool-output/`, `snapshot/`, `repos/`, `log/` (directories,
- *   masked with empty tmpfs): previous sessions' output. A run may still write to them
- *   — opencode's shell tool needs to — but the host's history is not visible.
- *
- * The database itself cannot be masked or narrowed: auth lives in it, and the agent
- * must authenticate to think. That residual — a credential and the operator's session
- * rows inside one SQLite file — is stated in the Phase 3 security addendum, and moving
- * auth into the egress proxy is the only way to remove it.
+ * This function takes no arguments. There is no `dataHome`, no `configHome`, and no
+ * path it could mount even if a future caller passed one — a caller cannot reintroduce
+ * the Phase 3 mount without changing this file and its tests. That is a stronger
+ * guarantee than a comment saying "do not mount $HOME".
  */
 
-const fileExists = (path: string): Promise<boolean> =>
-  access(path, fsConstants.F_OK).then(
-    () => true,
-    () => false,
-  );
-
-/** Directories inside the data dir that hold previous sessions' output. */
-export const OPERATOR_DATA_DIRECTORIES = [
-  'shell',
-  'storage',
-  'tool-output',
-  'snapshot',
-  'repos',
-  'log',
-] as const;
-
-export interface StateMountInput {
-  /** Host `XDG_DATA_HOME` (`~/.local/share`). */
-  readonly dataHome: string;
-  /** Host `XDG_STATE_HOME` (`~/.local/state`). */
-  readonly stateHome: string;
-  /** Host `XDG_CACHE_HOME` (`~/.cache`). */
-  readonly cacheHome: string;
-  /** Host `XDG_CONFIG_HOME` (`~/.config`). */
-  readonly configHome: string;
-}
-
-export interface StateMountPlan {
+export interface EphemeralStatePlan {
+  /** Always empty. The host mounts nothing into the state tree. */
   readonly mounts: SandboxMount[];
-  /** XDG base directories to create inside the sandbox, mounted or not. */
+  /** Directories to create inside the sandbox root. Empty and writable. */
   readonly dirs: string[];
-  /** Container paths to replace with an empty tmpfs, after the overlay is applied. */
+  /** Always empty. There is nothing to mask when nothing is mounted. */
   readonly masks: string[];
 }
 
-export const XDG_DIRECTORIES = ['/xdg-data', '/xdg-state', '/xdg-cache', '/xdg-config'] as const;
+/** XDG base directories. Created even when nothing is mounted over them. */
+export const XDG_DIRECTORIES = [
+  '/xdg-data',
+  '/xdg-state',
+  '/xdg-cache',
+  '/xdg-config',
+] as const;
 
-export async function buildOpencodeStateMounts(input: StateMountInput): Promise<StateMountPlan> {
-  const mounts: SandboxMount[] = [];
-  const masks: string[] = [];
+/** Per-run opencode state directories. Empty, writable, and ephemeral. */
+export const OPENCODE_STATE_DIRECTORIES = [
+  '/xdg-data/opencode',
+  '/xdg-state/opencode',
+  '/xdg-cache/opencode',
+] as const;
 
-  const data = join(input.dataHome, 'opencode');
-
-  if (await fileExists(data)) {
-    // Ephemeral overlay: read the real database, write into an invisible tmpfs, never
-    // modify the host copy, and never let one run poison the next run's session state.
-    mounts.push({ hostPath: data, containerPath: '/xdg-data/opencode', mode: 'ephemeral' });
-
-    const mcpAuth = join(data, 'mcp-auth.json');
-
-    if (await fileExists(mcpAuth)) {
-      // `/dev/null` is the cheapest way to make a file unreadable without deleting it.
-      mounts.push({
-        hostPath: '/dev/null',
-        containerPath: '/xdg-data/opencode/mcp-auth.json',
-        mode: 'ro',
-      });
-    }
-
-    for (const directory of OPERATOR_DATA_DIRECTORIES) {
-      if (await fileExists(join(data, directory))) {
-        masks.push(`/xdg-data/opencode/${directory}`);
-      }
-    }
-  }
-
-  const state = join(input.stateHome, 'opencode');
-
-  if (await fileExists(state)) {
-    mounts.push({ hostPath: state, containerPath: '/xdg-state/opencode', mode: 'ephemeral' });
-  }
-
-  const cache = join(input.cacheHome, 'opencode');
-
-  if (await fileExists(cache)) {
-    mounts.push({ hostPath: cache, containerPath: '/xdg-cache/opencode', mode: 'ephemeral' });
-  }
-
-  const legacyAuth = join(input.configHome, 'opencode', 'auth.json');
-
-  if (await fileExists(legacyAuth)) {
-    mounts.push({
-      hostPath: legacyAuth,
-      containerPath: '/xdg-config/opencode/auth.json',
-      mode: 'ro',
-    });
-  }
-
-  return { mounts, dirs: [...XDG_DIRECTORIES], masks };
+export function buildEphemeralStatePlan(): EphemeralStatePlan {
+  return {
+    mounts: [],
+    dirs: [...XDG_DIRECTORIES, ...OPENCODE_STATE_DIRECTORIES],
+    masks: [],
+  };
 }

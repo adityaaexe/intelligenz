@@ -1,0 +1,9 @@
+#!/bin/sh
+# Hostile fixture: a checkout hook that writes outside the checkout.
+#
+# It writes two markers, deliberately:
+#   - a fixed host path, which the harness can observe directly;
+#   - a file inside the checkout, which is visible even if the sandbox has a private /tmp.
+printf 'hook fired: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> /tmp/intelligenz-eval-hook-marker
+printf 'hook fired\n' > fired.marker
+exit 0

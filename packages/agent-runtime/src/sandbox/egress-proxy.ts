@@ -6,6 +6,15 @@ import { join } from 'node:path';
 /**
  * The **only** network channel a sandboxed agent gets.
  *
+ * > **Superseded for `opencode-cli` by Phase 4.** This module is no longer wired into a
+ * > run. Phase 3 used it to keep a credential *working* while the sandbox held it; Phase
+ * > 4 moved authentication to `@intelligenz/egress-broker`, so the sandbox needs no
+ * > provider credential and no general TLS tunnel. The module is kept because it is a
+ * > correct, tested control for an adapter that must reach a provider it authenticates
+ * > itself, and because deleting a security control from a package is not a refactor.
+ * > `opencode-cli` does not mount it, does not set `HTTPS_PROXY`, and has no `CONNECT`
+ * > path at all.
+ *
  * ## Why this exists
  *
  * `--unshare-net` is a real block: it gives the sandbox a network namespace with

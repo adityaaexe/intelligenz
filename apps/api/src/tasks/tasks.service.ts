@@ -4,8 +4,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import {
   type CreateTaskInput,
   type PaginationQuery,
-  type RiskClass,
-  type TaskStatus,
+  type RunTaskInput,
   type UpdateTaskStatusInput,
   canTransition,
   requiresApproval,
@@ -15,10 +14,16 @@ import type { Prisma, PrismaClient } from '@intelligenz/database';
 import type { Logger } from 'pino';
 
 import { AuditService } from '../audit/audit.service';
+import {
+  ApprovalGateService,
+  type ApprovalGateTask,
+} from '../approvals/approval-gate.service';
+import { computeTaskContentHash } from '../approvals/approval-binding';
 import { ArtifactsService } from '../artifacts/artifacts.service';
 import { AppError } from '../common/errors';
 import { LOGGER } from '../common/logger';
 import { isUniqueConstraintError } from '../common/prisma-errors';
+import { APP_CONFIG, type AppConfig } from '../config/app-config';
 import { PRISMA_CLIENT } from '../database/database.module';
 import {
   OrchestratorService,
@@ -26,6 +31,8 @@ import {
   WORKFLOW_ID_PREFIX,
   isWorkflowAlreadyStartedError,
 } from '../orchestrator/orchestrator.service';
+import { classify } from '../risk/classify';
+import { DEFAULT_EXECUTION_PROFILE } from '../risk/risk-policy';
 import { isHumanTransition } from './human-transitions';
 import type {
   CancelResponse,
@@ -52,6 +59,14 @@ import type {
  * `AppError.notFound` for a task that exists in another org. A 403 would confirm the
  * id is real, which is the one bit of information an attacker wants from a
  * guessing loop.
+ *
+ * ## Risk class is derived here, never accepted (D-006)
+ *
+ * `create` ignores the caller's `riskClass` for authorisation and stores the class
+ * `classify()` produced, with `riskSource = 'server'`. The caller's value is still
+ * read — but only to record whether they tried to move the class down or up. See
+ * `risk/classify.ts` for the policy and `docs/engineering/decisions/D-006-*.md` for
+ * the decision.
  */
 
 const TASK_SELECT = {
@@ -73,6 +88,20 @@ const TASK_SELECT = {
 
 type TaskRow = Prisma.TaskGetPayload<{ select: typeof TASK_SELECT }>;
 
+/**
+ * Everything the approval gate needs, plus the response fields. One select rather
+ * than two, because two selects of the same row is how the gate and the response end
+ * up disagreeing about which class is in force.
+ */
+const TASK_GATE_SELECT = {
+  ...TASK_SELECT,
+  derivedRiskClass: true,
+  riskPolicyVersion: true,
+  riskFactors: true,
+} as const satisfies Prisma.TaskSelect;
+
+type TaskGateRow = Prisma.TaskGetPayload<{ select: typeof TASK_GATE_SELECT }>;
+
 const MAX_IDEMPOTENCY_KEY_LENGTH = 255;
 
 @Injectable()
@@ -83,6 +112,8 @@ export class TasksService {
     @Inject(AuditService) private readonly audit: AuditService,
     @Inject(OrchestratorService) private readonly orchestrator: OrchestratorService,
     @Inject(ArtifactsService) private readonly artifacts: ArtifactsService,
+    @Inject(ApprovalGateService) private readonly approvals: ApprovalGateService,
+    @Inject(APP_CONFIG) private readonly config: AppConfig,
   ) {}
 
   /**
@@ -93,9 +124,17 @@ export class TasksService {
    * attempted first and the collision is caught; that is the only version of this
    * that is correct under concurrency.
    *
-   * The task, its approval request (HIGH/CRITICAL only) and both audit events are
-   * one transaction. A task without its `task.created.v1` row would be a state whose
+   * The task, its approval request (HIGH/CRITICAL only) and every audit event are one
+   * transaction. A task without its `task.created.v1` row would be a state whose
    * history is missing, which is the one thing an audit trail must never be.
+   *
+   * ## What the caller can and cannot decide
+   *
+   * `input.riskClass` is not used to choose the class. It is compared with the derived
+   * one and the comparison is recorded. A downgrade attempt is also a separate audit
+   * event: "a member labelled a production deploy LOW" is exactly what a reviewer
+   * needs to see, and it is not an error the request should fail on — the server
+   * simply did not agree.
    */
   async create(params: {
     orgId: string;
@@ -119,6 +158,47 @@ export class TasksService {
 
     const idempotencyKey = normaliseIdempotencyKey(params.idempotencyKey);
 
+    // The binding is what the grant will later be pinned to. Defaults are explicit:
+    // an absent profile is `standard`, not "whatever the worker feels like".
+    const executionProfile = input.executionProfile ?? DEFAULT_EXECUTION_PROFILE;
+    const sourceRef = input.sourceRef ?? null;
+    const baseCommit = input.baseCommit ?? null;
+
+    const classification = classify({
+      title: input.title,
+      goal: input.goal,
+      acceptanceCriteria: input.acceptanceCriteria,
+      executionProfile,
+      sourceRef,
+      baseCommit,
+      trustedSourceRepos: this.config.trustedSourceRepos,
+      // Repository text is not available at creation time; the worker classifies with
+      // it inside the sandbox. Passing `[]` is honest about what this decision saw.
+      repositoryInstructions: [],
+      clientRiskClass: input.riskClass ?? null,
+    });
+
+    const factors = classification.factors;
+
+    // The exact JSON that is persisted. Written out field by field rather than spread,
+    // so a new factor cannot appear in the database without being named here.
+    const riskFactors = {
+      signals: [...factors.signals],
+      score: factors.score,
+      operation: factors.operation,
+      repositoryTrust: factors.repositoryTrust,
+      matchedTerms: [...factors.matchedTerms],
+      executionProfile: factors.executionProfile,
+      policyVersion: factors.policyVersion,
+      clientRiskClass: factors.clientRiskClass,
+      clientAttemptedDowngrade: factors.clientAttemptedDowngrade,
+      clientAttemptedEscalation: factors.clientAttemptedEscalation,
+      securityEvents: [...factors.securityEvents],
+      // The execution facts, stored here because classification consumed them: the
+      // approval binds the same four values at decision time.
+      binding: { executionProfile, sourceRef, baseCommit },
+    } satisfies Prisma.InputJsonObject;
+
     try {
       const task = await this.prisma.$transaction(async (transaction) => {
         const created = await transaction.task.create({
@@ -130,7 +210,12 @@ export class TasksService {
             workspaceId: project.workspaceId,
             title: input.title,
             goal: input.goal,
-            riskClass: input.riskClass,
+            // The derived class is the effective class. One field downstream gates read.
+            riskClass: classification.riskClass,
+            riskSource: 'server',
+            derivedRiskClass: classification.riskClass,
+            riskPolicyVersion: classification.policyVersion,
+            riskFactors,
             // Undefined lets the column default ('normal') decide, so the default
             // exists in one place.
             priority: input.priority ?? undefined,
@@ -141,17 +226,32 @@ export class TasksService {
           select: TASK_SELECT,
         });
 
-        // Contract §15 A3: a HIGH or CRITICAL task needs an APPROVED request before
-        // it can be queued. Creating the PENDING request here is what puts it in the
-        // queue the approvals screen reads — without it, the gate would only ever be
-        // satisfiable by seed data.
-        if (requiresApproval(input.riskClass)) {
+        // Contract §15 A3: a HIGH or CRITICAL task needs a live APPROVED request
+        // before it can be queued. Creating the PENDING request here is what puts it
+        // in the queue the approvals screen reads — without it, the gate would only
+        // ever be satisfiable by seed data.
+        if (classification.requiresApproval) {
           const approval = await transaction.approvalRequest.create({
             data: {
               orgId,
               taskId: created.id,
-              riskClass: input.riskClass,
+              riskClass: classification.riskClass,
               requestedById: actorId,
+              // Bound from birth so the row is never an unbound `APPROVED` waiting to
+              // happen. `decide` re-computes it against the content the approver sees.
+              taskContentHash: computeTaskContentHash({
+                title: created.title,
+                goal: created.goal,
+                acceptanceCriteria: created.acceptanceCriteria,
+                riskClass: classification.riskClass,
+                executionProfile,
+                sourceRef,
+                baseCommit,
+              }),
+              riskClassAtApproval: classification.riskClass,
+              policyVersion: classification.policyVersion,
+              executionProfile,
+              expiresAt: new Date(Date.now() + this.config.approvalTtlHours * 60 * 60 * 1_000),
             },
             select: { id: true },
           });
@@ -165,7 +265,11 @@ export class TasksService {
             aggregateType: 'ApprovalRequest',
             aggregateId: approval.id,
             correlationId,
-            payload: { taskId: created.id, riskClass: input.riskClass },
+            payload: {
+              taskId: created.id,
+              riskClass: classification.riskClass,
+              policyVersion: classification.policyVersion,
+            },
           });
         }
 
@@ -179,8 +283,58 @@ export class TasksService {
           aggregateId: created.id,
           correlationId,
           idempotencyKey: `task.created:${created.id}`,
-          payload: { title: created.title, riskClass: created.riskClass, status: created.status },
+          payload: {
+            riskClass: created.riskClass,
+            riskSource: 'server',
+            riskPolicyVersion: classification.policyVersion,
+            status: created.status,
+          },
         });
+
+        if (factors.clientAttemptedDowngrade || factors.clientAttemptedEscalation) {
+          // Recorded, never refused. The request is legitimate; the assertion was not
+          // accepted. Failing here would let a caller probe the classifier with a 400
+          // instead of simply being overruled.
+          await this.audit.recordWithin(transaction, {
+            orgId,
+            projectId: created.projectId,
+            actor: { type: 'user', id: actorId },
+            action: 'task.risk_class_overridden',
+            eventType: 'task.risk_class_overridden.v1',
+            aggregateType: 'Task',
+            aggregateId: created.id,
+            correlationId,
+            payload: {
+              clientRiskClass: factors.clientRiskClass,
+              derivedRiskClass: classification.riskClass,
+              direction: factors.clientAttemptedDowngrade ? 'downgrade' : 'escalation',
+              policyVersion: classification.policyVersion,
+              signals: [...factors.signals],
+            },
+          });
+        }
+
+        if (factors.securityEvents.length > 0) {
+          // A task asking for credentials or host paths is an attempt at the platform's
+          // own trust boundary, not merely risky work. CRITICAL plus this event means a
+          // reviewer can find every such request in one query.
+          await this.audit.recordWithin(transaction, {
+            orgId,
+            projectId: created.projectId,
+            actor: { type: 'user', id: actorId },
+            action: 'security.risk_signal',
+            eventType: 'security.risk_signal.v1',
+            aggregateType: 'Task',
+            aggregateId: created.id,
+            correlationId,
+            payload: {
+              taskId: created.id,
+              signals: [...factors.securityEvents],
+              riskClass: classification.riskClass,
+              policyVersion: classification.policyVersion,
+            },
+          });
+        }
 
         return created;
       });
@@ -307,6 +461,9 @@ export class TasksService {
             checksum: true,
             sizeBytes: true,
             runtimeId: true,
+            // Phase 4 provenance. `null` is reported as `unattributed: true`, never
+            // guessed from a time window.
+            attemptId: true,
             createdAt: true,
           },
         },
@@ -321,6 +478,9 @@ export class TasksService {
             decisionNote: true,
             createdAt: true,
             decidedAt: true,
+            expiresAt: true,
+            consumedAt: true,
+            revokedAt: true,
           },
         },
       },
@@ -370,6 +530,8 @@ export class TasksService {
         // integer range, so a number is the honest representation.
         sizeBytes: Number(artifact.sizeBytes),
         runtimeId: artifact.runtimeId,
+        attemptId: artifact.attemptId,
+        unattributed: artifact.attemptId === null,
         createdAt: artifact.createdAt.toISOString(),
       })),
       approvals: task.approvalRequests.map((approval) => ({
@@ -381,6 +543,9 @@ export class TasksService {
         decisionNote: approval.decisionNote,
         createdAt: approval.createdAt.toISOString(),
         decidedAt: approval.decidedAt?.toISOString() ?? null,
+        expiresAt: approval.expiresAt?.toISOString() ?? null,
+        consumedAt: approval.consumedAt?.toISOString() ?? null,
+        revokedAt: approval.revokedAt?.toISOString() ?? null,
       })),
     };
   }
@@ -394,6 +559,15 @@ export class TasksService {
    * allowed to walk `ready → queued → running → verifying → succeeded` and mint a
    * terminal success with nothing behind it. So a legal edge that the orchestrator
    * owns is refused with `409 TRANSITION_IS_SYSTEM_MANAGED`.
+   *
+   * ## Approval is checked before the system-managed refusal
+   *
+   * For a HIGH/CRITICAL task, `PATCH → queued` answers `409 APPROVAL_REQUIRED` (or
+   * `APPROVAL_STALE`/`EXPIRED`/…) rather than the generic "system managed" refusal.
+   * Both refuse — the edge is still not a user's — but the first is the true reason a
+   * person cannot proceed, and it names the action that unblocks them. The check is
+   * **non-consuming**: this call can never queue anything, so spending the grant here
+   * would burn it for nothing.
    *
    * The write is a compare-and-swap on `(id, orgId, currentStatus)`. If another
    * request moved the task between our read and our write, the count is zero and the
@@ -411,7 +585,7 @@ export class TasksService {
     const task = await this.prisma.task.findFirst({
       // Tenant scoping.
       where: { id: taskId, orgId },
-      select: { id: true, projectId: true, status: true, riskClass: true },
+      select: TASK_GATE_SELECT,
     });
 
     if (task === null) throw AppError.notFound('Task');
@@ -419,6 +593,18 @@ export class TasksService {
     // 422: the pair is not an edge of the machine at all.
     if (!canTransition(task.status, input.status)) {
       throw AppError.invalidTransition(task.status, input.status);
+    }
+
+    if (input.status === 'queued' && requiresApproval(task.riskClass)) {
+      // Non-consuming: `ready → queued` is system-managed, so a successful check is
+      // followed by a refusal below. Consuming here would spend a grant on a request
+      // that was never going to start a run.
+      await this.approvals.requireLiveApproval({
+        task: toGateTask(task),
+        correlationId,
+        actorId,
+        consume: false,
+      });
     }
 
     // 409: the pair is a real edge, but one that only the orchestrator may take.
@@ -445,14 +631,6 @@ export class TasksService {
         'A reason is required when returning a task to ready.',
         { reason: ['A reason is required when a task is moved to ready.'] },
       );
-    }
-
-    if (input.status === 'queued' && requiresApproval(task.riskClass)) {
-      // Unreachable through this method now that `ready → queued` is
-      // system-managed, and kept deliberately: if the human subset is ever widened,
-      // the approval gate is already on the path. `POST /run` performs the same
-      // check for the transition that actually queues.
-      await this.assertApproved(orgId, task, correlationId, actorId, 'queued');
     }
 
     return this.prisma.$transaction(async (transaction) => {
@@ -504,36 +682,44 @@ export class TasksService {
    *
    * Order of operations matters and is the reason this is longer than it looks:
    *
-   *  1. reserve — task `ready → queued` and a `WorkflowRun` row, in one transaction;
+   *  1. gate + reserve — in **one** transaction: spend the approval (CAS) and move the
+   *     task `ready → queued`, writing the `WorkflowRun`. Doing the spend in the same
+   *     transaction as the reservation is what makes "one approval, one run" true even
+   *     when the reservation loses a race: the loser's consumption rolls back with it.
    *  2. start the workflow with the deterministic id. The reuse policy permits replacing
    *     a *closed failed* execution but not a running one, so a retry after a failure can
    *     run while a duplicate of a live run is still refused (`409`);
    *  3. on success, record the Temporal run id;
    *  4. on failure, compensate: the task goes back to `ready` and the run is marked
    *     failed. A task is never left `running` when nothing is running it.
+   *
+   * ## A failed start still spends the grant
+   *
+   * The reservation commits before Temporal is contacted, so an `ORCHESTRATOR_UNAVAILABLE`
+   * leaves the approval consumed. That is deliberate: refunding it would need a second
+   * compare-and-swap against a run that may have started after all, and a refund that
+   * loses that race authorises two executions. The cost of the conservative choice is
+   * one re-approval after an outage; the cost of the other is the control.
    */
   async run(params: {
     orgId: string;
     taskId: string;
+    input: RunTaskInput;
     correlationId: string;
     actorId: string;
   }): Promise<RunResponse> {
-    const { orgId, taskId, correlationId, actorId } = params;
+    const { orgId, taskId, input, correlationId, actorId } = params;
 
     const task = await this.prisma.task.findFirst({
       // Tenant scoping.
       where: { id: taskId, orgId },
-      select: { id: true, projectId: true, status: true, riskClass: true },
+      select: TASK_GATE_SELECT,
     });
 
     if (task === null) throw AppError.notFound('Task');
 
     if (task.status !== 'ready') {
       throw AppError.invalidTransition(task.status, 'queued');
-    }
-
-    if (requiresApproval(task.riskClass)) {
-      await this.assertApproved(orgId, task, correlationId, actorId, 'queued');
     }
 
     const activeRun = await this.prisma.workflowRun.findFirst({
@@ -549,6 +735,30 @@ export class TasksService {
     const workflowId = `${WORKFLOW_ID_PREFIX}${taskId}`;
 
     const reserved = await this.prisma.$transaction(async (transaction) => {
+      if (requiresApproval(task.riskClass)) {
+        // Inside the transaction on purpose: a lost reservation must not spend the
+        // grant, and the CAS predicates make concurrent runs safe regardless.
+        await this.approvals.requireLiveApproval({
+          task: toGateTask(task),
+          correlationId,
+          actorId,
+          consume: true,
+          // The attempt row does not exist yet — the worker creates it. `consumedAt`
+          // is what makes the grant spent; the worker fills the link in when it can.
+          attemptId: null,
+          // What the caller asserts this run will use. Compared against the binding,
+          // never trusted: a grant for `standard` must not authorise `heavy`.
+          assertion: {
+            ...(input.executionProfile === undefined
+              ? {}
+              : { executionProfile: input.executionProfile }),
+            ...(input.sourceRef === undefined ? {} : { sourceRef: input.sourceRef }),
+            ...(input.baseCommit === undefined ? {} : { baseCommit: input.baseCommit }),
+          },
+          transaction,
+        });
+      }
+
       const reservedTask = await transaction.task.updateMany({
         where: { id: taskId, orgId, status: 'ready' },
         data: { status: 'queued' },
@@ -745,58 +955,6 @@ export class TasksService {
     };
   }
 
-  /**
-   * Contract §15 A3's precondition, in one place.
-   *
-   * `POST /run` is the only path to queueing, so it is the only caller — and a
-   * gate that exists on only one path is not a gate. `updateStatus` keeps an
-   * unreachable call on the `queued` branch as defence in depth if the human
-   * transition subset is ever widened.
-   *
-   * The refusal is an audit event as well as a 409 — "the user tried to run a
-   * CRITICAL task without approval" is exactly the kind of thing a reviewer needs to
-   * see later.
-   */
-  private async assertApproved(
-    orgId: string,
-    task: { id: string; projectId: string; status: TaskStatus; riskClass: RiskClass },
-    correlationId: string,
-    actorId: string,
-    target: TaskStatus,
-  ): Promise<void> {
-    const approval = await this.prisma.approvalRequest.findFirst({
-      // Tenant scoping: an approval from another org can never satisfy this gate.
-      where: { orgId, taskId: task.id, status: 'APPROVED' },
-      select: { id: true },
-    });
-
-    if (approval !== null) return;
-
-    await this.audit.record({
-      orgId,
-      projectId: task.projectId,
-      actor: { type: 'user', id: actorId },
-      action: 'task.transition_refused',
-      eventType: 'task.transition_refused.v1',
-      aggregateType: 'Task',
-      aggregateId: task.id,
-      correlationId,
-      payload: {
-        from: task.status,
-        to: target,
-        riskClass: task.riskClass,
-        reason: 'approval_required',
-      },
-    });
-
-    throw new AppError(
-      409,
-      'APPROVAL_REQUIRED',
-      `A ${task.riskClass} task requires an approved request before it can be queued.`,
-      { approval: [`No APPROVED approval request exists for task ${task.id}.`] },
-    );
-  }
-
   private async compensateFailedStart(
     orgId: string,
     taskId: string,
@@ -840,6 +998,23 @@ export class TasksService {
  * A fixed v5-shaped UUID keeps it greppable and valid for `EventEnvelope.actor.id`.
  */
 const SYSTEM_ACTOR_ID = '00000000-0000-5000-8000-000000000000';
+
+/** The narrow shape the gate consumes. Keeps that service ignorant of the ORM model. */
+function toGateTask(task: TaskGateRow): ApprovalGateTask {
+  return {
+    id: task.id,
+    orgId: task.orgId,
+    projectId: task.projectId,
+    title: task.title,
+    goal: task.goal,
+    acceptanceCriteria: task.acceptanceCriteria,
+    // The derived class is what was stored in `riskClass` at creation; the fallback
+    // covers rows written before Phase 4, where `derivedRiskClass` is null.
+    riskClass: task.derivedRiskClass ?? task.riskClass,
+    riskPolicyVersion: task.riskPolicyVersion,
+    riskFactors: task.riskFactors,
+  };
+}
 
 function normaliseIdempotencyKey(value: string | undefined): string {
   const key = value?.trim();

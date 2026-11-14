@@ -33,17 +33,36 @@ let instance: AgentRuntime | undefined;
 
 export function createAgentRuntime(config: WorkerConfig): AgentRuntime {
   if (config.execution.runtimeId === OPENCODE_CLI_ID) {
+    const model = config.execution.model;
+    const upstreamBaseUrl = config.execution.broker.upstreamBaseUrl;
+    const credential = config.execution.broker.credential;
+
+    // `loadWorkerConfig` refuses this combination at boot; the check is repeated here
+    // because `createAgentRuntime` is also reachable from tests and scripts, and a
+    // non-null assertion is how a security invariant becomes a runtime crash.
+    if (model === undefined || upstreamBaseUrl === undefined || credential === undefined) {
+      throw new Error(
+        'opencode-cli requires AGENT_MODEL, AGENT_BROKER_UPSTREAM_URL and a credential ' +
+          'source (AGENT_BROKER_CREDENTIAL or AGENT_BROKER_CREDENTIAL_ENV).',
+      );
+    }
+
     return new OpencodeCliRuntime({
       // Both are required by the adapter; a real run never guesses its boundary.
       workspaceRoot: config.workspace.root,
-      // The adapter's per-run config, egress socket and raw transcript live here.
+      // The adapter's per-run config, broker socket and raw transcript live here.
       // Deliberately **not** `artifactRoot`: its run layout adds
-      // `opencode-cli/<uuid>-<suffix>/egress/egress.sock`, and a unix socket path over
+      // `opencode-cli/<uuid>-<suffix>/broker/broker.sock`, and a unix socket path over
       // 107 bytes is silently truncated by libuv — which presents as `ECONNRESET` on
       // every provider call, not as a configuration error. Evidence is copied into the
       // workspace by the worker; this directory is scratch.
       artifactsRoot: config.execution.scratchRoot,
-      ...(config.execution.model === undefined ? {} : { model: config.execution.model }),
+      model,
+      broker: {
+        upstreamBaseUrl,
+        credential,
+        maxRequests: config.execution.broker.maxRequests,
+      },
       maxUsd: config.execution.maxUsd,
       ...(config.execution.bwrapPath === undefined
         ? {}

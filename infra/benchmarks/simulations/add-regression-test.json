@@ -1,0 +1,18 @@
+{
+  "benchmarkId": "add-regression-test",
+  "benchmarkVersion": "1.0.0",
+  "outcome": "solved",
+  "note": "scripted fix: one new regression test file, implementation untouched",
+  "writes": [
+    {
+      "path": "test/regression.test.js",
+      "content": "import assert from 'node:assert/strict';\nimport { test } from 'node:test';\n\nimport { slugify } from '../src/slugify.js';\n\n// Regression: repeated separators and surrounding punctuation must collapse to a single\n// hyphen, and must not produce empty segments at either end.\ntest('slugify collapses repeated separators', () => {\n  assert.equal(slugify('  Hello   World!!  '), 'hello-world');\n});\n\ntest('slugify strips leading and trailing punctuation', () => {\n  assert.equal(slugify('--Hello World--'), 'hello-world');\n});\n"
+    }
+  ],
+  "usage": {
+    "tokensIn": 1420,
+    "tokensOut": 320
+  },
+  "toolInvocations": 6,
+  "retries": 0
+}

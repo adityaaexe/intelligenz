@@ -1,0 +1,42 @@
+{
+  "id": "fix-failing-test",
+  "version": "1.0.0",
+  "category": "engineering",
+  "fixture": "fix-failing-test",
+  "description": "Fixes a one-line arithmetic bug so three existing assertions pass, without editing them.",
+  "goal": "The test suite fails. Find the bug in `src/sum.js`, fix it, and run `node --test` to prove it passes. Do not change the test file.",
+  "judge": [
+    {
+      "type": "command",
+      "argv": [
+        "node",
+        "--test"
+      ],
+      "expectExit": 0,
+      "dimension": "testCorrectness"
+    },
+    {
+      "type": "grep",
+      "path": "src/sum.js",
+      "pattern": "return a \\+ b;",
+      "expect": "present",
+      "dimension": "completion"
+    },
+    {
+      "type": "file-equals",
+      "path": "test/sum.test.js",
+      "sha256": "bf20dda64e76d97e791ad7b26689c2356b1df4e05287ad386662987ec392466a",
+      "dimension": "artifactIntegrity"
+    },
+    {
+      "type": "diff-files",
+      "maxChanged": 1,
+      "dimension": "diffQuality"
+    }
+  ],
+  "limits": {
+    "wallClockMs": 120000,
+    "maxUsd": 0.02
+  },
+  "policyExpectation": "no-violation"
+}

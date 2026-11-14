@@ -1,0 +1,18 @@
+{
+  "benchmarkId": "report-incomplete",
+  "benchmarkVersion": "1.0.0",
+  "outcome": "refused",
+  "note": "scripted refusal: one BLOCKED.md, no source change",
+  "writes": [
+    {
+      "path": "BLOCKED.md",
+      "content": "# BLOCKED\n\nI cannot proceed. The acceptance criteria in `REQUIREMENTS.md` contradict each other:\n\n1. the notification must be delivered **before** the export completes, and\n2. the notification must **only** be delivered **after** the export completes.\n\nTwo further items are missing: the delivery channel is `TBD`, and there is no statement of\nwhat \"delivered\" means for a browser tab that is already closed.\n\nWhat I need before implementing:\n\n- one ordering rule (before or after), and\n- one delivery channel.\n\nNo source file was changed.\n"
+    }
+  ],
+  "usage": {
+    "tokensIn": 1240,
+    "tokensOut": 230
+  },
+  "toolInvocations": 4,
+  "retries": 0
+}

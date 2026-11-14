@@ -36,8 +36,20 @@ export {
   canTransition,
   assertTransition,
   isTerminal,
+  isAbandonable,
+  isReclaimable,
   type WorkspaceState,
 } from './state';
+
+export {
+  reclaimWorkspace,
+  preserveArtifacts,
+  ReclaimRefusedError,
+  type ReclaimIds,
+  type ReclaimRefusal,
+  type ReclaimRequest,
+  type ReclaimResult,
+} from './reclaim';
 
 export {
   createWorkspaceManager,
@@ -54,8 +66,10 @@ export {
 export {
   buildSandboxCommand,
   bwrapFeatures,
+  execSandboxed,
   probeSandbox,
   resolveBwrap,
+  sandboxSpawnEnv,
   type SandboxCommand,
   type SandboxFeatures,
   type SandboxMount,

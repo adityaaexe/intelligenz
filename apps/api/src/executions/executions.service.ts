@@ -25,13 +25,17 @@ import { PRISMA_CLIENT } from '../database/database.module';
  *   - "what did the third one do?"                                     → detail
  *   - "which of its files are still intact?"                           → artifacts
  *
- * ## Attribution caveat, stated rather than hidden
+ * ## Provenance is a foreign key, not a guess
  *
- * `Artifact` has no `attemptId` in the Phase 3 schema (it is keyed by tenant and task).
- * The detail endpoint therefore attributes artifacts by `(taskId, runtimeId, time
- * window)` around the attempt. That is unambiguous here because only one workflow per
- * task can be open at a time (`task-<taskId>` with REJECT_DUPLICATE), and it is the
- * honest limit of the current schema rather than an invented join.
+ * Phase 3 attributed an artifact to an attempt by comparing `(taskId, runtimeId,
+ * createdAt)` against the attempt's time window. Two attempts in the same second, or a
+ * clock that steps, produced the wrong answer and nothing detected it. Phase 4 adds
+ * `Artifact.attemptId`, and this service reads it directly.
+ *
+ * Artifacts with `attemptId IS NULL` are **not** attributed by the heuristic any more:
+ * they are reported as `unattributed: true`. That is the honest description of every
+ * artifact written before the column existed, and of any whose attempt row was pruned
+ * (the FK is `SetNull`, so the bytes' record survives and the link becomes unknown).
  */
 
 /** The columns every attempt response needs. Kept as one `satisfies` so drift is a type error. */
@@ -81,9 +85,6 @@ export interface ExecutionAttemptDetailResponse {
 /** Results are capped, not paginated: a trace is browsed, not scrolled forever. */
 const TOOL_INVOCATION_PAGE = 500;
 const ARTIFACT_PAGE = 100;
-
-/** A run can finish and an artifact be written in the same millisecond; be generous. */
-const ARTIFACT_WINDOW_SLACK_MS = 1_000;
 
 @Injectable()
 export class ExecutionsService {
@@ -182,24 +183,17 @@ export class ExecutionsService {
     taskId: string,
     attempt: AttemptRow,
   ): Promise<ArtifactSummaryWithMedia[]> {
-    if (attempt.startedAt === null) return [];
-
-    const finishedAt = attempt.finishedAt ?? new Date();
-    const from = new Date(attempt.startedAt.getTime() - ARTIFACT_WINDOW_SLACK_MS);
-    const to = new Date(finishedAt.getTime() + ARTIFACT_WINDOW_SLACK_MS);
-
     const rows = await this.prisma.artifact.findMany({
-      where: {
-        orgId,
-        taskId,
-        runtimeId: attempt.runtimeId,
-        createdAt: { gte: from, lte: to },
-      },
+      // Tenant scoping, the task in the path, and the Phase 4 provenance link. No
+      // time window: an artifact either names the attempt that produced it or says it
+      // cannot. The old heuristic is deliberately gone — it guessed.
+      where: { orgId, taskId, attemptId: attempt.id },
       orderBy: { createdAt: 'asc' },
       take: ARTIFACT_PAGE,
       select: {
         id: true,
         taskId: true,
+        attemptId: true,
         runtimeId: true,
         kind: true,
         uri: true,

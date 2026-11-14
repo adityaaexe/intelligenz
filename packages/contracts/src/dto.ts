@@ -48,19 +48,97 @@ export const CreateProjectInput = z
 
 export type CreateProjectInput = z.infer<typeof CreateProjectInput>;
 
+/**
+ * Execution profiles a task may request. Deliberately a closed set: the profile is
+ * part of an approval's binding and a free-text value would make "the same profile"
+ * unfalsifiable. Adding one is a policy change, not a client choice.
+ */
+export const ExecutionProfile = z.enum(['standard', 'heavy']);
+export type ExecutionProfile = z.infer<typeof ExecutionProfile>;
+
 export const CreateTaskInput = z
   .object({
     title: z.string().trim().min(1).max(120),
     goal: z.string().trim().min(1).max(4000),
-    riskClass: RiskClass,
+    /**
+     * **Advisory only** since Phase 4 (D-006). The server derives the effective class
+     * in `apps/api/src/risk` and stores that; this field is kept so an existing client
+     * does not break, and so a disagreement between what the caller asserted and what
+     * the policy derived can be recorded (`clientAttemptedDowngrade`) instead of
+     * silently dropped. Optional because a caller no longer has to guess a class.
+     */
+    riskClass: RiskClass.optional(),
     // Optional at the boundary: the database default ('normal') is the single
     // place that decision is made.
     priority: TaskPriority.optional(),
     acceptanceCriteria: z.array(z.string().trim().min(1).max(1000)).max(20),
+    /**
+     * The execution profile the task is expected to run under. Part of the approval
+     * binding: a grant for `standard` must not authorise `heavy`. Server default is
+     * `standard` (`DEFAULT_EXECUTION_PROFILE` in the API).
+     */
+    executionProfile: ExecutionProfile.optional(),
+    /**
+     * Where the work will be checked out from, and the exact commit it is pinned to.
+     * Both are part of the approval binding and of the repository-trust signal: a repo
+     * is `trusted` only when it matches an allowlisted source AND the commit is pinned.
+     */
+    sourceRef: z.string().trim().min(1).max(500).optional(),
+    baseCommit: z.string().trim().regex(/^[0-9a-f]{7,64}$/, {
+      message: 'baseCommit must be 7-64 lower-case hex characters',
+    }).optional(),
+    /**
+     * Server-owned fields. Declared so `.strict()` accepts a body that still carries
+     * them (a stale client, or someone probing for a bypass) and then dropped before
+     * the service sees it. They are never read: a client cannot label its own work.
+     */
+    riskSource: z.unknown().optional(),
+    derivedRiskClass: z.unknown().optional(),
+    riskPolicyVersion: z.unknown().optional(),
+    riskFactors: z.unknown().optional(),
+  })
+  .strict()
+  .transform((value) => {
+    const {
+      riskSource,
+      derivedRiskClass,
+      riskPolicyVersion,
+      riskFactors,
+      ...accepted
+    } = value;
+
+    // Explicitly discarded. `void` reads keep the bindings meaningful to the type
+    // checker and to a reviewer; the request succeeds with server values.
+    void riskSource;
+    void derivedRiskClass;
+    void riskPolicyVersion;
+    void riskFactors;
+
+    return accepted;
+  });
+
+export type CreateTaskInput = z.infer<typeof CreateTaskInput>;
+
+/**
+ * The execution request. A body is optional (`RunTaskInput.default({})` at the route),
+ * so `POST /run` with no body keeps working.
+ *
+ * Everything here is an **assertion**, not a command: the API compares it with the
+ * binding recorded on the approval and refuses on a mismatch. The grant is for
+ * (content, profile, source, commit); a run that intends to use a different profile or
+ * checkout cannot spend it.
+ */
+export const RunTaskInput = z
+  .object({
+    executionProfile: ExecutionProfile.optional(),
+    sourceRef: z.string().trim().min(1).max(500).optional(),
+    baseCommit: z.string().trim().regex(/^[0-9a-f]{7,64}$/, {
+      message: 'baseCommit must be 7-64 lower-case hex characters',
+    }).optional(),
   })
   .strict();
 
-export type CreateTaskInput = z.infer<typeof CreateTaskInput>;
+export type RunTaskInput = z.infer<typeof RunTaskInput>;
 
 /**
  * Status change payload.

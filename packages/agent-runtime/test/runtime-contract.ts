@@ -33,11 +33,31 @@ import {
  * 3. **Determinism.** `deterministic: false` skips the last test, and a skipped test
  *    is visible in the report rather than silently green. An LLM-backed adapter
  *    cannot pass it, and pretending otherwise is the dishonesty ADR-006 warns about.
+ * 4. **A live model.** Cases 7 and 8 need a run that actually *succeeds*. An adapter
+ *    backed by a paid provider cannot promise that on a machine with no quota, so the
+ *    caller supplies `liveProvider: { skip: true, reason }` and the two cases are
+ *    reported as skipped, with the reason in the report. Cases 1–6 do not need one:
+ *    they assert the result *contract* — shape, union, summary, usage, cancel,
+ *    timeout — which holds for a structured refusal as well as a completed run.
  */
 
 export interface RuntimeContractContext {
   /** Absolute directory the adapter may write artifacts into. */
   readonly artifactRoot: string;
+}
+
+/**
+ * Whether the two cases that need a real, succeeded model run can execute.
+ *
+ * `skip` exists so an adapter whose provider is metered or absent does not turn a
+ * default test run red for an environmental reason. The reason is part of the report,
+ * never a silent green.
+ */
+export interface LiveProviderGate {
+  /** `true` when cases 7 and 8 cannot run and must be reported as skipped. */
+  readonly skip: boolean;
+  /** One line naming exactly what is missing. Printed as the skipped suite's name. */
+  readonly reason: string;
 }
 
 export type RuntimeContractFactory = (
@@ -53,10 +73,16 @@ export interface RuntimeContractOptions {
   readonly resolveArtifact?: (uri: string) => Promise<Buffer>;
   /** Extra fields merged into every request the suite issues. */
   readonly request?: Partial<ExecutionRequest>;
+  /**
+   * Default: cases 7 and 8 run. Supply `{ skip: true, reason }` when the adapter needs
+   * a metered or unavailable provider; the two cases are then skipped, visibly.
+   */
+  readonly liveProvider?: LiveProviderGate;
 }
 
 const CORRELATION_ID = '11111111-1111-5111-8111-111111111111';
 const STATUSES = ['succeeded', 'failed', 'timeout', 'cancelled'] as const;
+const SUCCEEDED_PROBES = 6;
 
 export function describeRuntimeContract(
   factory: RuntimeContractFactory,
@@ -65,6 +91,10 @@ export function describeRuntimeContract(
   const timeoutProbeMs = options.timeoutProbeMs ?? 1;
   const deterministic = options.deterministic ?? true;
   const resolveArtifact = options.resolveArtifact ?? ((uri: string) => readFile(uri));
+  const liveProvider = options.liveProvider ?? {
+    skip: false,
+    reason: 'requires a live provider',
+  };
 
   describe('runtime contract', () => {
     let runtime: AgentRuntime;
@@ -162,40 +192,52 @@ export function describeRuntimeContract(
       expect(result.error?.retryable).toBe(true);
     });
 
-    it('7. returns artifact references that resolve to files with matching checksums', async () => {
-      const { result } = await findSucceedingExecution(runtime, requestFor);
+    // Cases 7 and 8 need a run that actually succeeded, which a metered or absent
+    // provider cannot promise. They are grouped so the skip is a single, visible suite
+    // whose name carries the reason — never a silently green run.
+    const liveCases = (): void => {
+      it('7. returns artifact references that resolve to files with matching checksums', async () => {
+        const { result } = await findSucceedingExecution(runtime, requestFor);
 
-      expect(result.artifacts.length, 'a succeeded run must produce evidence').toBeGreaterThan(0);
+        expect(result.artifacts.length, 'a succeeded run must produce evidence').toBeGreaterThan(0);
 
-      for (const artifact of result.artifacts) {
-        const parsed = ArtifactReference.safeParse(artifact);
-        if (!parsed.success) expect.fail(JSON.stringify(parsed.error.issues));
+        for (const artifact of result.artifacts) {
+          const parsed = ArtifactReference.safeParse(artifact);
+          if (!parsed.success) expect.fail(JSON.stringify(parsed.error.issues));
 
-        expect(artifact.kind.length).toBeGreaterThan(0);
+          expect(artifact.kind.length).toBeGreaterThan(0);
 
-        const bytes = await resolveArtifact(artifact.uri);
+          const bytes = await resolveArtifact(artifact.uri);
 
-        expect(bytes.byteLength).toBe(artifact.sizeBytes);
-        expect(createHash('sha256').update(bytes).digest('hex')).toBe(artifact.checksum);
-      }
-    });
+          expect(bytes.byteLength).toBe(artifact.sizeBytes);
+          expect(createHash('sha256').update(bytes).digest('hex')).toBe(artifact.checksum);
+        }
+      });
 
-    it.runIf(deterministic)(
-      '8. is deterministic: the same taskId twice yields the same summary and checksums',
-      async () => {
-        const { request } = await findSucceedingExecution(runtime, requestFor);
+      it.runIf(deterministic)(
+        '8. is deterministic: the same taskId twice yields the same summary and checksums',
+        async () => {
+          const { request } = await findSucceedingExecution(runtime, requestFor);
 
-        const first = await runtime.execute(request, new AbortController().signal);
-        const second = await runtime.execute(request, new AbortController().signal);
+          const first = await runtime.execute(request, new AbortController().signal);
+          const second = await runtime.execute(request, new AbortController().signal);
 
-        expect(first.status).toBe('succeeded');
-        expect(second.status).toBe('succeeded');
-        expect(second.summary).toBe(first.summary);
-        expect(second.artifacts.map((artifact) => artifact.checksum)).toEqual(
-          first.artifacts.map((artifact) => artifact.checksum),
-        );
-      },
-    );
+          expect(first.status).toBe('succeeded');
+          expect(second.status).toBe('succeeded');
+          expect(second.summary).toBe(first.summary);
+          expect(second.artifacts.map((artifact) => artifact.checksum)).toEqual(
+            first.artifacts.map((artifact) => artifact.checksum),
+          );
+        },
+      );
+    };
+
+    if (liveProvider.skip) {
+      describe.skip(`skipped: ${liveProvider.reason}`, liveCases);
+    } else {
+      // No wrapper when the cases run: their names stay exactly as they were.
+      liveCases();
+    }
   });
 }
 
@@ -210,7 +252,7 @@ async function findSucceedingExecution(
 ): Promise<{ request: ExecutionRequest; result: ExecutionResult }> {
   let last: ExecutionResult | undefined;
 
-  for (let attempt = 0; attempt < 6; attempt += 1) {
+  for (let attempt = 0; attempt < SUCCEEDED_PROBES; attempt += 1) {
     const request = requestFor(`probe-${attempt}`);
     const result = await runtime.execute(request, new AbortController().signal);
 
@@ -219,9 +261,49 @@ async function findSucceedingExecution(
     last = result;
   }
 
-  throw new Error(
-    `The adapter produced no succeeded execution in 6 attempts (last status: ${
-      last?.status ?? 'none'
-    }). The contract suite cannot verify artifacts without one.`,
+  throw new Error(explainNoSucceededExecution(last));
+}
+
+/**
+ * Why the probe found nothing succeeded.
+ *
+ * The bare attempt count is misleading when the provider refused every call: an
+ * exhausted free tier and a broken adapter look identical, and the reader is sent to
+ * the wrong place. An adapter that reports `PROVIDER_REFUSED` (the `opencode-cli`
+ * adapter names the upstream status in the message) is translated here so a quota
+ * failure says **quota**. Exported for its own unit test; it is pure.
+ */
+export function explainNoSucceededExecution(last: ExecutionResult | undefined): string {
+  const error = last?.error;
+  const message = error?.message ?? '';
+  const status = /\banswered (\d{3}) for all\b/.exec(message)?.[1];
+
+  // Classified on the status first: the refusal message always contains the phrase
+  // "(quota, balance, or entitlement)", so a bare word match would call every 4xx a
+  // quota failure. Only an explicit 429, or a body that actually says the quota was
+  // exhausted, counts.
+  const quota =
+    status === '429' ||
+    /RESOURCE_EXHAUSTED|quota[\s-]*(?:exhausted|exceeded)|out of quota/i.test(message);
+
+  if (quota) {
+    return (
+      `Provider quota exhausted (HTTP ${status ?? '429'}): all ${SUCCEEDED_PROBES} contract ` +
+      'probes were refused before any run succeeded, so the artifact checksums cannot be ' +
+      'verified. This is provider-side quota, not an adapter defect, and retrying cannot fix it.'
+    );
+  }
+
+  if (error?.code === 'PROVIDER_REFUSED') {
+    return (
+      `The provider refused all ${SUCCEEDED_PROBES} contract probes (HTTP ${status ?? 'unknown'}), ` +
+      'so no run produced artifacts to verify. The credential reached the provider and was ' +
+      'rejected: this is a provider-side refusal (balance or entitlement), not an adapter defect.'
+    );
+  }
+
+  return (
+    `The adapter produced no succeeded execution in ${SUCCEEDED_PROBES} attempts (last status: ` +
+    `${last?.status ?? 'none'}). The contract suite cannot verify artifacts without one.`
   );
 }

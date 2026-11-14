@@ -1,6 +1,8 @@
 import { createPrismaClient, type PrismaClient } from '@intelligenz/database';
 import argon2 from 'argon2';
 
+import { computeTaskContentHash } from '../../src/approvals/approval-binding';
+import { DEFAULT_EXECUTION_PROFILE, RISK_POLICY_VERSION } from '../../src/risk/risk-policy';
 import { testDatabaseUrl } from './env';
 
 /**
@@ -276,6 +278,22 @@ export async function seedFixtures(prisma: PrismaClient): Promise<Fixtures> {
       riskClass: 'HIGH',
       status: 'PENDING',
       requestedById: memberA.id,
+      // Phase 4: the fixture is a bound, expiring grant like any row the API writes.
+      // A fixture with a null hash would be `APPROVAL_UNBOUND` at the execution gate,
+      // which is correct behaviour and the wrong starting point for every other test.
+      taskContentHash: computeTaskContentHash({
+        title: 'Alpha high-risk task',
+        goal: 'Fixture task created by the API test suite.',
+        acceptanceCriteria: [],
+        riskClass: 'HIGH',
+        executionProfile: DEFAULT_EXECUTION_PROFILE,
+        sourceRef: null,
+        baseCommit: null,
+      }),
+      riskClassAtApproval: 'HIGH',
+      policyVersion: RISK_POLICY_VERSION,
+      executionProfile: DEFAULT_EXECUTION_PROFILE,
+      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1_000),
     },
   });
 

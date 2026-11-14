@@ -51,6 +51,13 @@ export interface ArtifactSummary {
   readonly checksum: string;
   readonly sizeBytes: number;
   readonly runtimeId: string;
+  /**
+   * Phase 4 provenance link. `null` means the artifact predates the column (or its
+   * attempt was pruned); `unattributed` makes that explicit instead of letting a
+   * consumer read `null` as "assume the latest run".
+   */
+  readonly attemptId: string | null;
+  readonly unattributed: boolean;
   readonly createdAt: string;
 }
 
@@ -63,6 +70,10 @@ export interface ApprovalSummary {
   readonly decisionNote: string | null;
   readonly createdAt: string;
   readonly decidedAt: string | null;
+  /** Phase 4 grant lifetime. Null on rows written before the columns existed. */
+  readonly expiresAt: string | null;
+  readonly consumedAt: string | null;
+  readonly revokedAt: string | null;
 }
 
 export interface TaskDetailResponse extends TaskResponse {

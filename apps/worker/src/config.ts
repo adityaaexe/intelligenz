@@ -1,6 +1,14 @@
 import { existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
+
+import type { CredentialSource } from '@intelligenz/egress-broker';
+
+import {
+  RESOURCE_PROFILE_NAMES,
+  isResourceProfileName,
+  type ResourceProfileName,
+} from './resource-profiles';
 
 /**
  * Worker configuration — read once at boot from the environment (contract §4, §15 A5).
@@ -38,17 +46,33 @@ export interface WorkerConfig {
    */
   readonly execution: {
     readonly runtimeId: AgentRuntimeId;
-    /** Provider-qualified model id, passed to the adapter when it is real. */
+    /**
+     * **Upstream** model id, sent to the provider by the broker (`AGENT_MODEL`).
+     * Required when the runtime is real: the sandbox sees `izbroker/<key>`, and the
+     * host maps that onto this id.
+     */
     readonly model: string | undefined;
     /** Hard spend cap in USD for one real run. Defaults to `DEFAULT_AGENT_MAX_USD`. */
     readonly maxUsd: number;
     readonly bwrapPath: string | undefined;
     /**
-     * Scratch directory the **adapter** owns: its per-run config, egress unix socket
-     * and raw transcript, before the worker copies evidence into the workspace.
+     * Provider authentication for a real run. Host-side only: the broker injects the
+     * credential, and the sandbox never holds one.
+     */
+    readonly broker: {
+      /** `AGENT_BROKER_UPSTREAM_URL` — e.g. `https://provider.example/v1`. */
+      readonly upstreamBaseUrl: string | undefined;
+      /** Where the credential is read: an opencode SQLite row, or an env variable. */
+      readonly credential: CredentialSource | undefined;
+      /** Requests one attempt may make through the broker. */
+      readonly maxRequests: number;
+    };
+    /**
+     * Scratch directory the **adapter** owns: its per-run config, broker socket and
+     * raw transcript, before the worker copies evidence into the workspace.
      *
      * Separate from `artifactRoot` because the adapter builds
-     * `<scratch>/opencode-cli/<taskId>-<suffix>/egress/egress.sock`, and a unix socket
+     * `<scratch>/opencode-cli/<taskId>-<suffix>/broker/broker.sock`, and a unix socket
      * path must stay under 107 bytes. With a UUID task id and a repository-relative
      * artifact root the path is 113 bytes, libuv silently binds a truncated name, and
      * every provider call fails with `ECONNRESET`. See `assertAdapterScratchBudget`.
@@ -61,6 +85,26 @@ export interface WorkerConfig {
     readonly budgetUsd: number;
     /** Simulated per-step delay; the stand-in for a real runtime's latency. */
     readonly stepDelayMs: number;
+  };
+  /**
+   * Phase 4 resource enforcement. Server-owned: nothing in this block is read from a
+   * task, a request body or an agent's output.
+   */
+  readonly resources: {
+    /**
+     * Where per-attempt cgroups are created. Must be the subtree the setup script
+     * delegated; the capability probe reads this path and nothing else.
+     */
+    readonly cgroupRoot: string;
+    /** `WORKER_RESOURCE_PROFILE` — an operator override of the selection policy. */
+    readonly profile: ResourceProfileName | undefined;
+    /**
+     * Reaper period. `WORKER_REAPER_INTERVAL_MS`, default 60 s. Also sets the grace
+     * window for an expired lease: 2 × this value.
+     */
+    readonly reaperIntervalMs: number;
+    /** `WORKER_REAPER_ENABLED=false` disables the loop; the pass is still callable. */
+    readonly reaperEnabled: boolean;
   };
   /** Dev-only levers. Both are inert unless explicitly set. */
   readonly faultInjection: {
@@ -258,13 +302,13 @@ export function assertAdapterScratchBudget(scratchRoot: string): void {
     scratchRoot,
     'opencode-cli',
     `${'0'.repeat(36)}-12345678`,
-    'egress',
-    'egress.sock',
+    'broker',
+    'broker.sock',
   );
 
   if (worstCase.length > UNIX_SOCKET_PATH_BUDGET) {
     throw new Error(
-      `AGENT_RUNTIME_SCRATCH_ROOT resolves to "${scratchRoot}", and the adapter's egress ` +
+      `AGENT_RUNTIME_SCRATCH_ROOT resolves to "${scratchRoot}", and the adapter's broker ` +
         `socket would be ${String(worstCase.length)} bytes (limit ${String(UNIX_SOCKET_PATH_BUDGET)}, ` +
         `worst-case run id ${String(WORST_CASE_RUN_ID)} characters). ` +
         'Choose a shorter path (the default is /tmp/intelligenz-runtime). A longer one ' +
@@ -286,6 +330,109 @@ export function resolveScratchRoot(
   return isAbsolute(configured) ? resolve(configured) : resolve(workspaceRoot, configured);
 }
 
+/** Requests one attempt may make through the egress broker. */
+export const DEFAULT_BROKER_MAX_REQUESTS = 400;
+
+/** Where opencode keeps the credential on this host (`auth.json` does not exist). */
+export function defaultCredentialDatabasePath(): string {
+  return join(homedir(), '.local', 'share', 'opencode', 'opencode.db');
+}
+
+function assertHttpUrl(name: string, value: string): string {
+  let parsed: URL;
+
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`${name} must be an absolute http(s) URL, received "${value}".`);
+  }
+
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    throw new Error(`${name} must be http or https, received "${parsed.protocol}".`);
+  }
+
+  return value;
+}
+
+/**
+ * Provider authentication for a real run.
+ *
+ * Two sources, because two deployments are legitimate: an operator machine where
+ * opencode already holds the credential in its SQLite store, and a container where the
+ * credential arrives from a secret manager as an environment variable. The adapter
+ * never sees either — the broker reads it per request.
+ *
+ * Nothing here reads the value. A boot check that printed a credential would be the
+ * leak it was meant to prevent.
+ */
+export function resolveBrokerConfig(
+  env: NodeJS.ProcessEnv,
+  workspaceRoot: string = findWorkspaceRoot(),
+): {
+  readonly upstreamBaseUrl: string | undefined;
+  readonly credential: CredentialSource | undefined;
+  readonly maxRequests: number;
+} {
+  const rawUpstream = readOptionalString(env, 'AGENT_BROKER_UPSTREAM_URL');
+  const upstreamBaseUrl =
+    rawUpstream === undefined
+      ? undefined
+      : assertHttpUrl('AGENT_BROKER_UPSTREAM_URL', rawUpstream);
+
+  const credentialEnv = readOptionalString(env, 'AGENT_BROKER_CREDENTIAL_ENV');
+  const integrationId = readOptionalString(env, 'AGENT_BROKER_CREDENTIAL');
+  const rawDatabase = readOptionalString(env, 'AGENT_BROKER_CREDENTIAL_DB');
+
+  const databasePath =
+    rawDatabase === undefined
+      ? defaultCredentialDatabasePath()
+      : isAbsolute(rawDatabase)
+        ? resolve(rawDatabase)
+        : resolve(workspaceRoot, rawDatabase);
+
+  let credential: CredentialSource | undefined;
+
+  if (credentialEnv !== undefined) {
+    credential = { kind: 'env', name: credentialEnv };
+  } else if (integrationId !== undefined) {
+    credential = { kind: 'opencode-db', databasePath, integrationId };
+  }
+
+  return {
+    upstreamBaseUrl,
+    credential,
+    maxRequests: readInteger(env, 'AGENT_BROKER_MAX_REQUESTS', DEFAULT_BROKER_MAX_REQUESTS),
+  };
+}
+
+function readResourceProfile(env: NodeJS.ProcessEnv): ResourceProfileName | undefined {
+  const raw = readOptionalString(env, 'WORKER_RESOURCE_PROFILE');
+  if (raw === undefined) return undefined;
+
+  const upper = raw.toUpperCase();
+
+  if (!isResourceProfileName(upper)) {
+    // Refusing at boot, not silently falling back: a typo that silently selects SMALL
+    // would cap a real run at 512 MiB and look like an OOM bug.
+    throw new Error(
+      `WORKER_RESOURCE_PROFILE must be one of ${RESOURCE_PROFILE_NAMES.join('|')}, received "${raw}".`,
+    );
+  }
+
+  return upper;
+}
+
+function readBoolean(env: NodeJS.ProcessEnv, name: string, fallback: boolean): boolean {
+  const raw = readOptionalString(env, name);
+  if (raw === undefined) return fallback;
+
+  const lowered = raw.toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(lowered)) return true;
+  if (['0', 'false', 'no', 'off'].includes(lowered)) return false;
+
+  throw new Error(`${name} must be a boolean, received "${raw}".`);
+}
+
 export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerConfig {
   const databaseUrl = readString(env, 'DATABASE_URL', '');
 
@@ -305,6 +452,7 @@ export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerCo
   const workspaceRootDirectory = findWorkspaceRoot();
   const runtimeId = readAgentRuntime(env);
   const maxUsd = readOptionalNumber(env, 'AGENT_MAX_USD') ?? DEFAULT_AGENT_MAX_USD;
+  const broker = resolveBrokerConfig(env, workspaceRootDirectory);
 
   if (runtimeId === 'opencode-cli') {
     // Fail at boot, not 90 seconds and one provider charge into a run.
@@ -318,6 +466,34 @@ export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerCo
       throw new Error(
         `AGENT_MAX_USD must be greater than 0 when AGENT_RUNTIME=${runtimeId}; ` +
           `received "${String(env['AGENT_MAX_USD'])}". Unset means ${DEFAULT_AGENT_MAX_USD}.`,
+      );
+    }
+
+    // Phase 4: the sandbox holds no credential, so the broker is the only way to
+    // authenticate. A deployment that selects the real runtime without it has no
+    // working model channel at all — there is no unproxied fallback to discover at
+    // run time, so it is refused here instead.
+    if (broker.upstreamBaseUrl === undefined) {
+      throw new Error(
+        'AGENT_BROKER_UPSTREAM_URL is required when AGENT_RUNTIME=opencode-cli. The sandbox ' +
+          'holds no provider credential; the host broker is the only authentication path.',
+      );
+    }
+
+    if (broker.credential === undefined) {
+      throw new Error(
+        'A provider credential source is required when AGENT_RUNTIME=opencode-cli. Set ' +
+          'AGENT_BROKER_CREDENTIAL to an opencode integration id (read from ' +
+          'AGENT_BROKER_CREDENTIAL_DB) or AGENT_BROKER_CREDENTIAL_ENV to an environment ' +
+          'variable name.',
+      );
+    }
+
+    if (readOptionalString(env, 'AGENT_MODEL') === undefined) {
+      throw new Error(
+        'AGENT_MODEL is required when AGENT_RUNTIME=opencode-cli: it is the upstream model ' +
+          'id the broker sends. There is no default, because a wrong one is a charge, not ' +
+          'a crash.',
       );
     }
   }
@@ -341,6 +517,7 @@ export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerCo
       model: readOptionalString(env, 'AGENT_MODEL'),
       maxUsd,
       bwrapPath: readOptionalString(env, 'AGENT_BWRAP_PATH'),
+      broker,
       scratchRoot: resolveScratchRoot(env['AGENT_RUNTIME_SCRATCH_ROOT'], workspaceRootDirectory),
     },
     runtime: {
@@ -350,6 +527,12 @@ export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerCo
       timeoutMs: readInteger(env, 'AGENT_TIMEOUT_MS', 50_000),
       budgetUsd: readNumber(env, 'AGENT_BUDGET_USD', 0),
       stepDelayMs: readInteger(env, 'AGENT_STEP_DELAY_MS', 40),
+    },
+    resources: {
+      cgroupRoot: readString(env, 'WORKER_CGROUP_ROOT', '/sys/fs/cgroup/intelligenz'),
+      profile: readResourceProfile(env),
+      reaperIntervalMs: readInteger(env, 'WORKER_REAPER_INTERVAL_MS', 60_000),
+      reaperEnabled: readBoolean(env, 'WORKER_REAPER_ENABLED', true),
     },
     faultInjection: {
       failExecuteOnce: faultInject

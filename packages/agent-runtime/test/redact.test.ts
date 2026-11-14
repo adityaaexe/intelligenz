@@ -35,9 +35,23 @@ const CASES: readonly Case[] = [
     leaks: ['eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9', 'SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV'],
   },
   {
-    name: 'sk- provider key',
-    input: 'OPENAI_API_KEY=sk-live-abcdef1234567890',
-    leaks: ['sk-live-abcdef1234567890'],
+    name: 'OpenAI-style sk- key',
+    input: 'OPENAI_API_KEY=sk-proj-abcdef1234567890',
+    leaks: ['sk-proj-abcdef1234567890'],
+  },
+  {
+    // The fixture used to be `sk-live-…`, which the hyphen rule matched — so the test
+    // and the regex agreed on a shape neither provider uses (audit F3). The real token
+    // is `sk_live_`, and it is written bare here so the generic `KEY=value` rule cannot
+    // be what makes this pass.
+    name: 'Stripe-style sk_live_ secret',
+    input: 'the credential printed by the tool was sk_live_​sample0000000000000000000',
+    leaks: ['sk_live_​sample0000000000000000000'],
+  },
+  {
+    name: 'Stripe-style sk_test_ secret',
+    input: 'sk_test_​sample0000000000000000000',
+    leaks: ['sk_test_​sample0000000000000000000'],
   },
   {
     name: 'GitHub personal access token',
@@ -50,9 +64,28 @@ const CASES: readonly Case[] = [
     leaks: ['github_pat_11ABCDEFG0123456789'],
   },
   {
+    // Bare: no `KEY=` name in front, no URL userinfo for the generic URL rule to catch.
+    // Only the `glpat-` family can remove this one.
+    name: 'GitLab personal access token',
+    input: 'clone with glpat-00EXAMPLE000000000000000 then push',
+    leaks: ['glpat-00EXAMPLE000000000000000'],
+  },
+  {
     name: 'AWS access key id',
     input: 'aws_access_key_id = AKIAIOSFODNN7EXAMPLE',
     leaks: ['AKIAIOSFODNN7EXAMPLE'],
+  },
+  {
+    // A hyphenated name: the generic `KEY|SECRET` rule could not cross the `-`, so the
+    // 40-character value survived even though its name says exactly what it is.
+    name: 'AWS secret access key under a hyphenated name',
+    input: 'aws-secret-access-key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+    leaks: ['wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'],
+  },
+  {
+    name: 'AWS secret access key in a JSON dump',
+    input: '"SecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"',
+    leaks: ['wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'],
   },
   {
     name: '32+ hex run',
@@ -76,9 +109,9 @@ const CASES: readonly Case[] = [
   },
   {
     name: 'base64 of an env assignment',
-    // btoa('OPENAI_API_KEY=sk-live-abcdef1234567890')
-    input: `payload ${Buffer.from('OPENAI_API_KEY=sk-live-abcdef1234567890', 'utf8').toString('base64')}`,
-    leaks: ['T1BFTkFJX0FQSV9LRVk9c2stbGl2ZS1hYmNkZWYxMjM0NTY3ODkw'],
+    // btoa('OPENAI_API_KEY=sk_live_​sample0000000000000')
+    input: `payload ${Buffer.from('OPENAI_API_KEY=sk_live_​sample0000000000000', 'utf8').toString('base64')}`,
+    leaks: ['T1BFTkFJX0FQSV9LRVk9c2tfbGl2ZV9hYmNkZWYxMjM0NTY3ODkw'],
   },
   {
     name: 'base64 of a bearer token with a scheme',
@@ -115,7 +148,37 @@ describe('redact', () => {
   });
 
   it('is idempotent', () => {
-    const once = redact('Authorization: Bearer abcdef0123456789.xyz and sk-live-abcdef1234567890');
+    const once = redact('Authorization: Bearer abcdef0123456789.xyz and sk_live_​sample0000000000000');
     expect(redact(once)).toBe(once);
+  });
+
+  /**
+   * False-positive guards. A denylist that eats ordinary text is a denylist developers
+   * route around, and a transcript with holes in it is not evidence.
+   */
+  it('leaves ordinary prose that merely contains "sk" alone', () => {
+    const ordinary = [
+      'the agent will skip the second step and ask for help',
+      'task: rebuild the risk report before Friday',
+      'desk: standing, chair: ergonomic',
+      'the risk assessment is attached',
+    ];
+
+    for (const line of ordinary) {
+      expect(redact(line)).toBe(line);
+    }
+  });
+
+  it('leaves a short glpat- prefix alone, because a prefix is not a token', () => {
+    expect(redact('the env var is named glpat- for short')).toBe(
+      'the env var is named glpat- for short',
+    );
+  });
+
+  it('leaves a git diff that mentions a token-named file alone', () => {
+    // The generic rule deliberately excludes `.` from the name class so a file path in a
+    // diff header is not mistaken for an assignment.
+    const line = 'diff --git a/src/auth-token.js b/src/auth-token.js';
+    expect(redact(line)).toBe(line);
   });
 });

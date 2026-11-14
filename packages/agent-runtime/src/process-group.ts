@@ -26,6 +26,13 @@ import { spawn } from 'node:child_process';
 
 export type KillReason = 'exit' | 'aborted' | 'timeout' | 'cost-cap';
 
+/**
+ * Exit code the placement wrapper uses when it could not join its cgroup. Distinct from
+ * every code the agent could produce so a placement failure is never read as an agent
+ * failure (see `apps/worker/src/termination.ts`: it maps to `workspace_error`).
+ */
+export const CGROUP_PLACEMENT_EXIT = 97;
+
 export interface GroupedProcessOptions {
   readonly file: string;
   readonly args: readonly string[];
@@ -33,7 +40,29 @@ export interface GroupedProcessOptions {
   readonly signal: AbortSignal;
   /** Grace between `SIGTERM` and `SIGKILL`. */
   readonly killGraceMs: number;
-  /** Deliberately minimal: the sandbox clears this again with `--clearenv`. */
+  /**
+   * Move the process into a cgroup **before** it execs.
+   *
+   * This is the only race-free placement. Writing `cgroup.procs` from the parent after
+   * `spawn()` returns is a window in which the sandbox exists and is unaccounted for —
+   * short, but a fork bomb does not need a long window. Instead the spawned program is
+   * a three-line `/bin/sh` that writes **its own pid** into the cgroup and then `exec`s
+   * the real command in the same pid: a shell that has not forked cannot have produced a
+   * child outside the cgroup, and `exec` preserves both the pid and the membership.
+   *
+   * The path is passed as `$1`, never interpolated into the script text.
+   */
+  readonly placement?: { readonly cgroupProcsPath: string };
+  /**
+   * The environment the sandbox process inherits.
+   *
+   * Optional, and the default is itself an allowlist (`PATH` + `LANG`), never
+   * `process.env`. The production caller does not rely on it: `spawnAndCollect` passes
+   * `SandboxCommand.env`, which `buildSandboxCommand` derived from the caller's declared
+   * environment. `--clearenv` inside `bwrap` applies to the command it execs, not to the
+   * `bwrap` process itself — pid 1 in the sandbox's pid namespace, readable at
+   * `/proc/1/environ` — so what is passed here must be scrubbed (audit F1).
+   */
   readonly env?: NodeJS.ProcessEnv;
   /**
    * Called once with the kill function, right after spawn. `cancel(taskId)` uses it to
@@ -54,7 +83,9 @@ export interface GroupedProcessResult {
 
 export function runInProcessGroup(options: GroupedProcessOptions): Promise<GroupedProcessResult> {
   return new Promise((resolvePromise) => {
-    const child = spawn(options.file, [...options.args], {
+    const spawnTarget = withPlacement(options);
+
+    const child = spawn(spawnTarget.file, spawnTarget.args, {
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: options.env ?? { PATH: process.env.PATH ?? '/usr/bin:/bin', LANG: 'C.UTF-8' },
@@ -119,4 +150,39 @@ export function runInProcessGroup(options: GroupedProcessOptions): Promise<Group
 
     child.on('close', (code) => finish(code ?? 1));
   });
+}
+
+/**
+ * The three-line placement wrapper.
+ *
+ * `$$` is the shell's own pid, which is the pid `child_process` returned and the pid
+ * that survives `exec` — so the cgroup membership established here is the membership of
+ * the sandbox and of every process it ever forks. `shift` drops the path, `exec "$@"`
+ * replaces the shell without forking.
+ *
+ * If the write fails the shell exits 97 and the command never runs: an unplaced sandbox
+ * is not started at all, which is the only acceptable outcome when the alternative is an
+ * unbounded one.
+ */
+function withPlacement(options: GroupedProcessOptions): {
+  file: string;
+  args: readonly string[];
+} {
+  if (options.placement === undefined) {
+    return { file: options.file, args: options.args };
+  }
+
+  const script = ['printf "%s\\n" "$$" > "$1" || exit 97', 'shift', 'exec "$@"'].join('; ');
+
+  return {
+    file: '/bin/sh',
+    args: [
+      '-c',
+      script,
+      'intelligenz-cgroup',
+      options.placement.cgroupProcsPath,
+      options.file,
+      ...options.args,
+    ],
+  };
 }

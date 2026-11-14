@@ -46,11 +46,21 @@ export interface SandboxMount {
 
 export interface SandboxOptions {
   /**
-   * Explicit environment allowlist. Keys matching `/KEY|TOKEN|SECRET|PASSWORD/i` are
-   * rejected: a caller cannot smuggle a credential in through the env, because that
-   * is exactly how a secret reaches a log line or a model transcript.
+   * **Required.** The environment inside the sandbox: emitted as `--setenv` assignments
+   * after `--clearenv`, and the only source of the values the host-side `bwrap` process
+   * itself is allowed to inherit (see `sandboxSpawnEnv`).
+   *
+   * Required, not optional, and deliberately so. It used to default to `{}`, which made
+   * "the caller forgot" indistinguishable from "the caller wants only the base
+   * environment" — and the second interpretation is not the dangerous one. A caller that
+   * omits a field gets a compile error instead of a sandbox whose pid 1 carries the
+   * worker's entire environment.
+   *
+   * Keys matching `/KEY|TOKEN|SECRET|PASSWORD/i` are rejected: a caller cannot smuggle a
+   * credential in through the env, because that is exactly how a secret reaches a log
+   * line or a model transcript.
    */
-  readonly env?: Readonly<Record<string, string>>;
+  readonly env: Readonly<Record<string, string>>;
   /** Read-only mounts, usually provider config. This is how opencode reads its config. */
   readonly readOnlyMounts?: readonly SandboxMount[];
   /** Full mount list override for callers that need ephemeral state directories. */
@@ -92,6 +102,53 @@ export interface SandboxFeatures {
 export interface SandboxCommand {
   readonly file: string;
   readonly args: readonly string[];
+  /**
+   * The environment the **`bwrap` process itself** is spawned with.
+   *
+   * This is not the sandbox's environment — that is `--clearenv` plus `--setenv`, and it
+   * applies to the command bwrap execs. `bwrap` itself keeps whatever environment it was
+   * given, and after `--unshare-pid` it (or its first child) is pid 1 in the new
+   * namespace, where `/proc/1/environ` is world-readable from inside. Spawning bwrap
+   * without an `env` therefore hands the whole worker environment to the agent: an
+   * `.git/config` filter, a hook, or a `node -e` one-liner reads it back out.
+   *
+   * Carried on the command so there is no second, skippable step: `execFile(file, args,
+   * { env: command.env })` is the only correct way to run it, and `execSandboxed` below
+   * is the sanctioned helper that does exactly that.
+   */
+  readonly env: Readonly<Record<string, string>>;
+}
+
+/**
+ * The only host environment a sandboxed spawn may inherit.
+ *
+ * `bwrap` needs none of these to run (it is resolved to an absolute path), but a process
+ * with *no* environment at all is a surprising thing to debug, and locale-less children
+ * produce mojibake in evidence. Everything else — credentials, `DATABASE_URL`, proxy
+ * settings, the CI provider's tokens — stays on the host.
+ */
+const SPAWN_ENV_KEYS = ['PATH', 'LANG', 'HOME', 'TMPDIR'] as const;
+
+/**
+ * Build the host-side environment for a sandboxed spawn.
+ *
+ * Values come from the caller's declared environment when present, so `HOME` is the
+ * sandbox's `HOME` and not the operator's, and fall back to `BASE_ENV`. Keys outside
+ * `SPAWN_ENV_KEYS` are dropped rather than forwarded: the run's extras
+ * (`IZ_BROKER_CAPABILITY`, config directories) are for the exec'd command, which receives
+ * them through `--setenv`, and every variable present at pid 1 is readable by the agent.
+ */
+export function sandboxSpawnEnv(
+  env: Readonly<Record<string, string>>,
+): Readonly<Record<string, string>> {
+  const spawn: Record<string, string> = {};
+
+  for (const key of SPAWN_ENV_KEYS) {
+    const value = env[key] ?? BASE_ENV[key];
+    if (value !== undefined) spawn[key] = value;
+  }
+
+  return spawn;
 }
 
 /** Rejected environment keys. An allowlist cannot leak what it refuses to carry. */
@@ -227,7 +284,7 @@ function rlimitArgs(limits: SandboxRlimits | undefined): string[] {
 export function buildSandboxCommand(
   workspace: { readonly rootPath: string },
   argv: readonly string[],
-  options: SandboxOptions = {},
+  options: SandboxOptions,
 ): SandboxCommand {
   if (argv.length === 0) {
     throw new WorkspaceError('SANDBOX_COMMAND_INVALID', 'Refusing to build a sandbox with no command');
@@ -272,7 +329,45 @@ export function buildSandboxCommand(
   args.push('--chdir', '/workspace');
   args.push(...argv);
 
-  return { file, args };
+  return { file, args, env: sandboxSpawnEnv(options.env) };
+}
+
+/**
+ * The sanctioned way to execute a `SandboxCommand` from the host.
+ *
+ * It exists so the spawn environment is not a thing a caller can forget: the `env` comes
+ * from the command, which `buildSandboxCommand` derived from the caller's allowlist, and
+ * this helper is the only place in the package that spawns a sandbox with arguments a
+ * caller controls. `execFile` with `env: command.env` and never `shell: true`.
+ *
+ * Rejects on a non-zero exit, matching `child_process.execFile`'s promise contract:
+ * callers that treat "not a git repository" as *no evidence* catch, and callers that
+ * treat it as a failure let it propagate.
+ */
+export function execSandboxed(
+  command: SandboxCommand,
+  options: { readonly timeoutMs: number; readonly maxBuffer: number },
+): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolvePromise, reject) => {
+    execFile(
+      command.file,
+      [...command.args],
+      {
+        timeout: options.timeoutMs,
+        maxBuffer: options.maxBuffer,
+        encoding: 'utf8',
+        env: command.env,
+      },
+      (error, stdout, stderr) => {
+        if (error !== null) {
+          reject(Object.assign(error, { stdout, stderr }));
+          return;
+        }
+
+        resolvePromise({ stdout, stderr });
+      },
+    );
+  });
 }
 
 export interface SandboxProbeResult {
@@ -298,7 +393,7 @@ function run(command: SandboxCommand, timeoutMs: number): Promise<RunOutcome> {
     execFile(
       command.file,
       [...command.args],
-      { timeout: timeoutMs, maxBuffer: 1024 * 1024, encoding: 'utf8' },
+      { timeout: timeoutMs, maxBuffer: 1024 * 1024, encoding: 'utf8', env: command.env },
       (error, stdout, stderr) => {
         const code =
           error === null ? 0 : typeof (error as { code?: unknown }).code === 'number'
@@ -326,7 +421,11 @@ function run(command: SandboxCommand, timeoutMs: number): Promise<RunOutcome> {
  */
 export async function probeSandbox(
   workspace: { readonly rootPath: string },
-  options: SandboxOptions = {},
+  // The default is an **empty allowlist**, not an inherited one: a capability probe needs
+  // no environment beyond the builder's own `BASE_ENV`, and `{ env: {} }` is the only
+  // safe default for a function that exists to measure isolation. It is still passed to
+  // the builder explicitly — the builder has no default of its own.
+  options: SandboxOptions = { env: {} },
 ): Promise<SandboxProbeResult> {
   const evidence: Record<string, string> = {};
   const build = (argv: readonly string[]): SandboxCommand =>

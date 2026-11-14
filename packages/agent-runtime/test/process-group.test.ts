@@ -56,6 +56,8 @@ describe('runInProcessGroup', () => {
       timeoutMs: 250,
       signal: new AbortController().signal,
       killGraceMs: 250,
+      // Required, never defaulted: see `GroupedProcessOptions.env`.
+      env: { PATH: '/usr/bin:/bin' },
     });
 
     expect(result.reason).toBe('timeout');
@@ -75,6 +77,7 @@ describe('runInProcessGroup', () => {
       timeoutMs: 1_800,
       signal: new AbortController().signal,
       killGraceMs: 250,
+      env: { PATH: '/usr/bin:/bin' },
     });
 
     await sleep(300);
@@ -97,6 +100,8 @@ describe('runInProcessGroup', () => {
       timeoutMs: 400,
       signal: new AbortController().signal,
       killGraceMs: 500,
+      // The builder's scrubbed env, which is what production passes.
+      env: command.env,
     });
 
     expect(result.reason).toBe('timeout');
@@ -113,6 +118,7 @@ describe('runInProcessGroup', () => {
       timeoutMs: 30_000,
       signal: controller.signal,
       killGraceMs: 250,
+      env: { PATH: '/usr/bin:/bin' },
     });
 
     controller.abort();

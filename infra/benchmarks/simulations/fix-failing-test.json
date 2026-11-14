@@ -1,0 +1,18 @@
+{
+  "benchmarkId": "fix-failing-test",
+  "benchmarkVersion": "1.0.0",
+  "outcome": "solved",
+  "note": "scripted fix: sum() subtracts; the script rewrites it to add",
+  "writes": [
+    {
+      "path": "src/sum.js",
+      "content": "/**\n * Adds two numbers.\n *\n * @param {number} a left operand\n * @param {number} b right operand\n * @returns {number} the sum of `a` and `b`\n */\nexport function sum(a, b) {\n  return a + b;\n}\n"
+    }
+  ],
+  "usage": {
+    "tokensIn": 1180,
+    "tokensOut": 210
+  },
+  "toolInvocations": 5,
+  "retries": 0
+}

@@ -16,6 +16,8 @@ import { verifyArtifact, type ArtifactLocator } from './artifact-locator';
 export interface ArtifactRecord {
   readonly id: string;
   readonly taskId: string;
+  /** Phase 4 provenance. `null` means "unattributed", never "assume the latest run". */
+  readonly attemptId: string | null;
   readonly runtimeId: string;
   readonly kind: string;
   readonly uri: string;
@@ -39,6 +41,9 @@ export async function summariseArtifact(
   const summary = ExecutionArtifactSummary.parse({
     id: record.id,
     taskId: record.taskId,
+    attemptId: record.attemptId,
+    // Denormalised so a UI cannot accidentally render a null link as the current run.
+    unattributed: record.attemptId === null,
     runtimeId: record.runtimeId,
     kind: record.kind,
     uri: resolution?.logicalUri ?? locator.logicalUri(record.uri),

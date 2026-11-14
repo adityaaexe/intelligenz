@@ -1,15 +1,15 @@
 /**
- * Phase 3, Unit E2 — sandbox remediation evidence.
+ * Sandbox audit — what the agent can see, measured from inside a real sandbox.
  *
- * This is not a test; it is the measurement the security report quotes. Every line is
- * produced by running something, not by reading a comment:
+ * **History, because the filename is quoted in the Phase 3 report.** In Phase 3 this
+ * script measured a mount plan that mounted four opencode paths from the operator's
+ * `$HOME`, and its output (§A.2 of `PHASE-3-SECURITY-RESULTS.md`) is the evidence that
+ * `opencode.db` — 1.08 GB, credential plus 696 sessions — was readable in-sandbox.
  *
- *   1. the mount plan the adapter derives from the **real** `$HOME`;
- *   2. what is visible under `/xdg-data` from inside the sandbox, including attempts to
- *      read the credentials the audit found there before;
- *   3. the resource ceilings the entry wrapper applies (`ulimit` as the agent sees it);
- *   4. the egress policy: `CONNECT` on 443 vs non-443 ports, through a real `curl` that
- *      speaks proxy protocol to the sandbox's loopback listener.
+ * Phase 4 removed that mount entirely and moved authentication into the host egress
+ * broker. The script now measures the current plan, which is empty. It is kept because
+ * the Phase 3 report cites the command, and because "the plan has no host paths" is
+ * worth being able to re-measure on any host in one command.
  *
  * Run from the repository root:
  *
@@ -23,10 +23,12 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
-import { buildOpencodeStateMounts } from '../../packages/agent-runtime/src/sandbox/state-mounts.ts';
-import { startEgressProxy } from '../../packages/agent-runtime/src/sandbox/egress-proxy.ts';
+import { buildEphemeralStatePlan } from '../../packages/agent-runtime/src/sandbox/state-mounts.ts';
 import { SANDBOX_ENTRY_SOURCE } from '../../packages/agent-runtime/src/sandbox/entry-source.ts';
-import { buildSandboxCommand, type SandboxCommand } from '../../packages/workspace-manager/src/index.ts';
+import {
+  buildSandboxCommand,
+  type SandboxCommand,
+} from '../../packages/workspace-manager/src/index.ts';
 
 const out = (line = ''): void => {
   process.stdout.write(`${line}\n`);
@@ -43,7 +45,14 @@ function run(command: SandboxCommand, timeoutMs = 30_000): Promise<RunResult> {
     execFile(
       command.file,
       [...command.args],
-      { timeout: timeoutMs, maxBuffer: 2 * 1024 * 1024, encoding: 'utf8' },
+      {
+        timeout: timeoutMs,
+        maxBuffer: 2 * 1024 * 1024,
+        encoding: 'utf8',
+        // Same rule as the production spawner: bwrap must not inherit the worker's
+        // environment, because `--clearenv` does not apply to bwrap's own pid-1 child.
+        env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin', LANG: 'C.UTF-8' },
+      },
       (error, stdout, stderr) => {
         const code =
           error === null
@@ -58,13 +67,13 @@ function run(command: SandboxCommand, timeoutMs = 30_000): Promise<RunResult> {
   });
 }
 
-/** The host paths the audit named as exposed, and the reason each was reachable. */
+/** The host paths the Phase 3 audit named as exposed, plus the credential store. */
 const AUDIT_PATHS = [
+  [join(homedir(), '.local/share/opencode/opencode.db'), 'opencode credential database'],
+  [join(homedir(), '.config/opencode/opencode.jsonc'), 'global opencode config'],
   [join(homedir(), '.local/share/agentmemory/secret'), 'agentmemory secret'],
   [join(homedir(), '.local/share/pki/nssdb/key4.db'), 'NSS key database'],
-  [join(homedir(), '.local/state/lesshst'), 'operator shell history'],
   [join(homedir(), '.ssh/id_rsa'), 'SSH private key'],
-  [join(homedir(), '.config/opencode/cli.json'), 'global opencode config'],
 ] as const;
 
 async function main(): Promise<void> {
@@ -72,22 +81,14 @@ async function main(): Promise<void> {
   const workspaceRoot = join(root, 'ws');
   const runDir = join(root, 'run');
   const entryDir = join(runDir, 'entry');
-  const egressDir = join(runDir, 'egress');
 
   await mkdir(join(workspaceRoot, 'repo'), { recursive: true });
   await mkdir(entryDir, { recursive: true, mode: 0o700 });
-  await mkdir(egressDir, { recursive: true, mode: 0o700 });
   await writeFile(join(entryDir, 'sandbox-entry.mjs'), SANDBOX_ENTRY_SOURCE, { mode: 0o500 });
 
-  const plan = await buildOpencodeStateMounts({
-    dataHome: join(homedir(), '.local', 'share'),
-    stateHome: join(homedir(), '.local', 'state'),
-    cacheHome: join(homedir(), '.cache'),
-    configHome: join(homedir(), '.config'),
-  });
+  const plan = buildEphemeralStatePlan();
 
   const nodeRoot = dirname(dirname(resolve(process.execPath)));
-  const proxy = await startEgressProxy({ socketDir: egressDir, allowHosts: ['api.commandcode.ai'] });
 
   const sandbox = (argv: readonly string[]): SandboxCommand =>
     buildSandboxCommand({ rootPath: workspaceRoot }, argv, {
@@ -98,52 +99,44 @@ async function main(): Promise<void> {
         XDG_STATE_HOME: '/xdg-state',
         XDG_CACHE_HOME: '/xdg-cache',
         XDG_CONFIG_HOME: '/xdg-config',
-        AGENT_PROXY_SOCKET: '/run/agent-egress/egress.sock',
-        AGENT_PROXY_PORT: '8899',
+        IZ_BROKER_SOCKET: '/run/agent-broker/broker.sock',
+        IZ_BROKER_PORT: '8899',
         AGENT_RLIMIT_NOFILE: '1024',
         AGENT_RLIMIT_NPROC: '4096',
         AGENT_RLIMIT_AS: String(6 * 1024 * 1024 * 1024),
-        AGENT_RLIMIT_FSIZE: String(256 * 1024 * 1024),
       },
       mounts: [
         { hostPath: entryDir, containerPath: '/opt/agent', mode: 'ro' },
         { hostPath: nodeRoot, mode: 'ro' },
-        { hostPath: egressDir, containerPath: '/run/agent-egress', mode: 'ro' },
         ...plan.mounts,
       ],
-      extraArgs: [
-        ...plan.masks.flatMap((mask) => ['--tmpfs', mask]),
-        ...plan.dirs.flatMap((dir) => ['--dir', dir]),
-      ],
+      extraArgs: plan.dirs.flatMap((dir) => ['--dir', dir]),
     });
 
   out('─'.repeat(78));
-  out('1. mount plan derived from the real $HOME');
+  out('1. mount plan derived from the host');
   out('─'.repeat(78));
 
+  out(`   host mounts  ${plan.mounts.length === 0 ? '(none — the state tree is created empty in-sandbox)' : String(plan.mounts.length)}`);
   for (const mount of plan.mounts) {
     out(`   ${mount.mode.padEnd(9)} ${mount.hostPath} -> ${mount.containerPath ?? mount.hostPath}`);
   }
-
-  out(`   masked       ${plan.masks.length === 0 ? '(none present)' : plan.masks.join(', ')}`);
+  out(`   dirs         ${plan.dirs.join(', ')}`);
   out();
 
   out('─'.repeat(78));
-  out('2. what is visible under /xdg-data, from inside the sandbox');
+  out('2. visible state, from inside the sandbox');
   out('─'.repeat(78));
 
   const listing = await run(sandbox(['/bin/ls', '-la', '/xdg-data', '/xdg-data/opencode']));
   out(listing.stdout.trim());
-
   out();
 
   const secretScript = [
     ...AUDIT_PATHS.map(
-      ([path, label]) =>
-        `echo "${label}: $(head -c 70 ${path} 2>&1 | tr -d '\\n')"`,
+      ([path, label]) => `echo "${label}: $(head -c 40 ${path} 2>&1 | tr -d '\\n')"`,
     ),
-    'echo "mcp-auth.json: $(head -c 70 /xdg-data/opencode/mcp-auth.json 2>&1 | tr -d \'\\n\')"',
-    'echo "opencode.db readable: $(head -c 16 /xdg-data/opencode/opencode.db | od -An -tx1 | tr -d \'\\n\')"',
+    'echo "own session db: $(ls -A /xdg-data/opencode 2>&1 | tr -d \'\\n\')"',
   ].join('; ');
 
   const secrets = await run(sandbox(['/bin/sh', '-c', secretScript]));
@@ -170,50 +163,28 @@ async function main(): Promise<void> {
   out();
 
   out('─'.repeat(78));
-  out('4. egress: CONNECT on 443 vs a non-443 port, through curl');
+  out('4. egress: there is none, and no proxy variable exists to abuse');
   out('─'.repeat(78));
 
-  const curl = (target: string): SandboxCommand =>
+  const egress = await run(
     sandbox([
-      'node',
-      '/opt/agent/sandbox-entry.mjs',
-      '/usr/bin/curl',
-      '-sS',
-      '-m',
-      '8',
-      '-o',
-      '/dev/null',
-      '-w',
-      '%{http_code}',
-      '-x',
-      'http://127.0.0.1:8899',
-      target,
-    ]);
+      '/bin/sh',
+      '-c',
+      [
+        'echo "HTTPS_PROXY=${HTTPS_PROXY:-<unset>}"',
+        'if (exec 3<>/dev/tcp/1.1.1.1/443) 2>/dev/null; then echo "tcp/443: REACHABLE"; else echo "tcp/443: BLOCKED"; fi',
+        'echo "dns: $(getent hosts api.commandcode.ai >/dev/null 2>&1 && echo resolved || echo blocked)"',
+      ].join('; '),
+    ]),
+  );
 
-  for (const [label, target] of [
-    ['443 ', 'https://api.commandcode.ai:443/'],
-    ['22  ', 'https://api.commandcode.ai:22/'],
-    ['8443', 'https://api.commandcode.ai:8443/'],
-    ['evil', 'https://evil.example.test:443/'],
-  ] as const) {
-    const result = await run(curl(target), 30_000);
+  out(egress.stdout.trim());
+  if (egress.stderr.trim().length > 0) out(`   stderr: ${egress.stderr.trim().slice(0, 200)}`);
 
-    out(
-      `   ${label} exit=${String(result.code)} body=${JSON.stringify(result.stdout.slice(0, 40))} err=${JSON.stringify(result.stderr.trim().slice(0, 90))}`,
-    );
-  }
-
-  out();
-  out('   proxy log:');
-  for (const entry of proxy.requests) {
-    out(`     ${entry.method} ${entry.host}:${String(entry.port)} -> ${entry.allowed ? 'allow' : 'deny'}`);
-  }
-
-  await proxy.close();
   await rm(root, { recursive: true, force: true });
 }
 
 main().catch((error: unknown) => {
-  process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+  process.stderr.write(`${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`);
   process.exitCode = 1;
 });

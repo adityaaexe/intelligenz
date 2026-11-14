@@ -43,6 +43,8 @@ interface AttemptBody {
 interface ArtifactBody {
   id: string;
   taskId: string;
+  attemptId: string | null;
+  unattributed: boolean;
   kind: string;
   uri: string;
   checksum: string;
@@ -209,9 +211,11 @@ beforeAll(async () => {
       uri: transcriptPath,
       checksum,
       sizeBytes: Buffer.byteLength(TRANSCRIPT, 'utf8'),
-      // Persisted during the attempt, as the worker does. The detail endpoint
-      // attributes artifacts by (task, runtime, time window) because the schema has
-      // no `attemptId` on Artifact.
+      // Phase 4: provenance is the FK, written when the bytes are persisted. The old
+      // time-window attribution is gone, so an artifact without this link is reported
+      // as unattributed rather than attributed by guesswork.
+      attemptId: attempt.id,
+      workspaceId: workspace.id,
       createdAt: finishedAt,
     },
   });
@@ -233,6 +237,8 @@ beforeAll(async () => {
       uri: diffPath,
       checksum: createHash('sha256').update(Buffer.from(diffBody, 'utf8')).digest('hex'),
       sizeBytes: Buffer.byteLength(diffBody, 'utf8'),
+      attemptId: attempt.id,
+      workspaceId: workspace.id,
       createdAt: finishedAt,
     },
   });
@@ -249,6 +255,8 @@ beforeAll(async () => {
       uri: '/etc/passwd',
       checksum: 'b'.repeat(64),
       sizeBytes: 1,
+      // Deliberately unattributed: this row stands in for every artifact written
+      // before `attemptId` existed. The API must say so, not infer an owner.
       createdAt: finishedAt,
     },
   });
@@ -317,6 +325,21 @@ describe('GET /executions/:attemptId', () => {
     expect(transcript).toBeDefined();
     expect(transcript?.integrity).toBe('verified');
     expect(transcript?.uri).toBe('org/task/workspace-1/artifacts/transcript.ndjson');
+    // Phase 4: the link is the FK, and it is stated on the wire.
+    expect(transcript?.attemptId).toBe(attemptId);
+    expect(transcript?.unattributed).toBe(false);
+  });
+
+  it('reports an artifact with no attempt link as unattributed, not as the latest run', async () => {
+    const response = await request(suite.app.getHttpServer())
+      .get(`/v1/orgs/${suite.fixtures.orgA.id}/artifacts/${traversalArtifactId}`)
+      .set(authHeaders(ownerToken, suite.fixtures.orgA.id))
+      .expect(200);
+
+    const body = response.body as DataBody<ArtifactBody>;
+
+    expect(body.data.attemptId).toBeNull();
+    expect(body.data.unattributed).toBe(true);
   });
 
   it('answers 404 for an attempt belonging to a different tenant', async () => {

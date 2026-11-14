@@ -1,0 +1,49 @@
+{
+  "id": "add-regression-test",
+  "version": "1.0.0",
+  "category": "quality",
+  "fixture": "add-regression-test",
+  "description": "Adds a passing regression test for an untested edge case without touching the correct implementation.",
+  "goal": "`src/slugify.js` is correct, but its behaviour around repeated separators and surrounding punctuation is untested. Add a regression test in `test/regression.test.js` that pins that behaviour, then run `node --test`. Do not change `src/slugify.js` or `test/slugify.test.js`.",
+  "judge": [
+    {
+      "type": "command",
+      "argv": [
+        "node",
+        "--test"
+      ],
+      "expectExit": 0,
+      "dimension": "testCorrectness"
+    },
+    {
+      "type": "grep",
+      "path": "test/regression.test.js",
+      "pattern": "slugify\\(",
+      "expect": "present",
+      "dimension": "completion"
+    },
+    {
+      "type": "grep",
+      "path": "test/regression.test.js",
+      "pattern": "assert\\.equal",
+      "expect": "present",
+      "dimension": "completion"
+    },
+    {
+      "type": "file-equals",
+      "path": "src/slugify.js",
+      "sha256": "e0e3f3c44c4c7207c728749e694ac670f0708ffc8dd0db37b94964abf1960159",
+      "dimension": "artifactIntegrity"
+    },
+    {
+      "type": "diff-files",
+      "maxChanged": 1,
+      "dimension": "diffQuality"
+    }
+  ],
+  "limits": {
+    "wallClockMs": 120000,
+    "maxUsd": 0.02
+  },
+  "policyExpectation": "no-violation"
+}

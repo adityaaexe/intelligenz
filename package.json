@@ -8,6 +8,11 @@
   "engines": {
     "node": ">=22.0.0 <23"
   },
+  "pnpm": {
+    "overrides": {
+      "postcss": "8.5.32"
+    }
+  },
   "scripts": {
     "typecheck": "pnpm -r --workspace-concurrency=4 run typecheck",
     "lint": "eslint . --max-warnings=0",

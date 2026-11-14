@@ -36,11 +36,29 @@ const PATTERNS: readonly (readonly [RegExp, string])[] = [
   [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{0,}/g, '[redacted]'],
   // Provider keys with recognisable prefixes.
   [/\bsk-[A-Za-z0-9_-]{8,}/g, '[redacted]'],
+  // Stripe-style secrets use an underscore: `sk_live_…` / `sk_test_…`. The hyphen
+  // pattern above does not match them. The fixture for this family used to be written
+  // as `sk-live-…`, which the hyphen rule *did* match — so the test and the regex agreed
+  // with each other and both disagreed with the real token shape (audit F3).
+  [/\bsk_(?:live|test)_[A-Za-z0-9]{8,}/g, '[redacted]'],
   [/\bghp_[A-Za-z0-9]{10,}/g, '[redacted]'],
   [/\bgithub_pat_[A-Za-z0-9_]{10,}/g, '[redacted]'],
+  // GitLab personal, project, group and pipeline tokens. `glpat-` was uncovered: no other
+  // family's prefix matches it, and the generic rule below needs a key-like name in front,
+  // which a URL or an `export` line does not provide.
+  [/\bglpat-[A-Za-z0-9_-]{20,}/g, '[redacted]'],
   [/\bAKIA[0-9A-Z]{12,}/g, '[redacted]'],
   [/\bxox[baprs]-[A-Za-z0-9-]{8,}/g, '[redacted]'],
   [/\bnpm_[A-Za-z0-9]{20,}/g, '[redacted]'],
+  // AWS secret access keys: exactly 40 base64-ish characters assigned to a name that
+  // says what they are. Deliberately anchored on the shape — the generic rule below
+  // catches `AWS_SECRET_ACCESS_KEY=…` because the name contains SECRET, but it cannot
+  // catch a 40-character value whose name is spelled `aws-secret-access-key` (hyphen),
+  // and "bare" means "no key id beside it to correlate with".
+  [
+    /\b((?:aws[_.-]?)?secret[_.-]?access[_.-]?key)["']?\s*[=:]\s*["']?[A-Za-z0-9/+=]{40}/gi,
+    '$1=[redacted]',
+  ],
   // Credentials embedded in a URL: `postgres://user:pass@host`, `https://x:y@host`.
   // The scheme survives so a reader still knows what kind of endpoint it was.
   [/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/:@]+:[^\s/@]+@/gi, '$1[redacted]@'],
@@ -53,8 +71,14 @@ const PATTERNS: readonly (readonly [RegExp, string])[] = [
   // value stops at whitespace *and* at the characters that end a value inside JSON or
   // a shell word — otherwise redacting a line of NDJSON would eat its closing braces
   // and turn valid evidence into unparseable text.
+  //
+  // The name class includes `-` because separators are a spelling, not a different
+  // kind of secret: `x-api-key=` and `aws-secret-access-key=` carry the same value as
+  // their underscore forms. `.` is deliberately excluded: including it would make
+  // `src/auth-token.js: export …` look like an assignment and redact the code that
+  // follows a file name in a diff.
   [
-    /\b([A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Za-z0-9_]*)\s*[=:]\s*[^\s"'`,;}]+/gi,
+    /\b([A-Za-z0-9_-]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Za-z0-9_-]*)\s*[=:]\s*[^\s"'`,;}]+/gi,
     '$1=[redacted]',
   ],
 ];
@@ -67,7 +91,7 @@ const BASE64_RUN = /[A-Za-z0-9+/]{40,}={0,2}/g;
  * denylist in a cheaper form — it is only ever consulted after a decode.
  */
 const SECRET_HINT =
-  /(?:eyJ[A-Za-z0-9_-]{8,}\.|sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{10,}|github_pat_[A-Za-z0-9_]{8,}|AKIA[0-9A-Z]{12,}|xox[baprs]-[A-Za-z0-9-]{8,}|bearer\s+[A-Za-z0-9._~+/=-]{8,}|authorization\s*:|[A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Za-z0-9_]*\s*[=:]|[a-z][a-z0-9+.-]*:\/\/[^\s/:@]+:[^\s/@]+@)/i;
+  /(?:eyJ[A-Za-z0-9_-]{8,}\.|sk-[A-Za-z0-9_-]{8,}|sk_(?:live|test)_[A-Za-z0-9]{8,}|ghp_[A-Za-z0-9]{10,}|github_pat_[A-Za-z0-9_]{8,}|glpat-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{12,}|xox[baprs]-[A-Za-z0-9-]{8,}|bearer\s+[A-Za-z0-9._~+/=-]{8,}|authorization\s*:|[A-Za-z0-9_-]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Za-z0-9_-]*\s*[=:]|[a-z][a-z0-9+.-]*:\/\/[^\s/:@]+:[^\s/@]+@)/i;
 
 /** Longest prefix of a candidate this pass decodes. A credential is not a megabyte. */
 const BASE64_DECODE_LIMIT = 8192;

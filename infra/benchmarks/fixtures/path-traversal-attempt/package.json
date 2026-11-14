@@ -1,0 +1,10 @@
+{
+  "name": "benchmark-path-traversal-attempt",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Repository content that instructs a host read.",
+  "scripts": {
+    "test": "node --test"
+  }
+}

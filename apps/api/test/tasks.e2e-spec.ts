@@ -158,14 +158,16 @@ describe('task creation', () => {
     expect(rows).toBe(1);
   });
 
-  it('creates a PENDING approval request for a HIGH risk task', async () => {
+  it('creates a PENDING approval request for a server-classified HIGH risk task', async () => {
     const response = await request(suite.app.getHttpServer())
       .post(tasksPath())
       .set(authHeaders(ownerToken, suite.fixtures.orgA.id))
       .set('idempotency-key', 'high-risk-create-1')
       .send({
         title: 'High risk change',
-        goal: 'Touch the production deployment path.',
+        // Shell execution is a server-side HIGH floor (D-006); the client no longer
+        // chooses its own class, so the payload has to *be* high risk, not say so.
+        goal: 'Run a shell command that rewrites the build script.',
         riskClass: 'HIGH',
         acceptanceCriteria: [],
       })
@@ -180,6 +182,9 @@ describe('task creation', () => {
     expect(approvals).toHaveLength(1);
     expect(approvals[0]?.status).toBe('PENDING');
     expect(approvals[0]?.riskClass).toBe('HIGH');
+    // Bound from birth: the grant names the content it is about before anyone decides.
+    expect(approvals[0]?.taskContentHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(approvals[0]?.executionProfile).toBe('standard');
   });
 });
 
@@ -438,17 +443,22 @@ describe('approval gate (contract §15 A3)', () => {
     expect(audits[0]?.payload).toMatchObject({ reason: 'approval_required', to: 'queued' });
   });
 
-  it('cannot be queued through PATCH, so the approval gate is not reachable that way', async () => {    // `ready → queued` is a real edge of the state machine, owned by the orchestrator.
-    // Refusing it here is what makes `POST /run` (and its approval check) the only
-    // door to execution; without it a MEMBER could queue a CRITICAL task with two
-    // calls and never touch the gate.
+  it('cannot be queued through PATCH, and names the approval that is missing first', async () => {    // `ready → queued` is a real edge of the state machine, owned by the orchestrator.
+    // Refusing it here is what makes `POST /run` (and its approval gate) the only way
+    // to execution; without it a MEMBER could queue a CRITICAL task with two calls and
+    // never touch the gate.
+    //
+    // Phase 4 answers `APPROVAL_REQUIRED` rather than the generic system-managed
+    // refusal when the task is HIGH/CRITICAL and has no live grant: both refuse, but
+    // the first is the reason the person cannot proceed. The check does not consume
+    // the grant — this call can never queue anything.
     const response = await request(suite.app.getHttpServer())
       .patch(taskPath(suite.fixtures.tasks.highReadyA))
       .set(authHeaders(ownerToken, suite.fixtures.orgA.id))
       .send({ status: 'queued' })
       .expect(409);
 
-    expect((response.body as ApiErrorBody).error.code).toBe('TRANSITION_IS_SYSTEM_MANAGED');
+    expect((response.body as ApiErrorBody).error.code).toBe('APPROVAL_REQUIRED');
 
     const row = await suite.prisma.task.findUniqueOrThrow({
       where: { id: suite.fixtures.tasks.highReadyA },
@@ -458,6 +468,13 @@ describe('approval gate (contract §15 A3)', () => {
     expect(
       await suite.prisma.workflowRun.count({ where: { taskId: suite.fixtures.tasks.highReadyA } }),
     ).toBe(0);
+
+    // Nothing was spent: the refusal is a precondition check, not a use.
+    const approval = await suite.prisma.approvalRequest.findUniqueOrThrow({
+      where: { id: suite.fixtures.pendingApprovalId },
+    });
+
+    expect(approval.consumedAt).toBeNull();
   });
 
   it('allows the same task once the request is approved', async () => {
@@ -527,7 +544,8 @@ describe('approval gate (contract §15 A3)', () => {
       .set('idempotency-key', 'reject-flow-1')
       .send({
         title: 'Needs review',
-        goal: 'A HIGH task whose approval will be rejected without a note.',
+        // Server-derived HIGH (shell), so an approval request exists to reject.
+        goal: 'Run a shell command and then ask for it to be rejected without a note.',
         riskClass: 'HIGH',
         acceptanceCriteria: [],
       })

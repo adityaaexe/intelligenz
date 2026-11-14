@@ -25,6 +25,18 @@ import { RunStatus } from './enums';
  * Mirrors the Prisma `WorkspaceState` enum exactly. Postgres enum labels are
  * case-sensitive, so this list is the storage vocabulary and a rename in either
  * place is a migration — `workspace-manager`'s test suite asserts the two agree.
+ *
+ * Phase 4 appends the states a durable reaper needs. The Phase 3 list described what
+ * happened to a *run*; it did not describe what happens to the *directory* after the
+ * process that owned it is gone. Appended, never reordered: a Postgres enum label is
+ * positional on disk.
+ *
+ *   allocated       → a row exists and a path is reserved, nothing written yet
+ *   finalizing      → the run is over; artifacts still being collected
+ *   cleanup_pending → reclaimable, queued for the reaper
+ *   cleaned         → bytes gone, verified
+ *   cleanup_failed  → the reaper tried and failed; retried with a backoff
+ *   quarantined     → deliberately retained (incident, evidence hold), never reaped
  */
 export const WorkspaceState = z.enum([
   'requested',
@@ -35,6 +47,12 @@ export const WorkspaceState = z.enum([
   'completed',
   'failed',
   'cancelled',
+  'allocated',
+  'finalizing',
+  'cleanup_pending',
+  'cleaned',
+  'cleanup_failed',
+  'quarantined',
 ]);
 export type WorkspaceState = z.infer<typeof WorkspaceState>;
 
@@ -128,11 +146,20 @@ export type ArtifactIntegrity = z.infer<typeof ArtifactIntegrity>;
 /**
  * Artifact metadata. `uri` is logical: relative to the artifact root that stores
  * the bytes, with posix separators, never an absolute host path.
+ *
+ * `attemptId` is the Phase 4 provenance link. `null` is not an error: every artifact
+ * written before the link existed has none, and inventing one would assert something
+ * nobody observed. `unattributed` makes that state explicit rather than leaving a
+ * consumer to treat `null` as "fine".
  */
 export const ExecutionArtifactSummary = z
   .object({
     id: z.string().min(1),
     taskId: z.string().min(1),
+    /** The attempt that produced the bytes. `null` means unattributed. */
+    attemptId: z.string().min(1).nullable(),
+    /** True exactly when `attemptId` is null. Denormalised so a UI cannot forget it. */
+    unattributed: z.boolean(),
     runtimeId: z.string().min(1),
     kind: z.string().min(1),
     uri: z.string().min(1),

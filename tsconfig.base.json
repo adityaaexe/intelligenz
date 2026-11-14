@@ -11,6 +11,7 @@
       "@intelligenz/database": ["packages/database/src/index.ts"],
       "@intelligenz/design-system": ["packages/design-system/src/index.ts"],
       "@intelligenz/agent-runtime": ["packages/agent-runtime/src/index.ts"],
+      "@intelligenz/egress-broker": ["packages/egress-broker/src/index.ts"],
       "@intelligenz/workspace-manager": ["packages/workspace-manager/src/index.ts"]
     },
     "strict": true,

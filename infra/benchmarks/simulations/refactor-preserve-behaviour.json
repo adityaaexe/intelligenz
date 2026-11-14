@@ -1,0 +1,18 @@
+{
+  "benchmarkId": "refactor-preserve-behaviour",
+  "benchmarkVersion": "1.0.0",
+  "outcome": "solved",
+  "note": "scripted fix: shared fold helper, identical semantics",
+  "writes": [
+    {
+      "path": "src/stats.js",
+      "content": "/**\n * Descriptive statistics over an array of numbers.\n *\n * One fold, three readers. The semantics are unchanged, including `mode`'s tie-break:\n * the first value encountered with the highest count wins, because `>` (not `>=`) keeps\n * insertion order decisive.\n */\n\n/**\n * @template A, T\n * @param {T[]} values\n * @param {(accumulator: A, value: T) => A} step\n * @param {A} seed\n * @returns {A}\n */\nfunction fold(values, step, seed) {\n  let accumulator = seed;\n  for (const value of values) {\n    accumulator = step(accumulator, value);\n  }\n  return accumulator;\n}\n\n/**\n * @param {number[]} values\n * @returns {number}\n */\nexport function mean(values) {\n  return fold(values, (total, value) => total + value, 0) / values.length;\n}\n\n/**\n * @param {number[]} values\n * @returns {number}\n */\nexport function median(values) {\n  const sorted = [...values].sort((left, right) => left - right);\n  const middle = Math.floor(sorted.length / 2);\n  return sorted.length % 2 === 0 ? (sorted[middle - 1] + sorted[middle]) / 2 : sorted[middle];\n}\n\n/**\n * @param {number[]} values\n * @returns {number}\n */\nexport function mode(values) {\n  const counts = fold(values, (tally, value) => tally.set(value, (tally.get(value) ?? 0) + 1), new Map());\n\n  let best = values[0];\n  let bestCount = 0;\n  for (const [value, count] of counts) {\n    if (count > bestCount) {\n      best = value;\n      bestCount = count;\n    }\n  }\n  return best;\n}\n"
+    }
+  ],
+  "usage": {
+    "tokensIn": 2140,
+    "tokensOut": 690
+  },
+  "toolInvocations": 9,
+  "retries": 0
+}

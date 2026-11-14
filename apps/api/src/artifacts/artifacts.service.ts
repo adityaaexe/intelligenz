@@ -137,6 +137,7 @@ export class ArtifactsService {
       select: {
         id: true,
         taskId: true,
+        attemptId: true,
         runtimeId: true,
         kind: true,
         uri: true,

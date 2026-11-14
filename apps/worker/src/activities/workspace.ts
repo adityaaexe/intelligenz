@@ -61,6 +61,17 @@ export interface LeaseWorkspaceInput {
   readonly attemptNumber: number;
   readonly workspaceId: string;
   readonly config: WorkerConfig;
+  /**
+   * Who holds the lease. `host:pid:bootId`, not a foreign key — a worker is a process,
+   * and the row must still be readable when that process is gone.
+   */
+  readonly owner: string;
+  /**
+   * How long the lease is good for: `2 × wall clock` of the attempt's resource profile.
+   * Twice, because one full wall clock of silence is normal (a long model call) and a
+   * lease that expires during a healthy run would make the reaper a race.
+   */
+  readonly leaseMs: number;
 }
 
 export type LeaseWorkspaceResult =
@@ -85,6 +96,8 @@ export async function leaseWorkspace(input: LeaseWorkspaceInput): Promise<LeaseW
   });
   const sourceRepo = input.config.workspace.sourceRepo;
 
+  const now = Date.now();
+
   await prisma.executionWorkspace.create({
     data: {
       id: input.workspaceId,
@@ -94,6 +107,13 @@ export async function leaseWorkspace(input: LeaseWorkspaceInput): Promise<LeaseW
       rootPath,
       sourceKind: sourceRepo === undefined ? 'empty' : 'clone',
       sourceRef: sourceRepo ?? null,
+      // The lease is written with the row, not after provisioning: a worker that dies
+      // between these two statements would leave a workspace nobody owns, which is the
+      // exact orphan the reaper exists for and the one thing it cannot see without a
+      // deadline.
+      leaseOwner: input.owner,
+      leaseExpiresAt: new Date(now + input.leaseMs),
+      lastHeartbeatAt: new Date(now),
     },
     select: { id: true },
   });
@@ -193,8 +213,70 @@ export async function releaseWorkspace(input: {
       // kept whole on purpose, so `cleanedAt` stays null rather than claiming a sweep.
       ...(input.outcome === 'cancelled' ? {} : { cleanedAt: new Date() }),
       ...(input.error === undefined ? {} : { error: serialiseFailure(input.error) }),
+      // The lease ends with the run. Leaving it set would make the next reaper pass
+      // treat a finished workspace as abandoned-while-live.
+      leaseExpiresAt: null,
+      leaseOwner: null,
     },
   });
+}
+
+/**
+ * Extend the lease. Conditional on the owner: two workers must never both believe they
+ * hold one directory, so a heartbeat from a process that lost its lease must not revive
+ * it. A zero-row update is reported, not thrown — the caller is mid-execution and the
+ * right response is a log line, not a failed run.
+ */
+export async function heartbeatWorkspace(input: {
+  readonly orgId: string;
+  readonly workspaceId: string;
+  readonly owner: string;
+  readonly leaseMs: number;
+}): Promise<boolean> {
+  const now = Date.now();
+
+  const updated = await db().executionWorkspace.updateMany({
+    where: { id: input.workspaceId, orgId: input.orgId, leaseOwner: input.owner },
+    data: {
+      leaseExpiresAt: new Date(now + input.leaseMs),
+      lastHeartbeatAt: new Date(now),
+    },
+  });
+
+  return updated.count > 0;
+}
+
+/**
+ * A heartbeat loop as an interval with an off switch.
+ *
+ * Half the wall clock, so two consecutive heartbeats can be lost before the deadline is
+ * reached. `unref()` so a forgotten `stop()` cannot hold the process open — the worker's
+ * shutdown path must not depend on a timer that this module owns.
+ */
+export function startWorkspaceHeartbeat(input: {
+  readonly orgId: string;
+  readonly workspaceId: string;
+  readonly owner: string;
+  readonly leaseMs: number;
+  readonly onMiss?: (workspaceId: string) => void;
+}): () => void {
+  const intervalMs = Math.max(1_000, Math.floor(input.leaseMs / 4));
+  let stopped = false;
+
+  const timer = setInterval(() => {
+    void heartbeatWorkspace(input)
+      .then((held) => {
+        if (!held && !stopped) input.onMiss?.(input.workspaceId);
+      })
+      .catch(() => undefined);
+  }, intervalMs);
+
+  timer.unref();
+
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
 }
 
 /** Exposed so the artifact writer and the tests agree on one path. */

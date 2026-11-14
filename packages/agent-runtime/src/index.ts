@@ -11,10 +11,13 @@
  *   `simulated: true`. It is the default on purpose.
  * - `OpencodeCliRuntime` runs a real agent inside `bwrap`: read-only root, one
  *   read-write workspace bind, no network namespace, cleared environment. Its `network`
- *   capability is **false for the agent** — no general egress — with one adapter-owned
- *   channel: a proxy that accepts `CONNECT` only to an exact provider allowlist on port
- *   443. Resource ceilings (`prlimit`) and a mandatory spend cap apply. Post-run git
- *   evidence is collected inside the same sandbox, never on the host.
+ *   capability is **false for the agent** — no general egress and, since Phase 4, no
+ *   provider-specific egress either. The one channel is a unix socket that terminates
+ *   at a **host egress broker** which injects the provider credential. The sandbox
+ *   holds no credential, no credential database and no provider config — only a
+ *   per-attempt canary that authenticates nothing. Resource ceilings (`prlimit`) and a
+ *   mandatory spend cap apply. Post-run git evidence is collected inside the same
+ *   sandbox, never on the host.
  *
  * ## What is still absent
  *
@@ -36,10 +39,29 @@ export {
 export {
   OpencodeCliRuntime,
   OPENCODE_CLI_ID,
+  brokerModelKey,
   collectWorkspaceEvidence,
+  safeRunIdSegment,
+  type OpencodeBrokerOptions,
   type OpencodeCliRuntimeOptions,
   type WorkspaceEvidence,
 } from './runtimes/opencode-cli';
+export {
+  buildEphemeralStatePlan,
+  OPENCODE_STATE_DIRECTORIES,
+  XDG_DIRECTORIES,
+  type EphemeralStatePlan,
+} from './sandbox/state-mounts';
+export {
+  BROKER_CANARY_ENV,
+  BROKER_PROVIDER_ID,
+  BROKER_RELAY_PORT,
+  BROKER_RELAY_SOCKET,
+  RUNTIME_RLIMITS,
+  buildRuntimeSandbox,
+  type RuntimeSandbox,
+  type RuntimeSandboxInput,
+} from './sandbox/broker-contract';
 export {
   parseOpencodeStream,
   type ParsedStream,
@@ -53,5 +75,11 @@ export {
   type EgressProxyOptions,
   type EgressRequestLog,
 } from './sandbox/egress-proxy';
-export { runInProcessGroup, type GroupedProcessResult, type KillReason } from './process-group';
+export {
+  CGROUP_PLACEMENT_EXIT,
+  runInProcessGroup,
+  type GroupedProcessResult,
+  type GroupedProcessOptions,
+  type KillReason,
+} from './process-group';
 export { redact, redactAndTruncate, summarizeToolPayload } from './redact';

@@ -1,0 +1,3 @@
+# Evaluation output is a local measurement, not a repository artifact.
+# Only the rendered baseline report is committed; the raw ledger is not.
+results/

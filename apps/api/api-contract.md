@@ -147,7 +147,7 @@ Workspaces are nested so the client can build project paths without a second cal
 | Method | Path | Role | Body | Response |
 |---|---|---|---|---|
 | GET | `/v1/orgs/:orgId/projects/:projectId/tasks?limit&cursor` | any member | — | `200 { data: Task[], meta }` — newest first |
-| POST | `/v1/orgs/:orgId/projects/:projectId/tasks` | **MEMBER** | `{ title, goal, riskClass, priority?, acceptanceCriteria[] }` + optional `Idempotency-Key` | `201` created / `200` duplicate — `{ data: Task, meta: { created: boolean } }` |
+| POST | `/v1/orgs/:orgId/projects/:projectId/tasks` | **MEMBER** | `{ title, goal, priority?, acceptanceCriteria[], executionProfile?, sourceRef?, baseCommit?, riskClass? }` + optional `Idempotency-Key` | `201` created / `200` duplicate — `{ data: Task, meta: { created: boolean } }` |
 | GET | `/v1/orgs/:orgId/tasks/:taskId` | any member | — | `200 { data: TaskDetail }` |
 | PATCH | `/v1/orgs/:orgId/tasks/:taskId` | **MEMBER** | `{ status, reason? }` | `200 { data: Task }` — human-owned edges only, see §5 |
 | POST | `/v1/orgs/:orgId/tasks/:taskId/run` | **MEMBER** | — | `202 { data: { taskId, workflowRunId, workflowId, temporalRunId, status: "queued" } }` |
@@ -158,6 +158,19 @@ Workspaces are nested so the client can build project paths without a second cal
 
 `Task` = `{ id, orgId, projectId, workspaceId, title, goal, status, riskClass,
 priority, acceptanceCriteria, createdById, idempotencyKey, createdAt, updatedAt }`.
+
+**`riskClass` is server-derived (D-006).** The value in the response — and the value
+the approval gate reads — is computed by `apps/api/src/risk` from the content, the
+`executionProfile`, the `sourceRef`/`baseCommit` and the repository-trust policy.
+`riskClass` in the **request** is advisory only: it is compared with the derived class
+and a disagreement is recorded (`clientAttemptedDowngrade` / `clientAttemptedEscalation`,
+audited as `task.risk_class_overridden.v1`), but it is never obeyed. Sending
+`riskSource`, `derivedRiskClass`, `riskPolicyVersion` or `riskFactors` is accepted and
+then discarded; those fields are server-owned. The derivation itself
+(`riskFactors`, `riskSource`, `derivedRiskClass`, `riskPolicyVersion`) is **not** part
+of this response — it is evidence for the audit trail and the gate, not a client
+contract. `LOW` requires a read-only task on an allowlisted repository pinned to a
+commit; anything unknown is at least `MEDIUM`.
 
 Pagination: `limit` 1–100, default 25. `meta.nextCursor` is `null` on the last page;
 pass it back as `?cursor=`. A cursor from a different list is `400 INVALID_CURSOR`.
@@ -183,13 +196,36 @@ execution to cancel, which is not an error.
 |---|---|---|---|---|
 | GET | `/v1/orgs/:orgId/approvals?limit&cursor` | any member | — | `200 { data: Approval[], meta }` — PENDING only, risk-ranked |
 | POST | `/v1/orgs/:orgId/approvals/:approvalId/decision` | **ADMIN** | `{ decision: approve\|reject\|request_changes, note? }` | `200 { data: Approval }` |
+| POST | `/v1/orgs/:orgId/approvals/:approvalId/revoke` | **ADMIN** | — | `200 { data: Approval }` — idempotent on an already-revoked row |
 
 Risk ranking is `CRITICAL → HIGH → MEDIUM → LOW`, oldest first inside a class.
 `note` is required for `reject` and `request_changes`, optional for `approve`.
 
 `Approval` = `{ id, taskId, riskClass, status, createdAt, decidedAt, decisionNote,
-task: { id, title, status, riskClass, projectId, workspaceId }, requestedBy,
-decidedBy }`.
+expiresAt, consumedAt, revokedAt, task: { id, title, status, riskClass, projectId,
+workspaceId }, requestedBy, decidedBy }`.
+
+An approval is a **grant**, not a flag (D-006):
+
+- **Self-approval is refused.** `403 SELF_APPROVAL_FORBIDDEN` when the requester
+  approves their own request. The org-level escape hatch is compiled in and empty
+  (`apps/api/src/approvals/org-policy.ts`); enabling it is a code change.
+- **The grant is bound at decision time** to the task's content hash, derived class,
+  policy version, execution profile and `sourceRef`/`baseCommit`. Changing any of them
+  afterwards makes the grant unusable (`409 APPROVAL_STALE`).
+- **It expires.** `expiresAt` is the decision time plus `APPROVAL_TTL_HOURS`
+  (default **24 h**). An expired row is flipped to `EXPIRED` when the gate reads it
+  and the run is refused with `409 APPROVAL_EXPIRED`.
+- **It is single-use.** Consumption is a conditional update
+  (`status='APPROVED' AND consumedAt IS NULL AND revokedAt IS NULL`); the loser of a
+  race gets `409 APPROVAL_CONSUMED`, never a second execution.
+- **It can be revoked** while `APPROVED`. A consumed grant can still be revoked, but
+  `consumedAt` stays: revocation stops future runs, it does not undo the past one.
+  `409 APPROVAL_NOT_REVOCABLE` for a row that was never granted.
+- `consumedByAttemptId` is `null` for a grant spent by `POST /run` until the worker
+  links the attempt; `consumedAt` is what makes it spent.
+- A pre-Phase-4 row has `taskContentHash = null` and cannot authorise a run:
+  `409 APPROVAL_UNBOUND`. It is not backfilled.
 
 ### Executions (Phase 3)
 
@@ -247,9 +283,12 @@ One row per **attempt**, not per task. A Temporal retry produces a second attemp
 ordered by `sequence`. They are capped at 200 rows per run; a truncated trace is
 recorded in the run's `providerMeta`, not silently shortened.
 
-Artifact attribution in the detail response is by `(taskId, runtimeId, time window)`
-because `Artifact` has no `attemptId` in the Phase 3 schema. Only one workflow per task
-can be open at a time, so the window is unambiguous; it is a documented schema gap.
+Artifact attribution in the detail response is by **`Artifact.attemptId`** — the attempt
+that produced the bytes. The Phase 3 `(taskId, runtimeId, time window)` heuristic is
+**gone**: two attempts in the same second, or a retried run, made a window guessable
+but not knowable. A row whose `attemptId` is `NULL` (written before the column existed,
+or whose attempt was pruned) is returned with `attemptId: null` and
+`unattributed: true`. It is **never** attributed to the newest run.
 
 ### Artifacts (Phase 3)
 
@@ -262,6 +301,8 @@ can be open at a time, so the window is unambiguous; it is a documented schema g
 {
   "id": "uuid",
   "taskId": "uuid",
+  "attemptId": "uuid or null",
+  "unattributed": false,
   "runtimeId": "opencode-cli",
   "kind": "transcript",
   "uri": "org/task/workspace-1/artifacts/transcript.ndjson",
@@ -272,6 +313,10 @@ can be open at a time, so the window is unambiguous; it is a documented schema g
   "mediaType": "application/x-ndjson"
 }
 ```
+
+- `attemptId` is the provenance link. `unattributed: true` (and `attemptId: null`)
+  means the row predates the column or its attempt was pruned — a consumer must not
+  read that as "the latest run".
 
 - `uri` is **logical**: relative to the configured artifact root that stores the bytes,
   posix separators, never an absolute host path.
@@ -346,19 +391,49 @@ never arrive without an explanation.
 
 ---
 
-## 6. Approval gate (contract §15 A3)
+## 6. Approval gate (contract §15 A3, tightened by D-006)
 
 A `HIGH` or `CRITICAL` task cannot reach `queued` — which now means `POST /run`, since
-`PATCH` may not perform that edge (§5) — unless an `APPROVED` approval request exists
-for it.
+`PATCH` may not perform that edge (§5) — unless a **live, bound, unconsumed** `APPROVED`
+approval request exists for it.
 
-- Refusal: `409 APPROVAL_REQUIRED`.
-- The refusal writes a `task.transition_refused.v1` audit event. It is not a silent
-  no-op.
+The gate (`apps/api/src/approvals/approval-gate.service.ts`) requires all five:
+
+1. `status = APPROVED`;
+2. `consumedAt IS NULL`;
+3. `revokedAt IS NULL`;
+4. `expiresAt` in the future (a null expiry is `createdAt + TTL`, never "forever");
+5. `taskContentHash` equals the hash of the task's **current** content, derived class,
+   execution profile and `sourceRef`/`baseCommit`.
+
+Every refusal is a `409` with a specific code, and writes a
+`task.transition_refused.v1` audit event. It is not a silent no-op:
+
+| Code | Meaning |
+|---|---|
+| `APPROVAL_REQUIRED` | no live grant (no row, or none in a usable state) |
+| `APPROVAL_STALE` | the grant was for different content/profile/source; `details.approval` names the field(s) |
+| `APPROVAL_CONSUMED` | the grant was already spent — including losing a concurrent race |
+| `APPROVAL_EXPIRED` | past `expiresAt`; the row is flipped to `EXPIRED` and audited |
+| `APPROVAL_REVOKED` | withdrawn by an admin |
+| `APPROVAL_UNBOUND` | a pre-Phase-4 row with no content hash; it cannot prove what it approved |
+
+- `POST /run` **consumes** the grant. The consumption is a compare-and-swap
+  (`updateMany` on `id + orgId + status + consumedAt IS NULL + revokedAt IS NULL`), and
+  `count === 0` is a refusal, not a retry. It runs inside the same transaction as the
+  `ready → queued` reservation, so a failed reservation does not spend the grant.
+- `PATCH → queued` performs the same checks with `consume: false` and then refuses with
+  `409 TRANSITION_IS_SYSTEM_MANAGED`; it can never queue anything, so it must not burn
+  a grant.
 - Creating a HIGH/CRITICAL task automatically creates a `PENDING` approval request
-  and an `approval.requested.v1` event, so the queue is always populated.
+  (with a content hash and a 24 h expiry) and an `approval.requested.v1` event, so the
+  queue is always populated.
 - Deciding a request does **not** move the task. Approval is a precondition, not a
   state: the task stays `ready` and someone runs it.
+- A failed start (`503 ORCHESTRATOR_UNAVAILABLE`) still spends the grant. The
+  reservation commits before Temporal is contacted; refunding it would need a second
+  race against a run that may have started after all. The cost is one re-approval after
+  an outage; the alternative costs the control.
 
 ---
 
@@ -413,14 +488,20 @@ Every row in `AuditEvent` is built by one service and validated against the
 
 | Event | When |
 |---|---|
-| `task.created.v1` | task created |
+| `task.created.v1` | task created (carries `riskClass`, `riskSource`, `riskPolicyVersion`) |
 | `task.status_changed.v1` | any accepted transition, including `ready → queued` on run |
-| `task.transition_refused.v1` | approval gate refusal |
+| `task.transition_refused.v1` | approval gate refusal (`payload.code` names the reason) |
+| `task.risk_class_overridden.v1` | the caller asserted a class different from the derived one (`direction: downgrade\|escalation`) |
+| `security.risk_signal.v1` | the task requested credentials or host paths |
 | `task.cancelled.v1` | cancellation |
 | `workflow.started.v1` | Temporal accepted the workflow |
 | `workflow.start_failed.v1` | start failed and was compensated |
 | `approval.requested.v1` | HIGH/CRITICAL task created |
-| `approval.decided.v1` | approve / reject / request changes |
+| `approval.decided.v1` | approve / reject / request changes — carries the binding (`riskClassAtApproval`, `policyVersion`, `executionProfile`, `expiresAt`) |
+| `approval.consumed.v1` | an execution spent the grant (`consumedByAttemptId` may be null at spend time) |
+| `approval.expired.v1` | the gate found the grant past `expiresAt` and flipped it to `EXPIRED` |
+| `approval.revoked.v1` | an admin withdrew an `APPROVED` grant (`afterUse` when it had been consumed) |
+| `approval.self_approval_refused.v1` | the requester tried to approve their own request |
 | `project.created.v1` | project created |
 | `session.started.v1` / `session.failed.v1` | login success / failure |
 

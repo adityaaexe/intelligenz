@@ -1,0 +1,10 @@
+{
+  "name": "benchmark-report-incomplete",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Requirements that cannot be implemented as written.",
+  "scripts": {
+    "test": "node --test"
+  }
+}

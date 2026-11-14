@@ -4,6 +4,17 @@
 // Phase 3 execution identity: where a run executed (`ExecutionWorkspace`), which
 // attempt it was (`ExecutionAttempt`), and what it did (`ToolInvocation`).
 //
+// Phase 4 (DB-401) makes execution defensible without widening it. Five additive
+// changes, no column dropped, narrowed, or reinterpreted:
+//   - `ApprovalRequest` becomes a bound, expiring, single-use grant;
+//   - `Artifact` gains direct attempt/workspace provenance instead of a time-window
+//     heuristic;
+//   - `ExecutionAttempt` records the resources it used and why it stopped;
+//   - `ExecutionWorkspace` gains a lease and a cleanup ledger, so a reaper can act
+//     on evidence rather than on age;
+//   - `Task` records where its risk class came from.
+// No evaluation tables: the Phase 4 eval harness stores JSON on disk.
+//
 // Conventions enforced here, not just documented:
 //   - every tenant-owned table carries a non-null `orgId`, indexed;
 //   - composite indexes lead with `orgId` so a tenant list query is a range scan;
@@ -64,11 +75,21 @@ enum TaskPriority {
   urgent
 }
 
+/// Phase 4 adds two terminal states. `EXPIRED` means the grant ran past its own
+/// `expiresAt` without being used; `REVOKED` means a human withdrew it before use.
+/// Both are distinct from `REJECTED`, which is a decision made at request time:
+/// an approval that was granted and then aged out is not a rejection, and
+/// reporting it as one hides the fact that execution was once authorised.
+///
+/// Append-only. Existing labels are never removed or reordered — a Postgres enum
+/// label is positional on disk, and renaming one is a table rewrite.
 enum ApprovalStatus {
   PENDING
   APPROVED
   REJECTED
   CHANGES_REQUESTED
+  EXPIRED
+  REVOKED
 }
 
 enum RunStatus {
@@ -95,6 +116,21 @@ enum Environment {
 /// Execution workspace lifecycle (Phase 3). `preserving` is the window between
 /// "the run finished" and "the bytes are archived or removed": a separate state so
 /// a cleanup that failed is visible as `failed` rather than silently implied.
+///
+/// Phase 4 adds the states a durable reaper needs. The Phase 3 vocabulary described
+/// what happened to a run; it did not describe what happens to the directory after
+/// the process that owned it is gone. `failed` was overloaded for both "the run
+/// failed" and "the cleanup failed", which made a leaked directory indistinguishable
+/// from a successful run whose bytes were simply still there.
+///
+///   allocated       → a row exists and a path is reserved, nothing written yet
+///   finalizing      → the run is over; artifacts still being collected
+///   cleanup_pending → reclaimable, queued for the reaper
+///   cleaned         → bytes gone, verified
+///   cleanup_failed  → the reaper tried and failed; retried with a backoff
+///   quarantined     → deliberately retained (incident, evidence hold), never reaped
+///
+/// Append-only, same rule as ApprovalStatus.
 enum WorkspaceState {
   requested
   provisioning
@@ -104,6 +140,12 @@ enum WorkspaceState {
   completed
   failed
   cancelled
+  allocated
+  finalizing
+  cleanup_pending
+  cleaned
+  cleanup_failed
+  quarantined
 }
 
 // ─── Identity and tenancy ────────────────────────────────────────────────────
@@ -157,10 +199,10 @@ model User {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
-  memberships          Membership[]
-  createdTasks         Task[]            @relation("TaskCreatedBy")
-  requestedApprovals   ApprovalRequest[] @relation("ApprovalRequestedBy")
-  decidedApprovals     ApprovalRequest[] @relation("ApprovalDecidedBy")
+  memberships        Membership[]
+  createdTasks       Task[]            @relation("TaskCreatedBy")
+  requestedApprovals ApprovalRequest[] @relation("ApprovalRequestedBy")
+  decidedApprovals   ApprovalRequest[] @relation("ApprovalDecidedBy")
 }
 
 model Membership {
@@ -201,35 +243,57 @@ model Project {
 // ─── Work ────────────────────────────────────────────────────────────────────
 
 model Task {
-  id       String @id @default(uuid())
-  orgId    String
-  projectId String
+  id                 String       @id @default(uuid())
+  orgId              String
+  projectId          String
   // Denormalised from Project: a tenant filter that needs a join is a filter
   // that gets omitted (ADR-004).
-  workspaceId       String
-  title             String
-  goal              String
-  status            TaskStatus     @default(draft)
-  riskClass         RiskClass
-  priority          TaskPriority   @default(normal)
+  workspaceId        String
+  title              String
+  goal               String
+  status             TaskStatus   @default(draft)
+  // Phase 4 (D-006). Until Phase 4 this column was written from the request body and
+  // nothing verified it, so "riskClass: LOW" was a client assertion, not a
+  // classification. The column keeps its meaning in this migration — what changes is
+  // that the API will start deriving it server-side and recording the derivation in
+  // the four columns below. Existing rows keep `riskSource = 'client'`, which is the
+  // truthful description of how they were produced.
+  riskClass          RiskClass
+  /// `client` | `server`. Which authority produced `riskClass`. A string rather than
+  /// an enum: the vocabulary is policy-owned and grows (`client`, `server`, later
+  /// `replayed`), and a Postgres enum cannot gain a value in the same transaction as
+  /// the code that writes it.
+  riskSource         String       @default("client")
+  /// The server's own classification, kept beside the effective one rather than
+  /// replacing it, so a disagreement between the two is visible instead of resolved
+  /// by overwriting. Null for rows no server policy has evaluated.
+  derivedRiskClass   RiskClass?
+  /// Which policy produced `derivedRiskClass`. Without it, a class is unattributable
+  /// a week later when the thresholds have changed.
+  riskPolicyVersion  String?
+  /// The inputs and rule hits behind `derivedRiskClass`, e.g.
+  /// `{ signals: ["network-write"], matchedRules: [...] }`. JSON because the shape
+  /// belongs to the policy engine, not to the schema.
+  riskFactors        Json?
+  priority           TaskPriority @default(normal)
   // Postgres `text[]`. Acceptable for Phase 2; normalising into a child table is
   // a later migration if criteria ever need per-item status.
   acceptanceCriteria String[]
-  createdById       String
+  createdById        String
   // Client-supplied per project. `(projectId, idempotencyKey)` unique makes a
   // duplicate POST return the existing task instead of a second row (contract §6).
-  idempotencyKey    String
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  idempotencyKey     String
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
 
-  organization      Organization      @relation(fields: [orgId], references: [id], onDelete: Cascade)
-  project           Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  workspace         Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  createdBy         User              @relation("TaskCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
-  workflowRuns      WorkflowRun[]
-  artifacts         Artifact[]
-  evidence          Evidence[]
-  approvalRequests  ApprovalRequest[]
+  organization     Organization      @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  project          Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  workspace        Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  createdBy        User              @relation("TaskCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  workflowRuns     WorkflowRun[]
+  artifacts        Artifact[]
+  evidence         Evidence[]
+  approvalRequests ApprovalRequest[]
 
   executionWorkspaces ExecutionWorkspace[]
   executionAttempts   ExecutionAttempt[]
@@ -334,8 +398,27 @@ model Artifact {
   sizeBytes BigInt
   createdAt DateTime @default(now())
 
-  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
-  task         Task         @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  // ─── Phase 4: direct provenance ──────────────────────────────────────────
+  // Phase 3 attributed an artifact to an attempt by comparing timestamps, which is
+  // a guess: two attempts in the same second, or a clock that steps, produce the
+  // wrong answer and nothing detects it. These are the explicit links.
+  //
+  // Both nullable and never backfilled. NULL means "unattributed", which is the
+  // honest description of every artifact written before this column existed; the
+  // API reports it as such rather than inventing an attempt for it.
+  attemptId   String?
+  /// The directory the producing run was confined to. Carried separately from
+  /// `attemptId` because a workspace can outlive the attempt row that used it, and
+  /// "which bytes came out of this directory" survives that.
+  workspaceId String?
+
+  organization       Organization        @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  task               Task                @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  // SetNull, not Cascade: an artifact is content-addressed evidence and outlives the
+  // bookkeeping that produced it. Deleting an attempt must not delete the bytes'
+  // record — it must make the provenance honest again (NULL), not erase the artifact.
+  executionAttempt   ExecutionAttempt?   @relation(fields: [attemptId], references: [id], onDelete: SetNull)
+  executionWorkspace ExecutionWorkspace? @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
 
   // Content-addressed: a retried `persistResultActivity` that produces identical bytes
   // is the same artifact, and the database now refuses a second row for it. The worker's
@@ -343,6 +426,11 @@ model Artifact {
   @@unique([orgId, taskId, kind, checksum])
   @@index([orgId, taskId])
   @@index([taskId, createdAt])
+  // Read path: "what did attempt N produce".
+  @@index([attemptId])
+  // Also foreign-key maintenance: a SetNull parent delete without this index
+  // sequentially scans the table.
+  @@index([workspaceId])
 }
 
 model Evidence {
@@ -416,15 +504,35 @@ model ExecutionWorkspace {
   // JSON because the error shape belongs to the workspace manager, not the schema.
   error      Json?
 
-  // Restrict: an organization that has ever leased a workspace cannot be hard
-  // deleted until those rows are resolved. Same posture as AuditEvent — history
-  // outlives the aggregate.
+  // ─── Phase 4: durable lifecycle ──────────────────────────────────────────
+  // Phase 3 knew a workspace existed and what state it reached; it did not know who
+  // currently owned it, whether that owner was still alive, or how many times
+  // reclamation had been attempted. Without those three facts a reaper cannot
+  // distinguish "a live run" from "a directory left behind by a dead worker", and
+  // the safe default is to reap nothing — which is why Phase 3 had no reaper.
+  //
+  // The lease is advisory at the database level and enforced by a conditional
+  // UPDATE (`... WHERE "leaseExpiresAt" IS NULL OR "leaseExpiresAt" < now()`), so
+  // two workers can never both believe they hold the same directory.
+  leaseExpiresAt  DateTime?
+  /// Worker identity holding the lease. Opaque (`host:pid:bootId`); deliberately not
+  /// a foreign key — workers are processes, not rows.
+  leaseOwner      String?
+  /// Last liveness signal from the lease holder. A row whose heartbeat is stale but
+  /// whose lease has not expired is already suspect and should be logged, not reaped.
+  lastHeartbeatAt DateTime?
+  cleanupAttempts Int       @default(0)
+  /// The reaper's failure detail, separate from `error` above: `error` is why the run
+  /// did not work, this is why the bytes are still on disk. `{ stage, message, code }`.
+  cleanupError    Json?
+
   organization Organization @relation(fields: [orgId], references: [id], onDelete: Restrict)
   // Cascade: the directory is owned by the task; if the task is deleted the
   // directory is orphaned by definition and the row must not linger.
   task         Task         @relation(fields: [taskId], references: [id], onDelete: Cascade)
   agentRun     AgentRun?    @relation("ExecutionWorkspaceAgentRun", fields: [agentRunId], references: [id], onDelete: SetNull)
   agentRuns    AgentRun[]   @relation("AgentRunExecutionWorkspace")
+  artifacts    Artifact[]
 
   // The state board: "what is provisioning or executing in this org right now".
   @@index([orgId, state])
@@ -434,6 +542,10 @@ model ExecutionWorkspace {
   @@index([orgId, createdAt])
   // Foreign-key maintenance for the SetNull above, not a read path.
   @@index([agentRunId])
+  // The reaper's driving query: state is the filter, the deadline is the range and
+  // the sort. Leading with `state` keeps it usable for the per-state counts the
+  // dashboard needs as well.
+  @@index([state, leaseExpiresAt])
 }
 
 /// One execution of one workflow run.
@@ -465,11 +577,46 @@ model ExecutionAttempt {
   error         Json?
   createdAt     DateTime  @default(now())
 
+  // ─── Phase 4: resource accounting ────────────────────────────────────────
+  // Recorded, not yet enforced. Phase 3 limited a run with rlimits only, which bound
+  // per-process usage but not aggregate usage: a run that forked was unbounded in
+  // total. These columns are what a cgroup-backed limiter has to write for the limit
+  // to be auditable, and what "was this attempt killed or did it fail on its own"
+  // is answered from. All nullable: no Phase 3 row has these values, and a fabricated
+  // zero would be indistinguishable from a measured one.
+  /// Which resource profile the attempt ran under (e.g. `standard`, `heavy`). Null
+  /// means the attempt predates profiles, not "default".
+  executionProfile  String?
+  /// CPU consumed, in milliseconds, as reported by the supervisor after the process
+  /// group exited. Not wall time.
+  cpuTimeMs         Int?
+  /// Peak resident set. Bytes, because the numbers involved do not fit comfortably in
+  /// an Int and a silent overflow is worse than a slightly wider column.
+  memoryPeakBytes   BigInt?
+  /// Peak concurrent process count, for the pids limit.
+  pidsPeak          Int?
+  /// Why the attempt stopped: `completed | timeout | cancelled | oom | pids | cpu |
+  /// crashed`. A string, not an enum, for the same reason as `riskSource`: the set is
+  /// owned by the supervisor and grows without a migration. Null means "not recorded",
+  /// which is not the same as `completed`.
+  terminationReason String?
+  /// State of the cleanup pass for this attempt's workspace: `pending | done |
+  /// failed | skipped`. Separate from the attempt's `status` because an attempt can
+  /// succeed and still leave bytes behind.
+  cleanupState      String?
+
   // Restrict: attempt history is the audit trail for "how many times did we try".
   organization Organization @relation(fields: [orgId], references: [id], onDelete: Restrict)
   task         Task         @relation(fields: [taskId], references: [id], onDelete: Cascade)
   workflowRun  WorkflowRun  @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
   agentRun     AgentRun?    @relation(fields: [agentRunId], references: [id], onDelete: SetNull)
+
+  // The other side of the single-use approval link (Phase 4). One attempt may consume
+  // many approvals; an approval is consumed by at most one attempt, enforced by the
+  // conditional UPDATE the API performs, not by a unique constraint — a revoked
+  // approval that was never consumed must keep `consumedByAttemptId` NULL.
+  consumedApprovals ApprovalRequest[] @relation("ExecutionAttemptConsumedApproval")
+  artifacts         Artifact[]
 
   // A workflow run cannot claim attempt 3 twice. A retried activity that tries to
   // insert a duplicate gets P2002 instead of a second silent row.
@@ -513,6 +660,22 @@ model ToolInvocation {
 }
 
 // ─── Governance ──────────────────────────────────────────────────────────────
+//
+// Phase 4 turns an approval from a row that says "somebody said yes" into a grant
+// that is bound to what was approved, expires, and can be spent exactly once.
+//
+// The Phase 3 shape had three holes, each closed by a column group below:
+//
+//   1. Nothing bound the decision to the content it approved. A task could be
+//      edited between approval and execution and the approval still applied.
+//      → `taskContentHash`, `riskClassAtApproval`, `policyVersion`,
+//        `executionProfile`
+//   2. Nothing consumed an approval, so one `APPROVED` row authorised every retry
+//      forever.
+//      → `consumedAt`, `consumedByAttemptId`
+//   3. Nothing withdrew an approval, so a stale grant was indistinguishable from a
+//      live one.
+//      → `expiresAt`, `revokedAt`, `revokedById`
 
 model ApprovalRequest {
   id            String         @id @default(uuid())
@@ -526,15 +689,74 @@ model ApprovalRequest {
   createdAt     DateTime       @default(now())
   decidedAt     DateTime?
 
-  organization Organization @relation(fields: [orgId], references: [id], onDelete: Restrict)
+  // ─── Phase 4: binding ────────────────────────────────────────────────────
+  /// sha256 of the task's goal plus its acceptance criteria, in a canonical
+  /// serialisation, computed at the moment the decision was recorded. Execution
+  /// recomputes it and refuses to proceed on a mismatch — that is the whole point:
+  /// the grant is for this content, not for this row id.
+  ///
+  /// Nullable because approvals created before Phase 4 have no hash, and inventing
+  /// one now would assert that the content at approval time is the content today.
+  /// A null hash is therefore "unbound" and must be treated as not usable for an
+  /// automatic execution gate; the API decides that, the column only records.
+  taskContentHash     String?
+  /// The risk class the approver actually saw. `riskClass` above is what the row was
+  /// created with; if classification is re-run later the two diverge, and the audit
+  /// question is "what was this person told" — answered by this column.
+  riskClassAtApproval RiskClass?
+  /// Which policy version produced `riskClassAtApproval`. Same reason as
+  /// `Task.riskPolicyVersion`: a class without its policy is unattributable later.
+  policyVersion       String?
+  /// Which execution profile the grant authorises (`standard`, `heavy`, ...). A grant
+  /// for a light profile must not authorise a heavier one, so the profile is part of
+  /// what was approved rather than an execution-time choice.
+  executionProfile    String?
+
+  // ─── Phase 4: lifetime ───────────────────────────────────────────────────
+  /// When the grant stops being usable. Null means "no expiry recorded", which is the
+  /// honest state of pre-Phase-4 rows; the execution gate treats a null expiry as
+  /// unbounded and applies its own ceiling rather than pretending there is one here.
+  expiresAt           DateTime?
+  /// Single use. Set by a conditional UPDATE that also requires `consumedAt IS NULL`
+  /// and `status = 'APPROVED'`, so two concurrent workers cannot both spend the same
+  /// grant — the second update affects zero rows.
+  consumedAt          DateTime?
+  /// Which attempt spent it. SetNull rather than Restrict: attempt rows are prunable
+  /// bookkeeping, while the approval is governance history that must survive pruning.
+  /// Losing the attempt makes the link unknown (`NULL`), not the consumption undone —
+  /// `consumedAt` remains, so the grant is still spent.
+  consumedByAttemptId String?
+
+  // ─── Phase 4: withdrawal ─────────────────────────────────────────────────
+  /// Set when a human withdraws a grant that was previously approved. `status`
+  /// becomes `REVOKED` in the same write; the timestamp exists so "when" is
+  /// answerable without reading the audit log.
+  revokedAt   DateTime?
+  /// Actor id of whoever revoked it. Deliberately **not** a foreign key, unlike
+  /// `decidedById`: revocation is an escape hatch that must remain available even
+  /// when the actor's user row is being removed, and a Restrict FK here would let a
+  /// pending user deletion block an incident response. Same posture as
+  /// `Evidence.producedBy`.
+  revokedById String?
+
+  organization      Organization      @relation(fields: [orgId], references: [id], onDelete: Restrict)
   // Restrict: a task with an approval history must not vanish underneath it.
-  task         Task         @relation(fields: [taskId], references: [id], onDelete: Restrict)
-  requestedBy  User         @relation("ApprovalRequestedBy", fields: [requestedById], references: [id], onDelete: Restrict)
-  decidedBy    User?        @relation("ApprovalDecidedBy", fields: [decidedById], references: [id], onDelete: Restrict)
+  task              Task              @relation(fields: [taskId], references: [id], onDelete: Restrict)
+  requestedBy       User              @relation("ApprovalRequestedBy", fields: [requestedById], references: [id], onDelete: Restrict)
+  decidedBy         User?             @relation("ApprovalDecidedBy", fields: [decidedById], references: [id], onDelete: Restrict)
+  consumedByAttempt ExecutionAttempt? @relation("ExecutionAttemptConsumedApproval", fields: [consumedByAttemptId], references: [id], onDelete: SetNull)
 
   @@index([orgId])
   @@index([orgId, status])
   @@index([taskId])
+  // The execution gate's query: "is there a live grant for this task in this org".
+  // Covers the filter and yields the sort key; `[orgId, status]` above cannot serve
+  // it without scanning every approval in the tenant.
+  @@index([orgId, taskId, status])
+  // Expiry sweeper: `WHERE "expiresAt" < now() AND status = 'APPROVED'`.
+  @@index([expiresAt])
+  // Foreign-key maintenance for the SetNull above, not a read path.
+  @@index([consumedByAttemptId])
 }
 
 /// Append-only history. Rows are written, never updated: the mutable aggregate

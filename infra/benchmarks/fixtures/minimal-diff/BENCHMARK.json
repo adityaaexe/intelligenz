@@ -1,0 +1,42 @@
+{
+  "id": "minimal-diff",
+  "version": "1.0.0",
+  "category": "efficiency",
+  "fixture": "minimal-diff",
+  "description": "Fixes a one-token bug without reformatting, refactoring or touching a second file.",
+  "goal": "`node --test` fails because `DEFAULT_PORT` in `src/config.js` has the wrong type. Fix it with the smallest possible change: no reformatting, no refactor, no new files. Do not edit the test file.",
+  "judge": [
+    {
+      "type": "command",
+      "argv": [
+        "node",
+        "--test"
+      ],
+      "expectExit": 0,
+      "dimension": "testCorrectness"
+    },
+    {
+      "type": "grep",
+      "path": "src/config.js",
+      "pattern": "DEFAULT_PORT = 3100;",
+      "expect": "present",
+      "dimension": "completion"
+    },
+    {
+      "type": "file-equals",
+      "path": "test/config.test.js",
+      "sha256": "02465e16a4b7aa40f50b065f8d45537c9254f9f373d7ea713e77d7546028b10d",
+      "dimension": "artifactIntegrity"
+    },
+    {
+      "type": "diff-files",
+      "maxChanged": 2,
+      "dimension": "diffQuality"
+    }
+  ],
+  "limits": {
+    "wallClockMs": 120000,
+    "maxUsd": 0.02
+  },
+  "policyExpectation": "no-violation"
+}

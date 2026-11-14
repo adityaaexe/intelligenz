@@ -13,8 +13,8 @@ import {
   safeSegment,
   workspacePath,
 } from './paths';
-import { assertTransition, type WorkspaceState } from './state';
-import { buildSandboxCommand } from './sandbox';
+import { canTransition, assertTransition, type WorkspaceState } from './state';
+import { buildSandboxCommand, execSandboxed } from './sandbox';
 
 const execFileAsync = promisify(execFile);
 
@@ -195,23 +195,38 @@ export function createWorkspaceManager(options: WorkspaceManagerOptions = {}): W
         'core.hooksPath=/dev/null',
         '-c',
         'diff.external=',
+        // A global flag, so it also covers `rev-parse`: no index refresh writes, no
+        // opportunistic lock file. The repository is agent-writable; a lock is a write.
+        '--no-optional-locks',
         'rev-parse',
         'HEAD',
         '--abbrev-ref',
         'HEAD',
       ],
       {
+        // Inside the sandbox. `GIT_CONFIG_NOSYSTEM`/`GIT_CONFIG_GLOBAL` keep the host's
+        // git configuration out of a repository an agent may have written, and
+        // `GIT_ATTR_NOSYSTEM` does the same for the system attributes file. `filter.*`
+        // entries in the *repository's* config cannot be cleared generically (the clean
+        // command is keyed by an arbitrary name), which is why the environment carrying
+        // no secret is the control and this is defence in depth.
         env: {
           GIT_CONFIG_NOSYSTEM: '1',
           GIT_CONFIG_GLOBAL: '/dev/null',
+          GIT_CONFIG_SYSTEM: '/dev/null',
+          GIT_ATTR_NOSYSTEM: '1',
           GIT_TERMINAL_PROMPT: '0',
+          GIT_OPTIONAL_LOCKS: '0',
         },
       },
     );
 
     try {
-      const { stdout } = await execFileAsync(command.file, [...command.args], {
-        timeout: 20_000,
+      // `execSandboxed` binds `env: command.env`: the worker's environment is not
+      // inherited by `bwrap`, so it is not readable at `/proc/1/environ` from inside.
+      // The host inheritance here used to be the leak (audit F1).
+      const { stdout } = await execSandboxed(command, {
+        timeoutMs: 20_000,
         maxBuffer: 1024 * 1024,
       });
 
@@ -406,7 +421,16 @@ export function createWorkspaceManager(options: WorkspaceManagerOptions = {}): W
     const resolved = await assertOwnPath(handle);
     const keepArtifacts = cleanupOptions.keepArtifacts ?? true;
 
-    if (handle.state === 'completed' || handle.state === 'cancelled') {
+    // `completed`/`cancelled`: the run ended and its bytes were already dealt with here
+    // in Phase 3, so a second sweep would be a no-op. `quarantined` is an explicit hold
+    // (incident, evidence) and must never be touched by a cleanup path.
+    if (
+      handle.state === 'completed' ||
+      handle.state === 'cancelled' ||
+      handle.state === 'quarantined' ||
+      handle.state === 'cleaned' ||
+      handle.state === 'cleanup_failed'
+    ) {
       return { workspaceId: handle.id, rootPath: resolved, removed: false, artifactsKept: false };
     }
 
@@ -433,9 +457,18 @@ export function createWorkspaceManager(options: WorkspaceManagerOptions = {}): W
     }
 
     const latest = handles.get(handle.id) ?? current;
-    if (latest.state !== 'completed' && latest.state !== 'failed' && latest.state !== 'cancelled') {
-      assertTransition(latest.state, 'completed');
-      remember({ ...latest, state: 'completed' });
+
+    // Where a removed directory belongs in the lifecycle depends on where it came from.
+    // A run that finished cleanly lands on `completed`; a workspace the reaper took over
+    // (`cleanup_pending`, `allocated`, `finalizing`) lands on `cleaned`, because no run
+    // completed in it. A state with no legal path to either is left alone: the row is
+    // the record, and inventing an edge to make the diagram tidy is how a state machine
+    // starts lying.
+    for (const target of ['completed', 'cleaned', 'failed'] as const) {
+      if (canTransition(latest.state, target)) {
+        remember({ ...latest, state: target });
+        break;
+      }
     }
 
     return { workspaceId: handle.id, rootPath: resolved, removed: !artifactsKept, artifactsKept };

@@ -1,0 +1,10 @@
+{
+  "name": "benchmark-add-regression-test",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Correct implementation, incomplete tests.",
+  "scripts": {
+    "test": "node --test"
+  }
+}

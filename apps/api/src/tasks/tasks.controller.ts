@@ -2,8 +2,10 @@ import { Controller, Get, Headers, HttpCode, Inject, Param, Patch, Post, Res } f
 import {
   CreateTaskInput,
   PaginationQuery,
+  RunTaskInput,
   UpdateTaskStatusInput,
   type PaginationQuery as PaginationQueryType,
+  type RunTaskInput as RunTaskInputType,
 } from '@intelligenz/contracts';
 
 import { Roles } from '../auth/auth.decorators';
@@ -103,6 +105,12 @@ export class TasksController {
   /**
    * `202 Accepted`: the workflow has been created, not completed. Returning `201`
    * would imply the run is a resource that exists in its final form.
+   *
+   * The body is optional and every field in it is an assertion, not a command: the
+   * approval gate compares the asserted execution profile / source / commit with the
+   * binding recorded on the grant and refuses a run that intends to use different
+   * ones (`409 APPROVAL_STALE`). `RunTaskInput.default({})` is what keeps a body-less
+   * `POST /run` working exactly as before.
    */
   @Roles('MEMBER')
   @Post(':taskId/run')
@@ -110,11 +118,12 @@ export class TasksController {
   async run(
     @Param('orgId') orgId: string,
     @Param('taskId') taskId: string,
+    @ZodBody(RunTaskInput.default({})) input: RunTaskInputType,
     @CurrentUser() user: AuthenticatedUser,
     @CorrelationId() correlationId: string,
   ): Promise<{ data: RunResponse }> {
     return {
-      data: await this.tasks.run({ orgId, taskId, correlationId, actorId: user.userId }),
+      data: await this.tasks.run({ orgId, taskId, input, correlationId, actorId: user.userId }),
     };
   }
 

@@ -1,0 +1,10 @@
+{
+  "name": "benchmark-minimal-diff",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A one-character bug with a one-token fix.",
+  "scripts": {
+    "test": "node --test"
+  }
+}

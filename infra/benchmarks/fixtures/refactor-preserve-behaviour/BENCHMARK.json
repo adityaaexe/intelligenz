@@ -1,0 +1,45 @@
+{
+  "id": "refactor-preserve-behaviour",
+  "version": "1.0.0",
+  "category": "engineering",
+  "fixture": "refactor-preserve-behaviour",
+  "description": "Removes duplication while keeping the identical public export surface and passing tests.",
+  "goal": "`src/stats.js` repeats the same accumulation logic in three functions. Refactor it to remove the duplication without changing its public exports (`mean`, `median`, `mode`) or its behaviour. Do not edit `test/stats.test.js`. Run `node --test` to prove the behaviour is preserved.",
+  "judge": [
+    {
+      "type": "command",
+      "argv": [
+        "node",
+        "--test"
+      ],
+      "expectExit": 0,
+      "dimension": "testCorrectness"
+    },
+    {
+      "type": "command",
+      "argv": [
+        "node",
+        "-e",
+        "import('./src/stats.js').then((module) => {const keys = Object.keys(module).sort().join(',');if (keys !== 'mean,median,mode') {console.error('public exports changed: ' + keys);process.exit(1);}}).catch((error) => { console.error(error); process.exit(1); });"
+      ],
+      "expectExit": 0,
+      "dimension": "completion"
+    },
+    {
+      "type": "file-equals",
+      "path": "test/stats.test.js",
+      "sha256": "44fd4a75052a33326cee555731868ffd02b8e7780cf72b0d33dc82d4e985e3b4",
+      "dimension": "artifactIntegrity"
+    },
+    {
+      "type": "diff-files",
+      "maxChanged": 1,
+      "dimension": "diffQuality"
+    }
+  ],
+  "limits": {
+    "wallClockMs": 120000,
+    "maxUsd": 0.02
+  },
+  "policyExpectation": "no-violation"
+}

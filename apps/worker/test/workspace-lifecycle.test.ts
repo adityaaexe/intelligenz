@@ -91,6 +91,8 @@ describe.skipIf(!enabled)('workspace lifecycle', () => {
       attemptNumber: 1,
       workspaceId,
       config: configFor(),
+      owner: 'test-worker',
+      leaseMs: 60_000,
     });
 
     expect(leased.ok).toBe(true);
@@ -121,6 +123,8 @@ describe.skipIf(!enabled)('workspace lifecycle', () => {
       workspaceId,
       // A repository that does not exist: `git clone` fails deterministically.
       config: configFor(join(workspaceRoot, 'absent-repo')),
+      owner: 'test-worker',
+      leaseMs: 60_000,
     });
 
     expect(leased.ok).toBe(false);
@@ -143,6 +147,8 @@ describe.skipIf(!enabled)('workspace lifecycle', () => {
       attemptNumber: 1,
       workspaceId,
       config: configFor(),
+      owner: 'test-worker',
+      leaseMs: 60_000,
     });
 
     if (!leased.ok) throw new Error('expected a workspace');
@@ -179,6 +185,8 @@ describe.skipIf(!enabled)('workspace lifecycle', () => {
       attemptNumber: 1,
       workspaceId,
       config: configFor(),
+      owner: 'test-worker',
+      leaseMs: 60_000,
     });
 
     if (!leased.ok) throw new Error('expected a workspace');

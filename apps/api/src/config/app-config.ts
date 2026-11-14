@@ -43,6 +43,24 @@ export interface AppConfig {
    * run's transcript is evidence, and evidence is served, not guessed.
    */
   readonly workspaceRoot: string;
+  /**
+   * How long an approved grant stays usable (`APPROVAL_TTL_HOURS`, default 24). Set at
+   * creation and refreshed at the decision, so a request that waited three days for a
+   * review does not arrive already expired.
+   *
+   * A null `ApprovalRequest.expiresAt` (a pre-Phase-4 row) is evaluated against
+   * `createdAt + this value`, never as "forever".
+   */
+  readonly approvalTtlHours: number;
+  /**
+   * Repositories whose checkouts are trusted, as a comma-separated allowlist
+   * (`TRUSTED_SOURCE_REPOS`). A task is `trusted` only when its `sourceRef` matches an
+   * entry **and** it pins a `baseCommit`; a branch name is not a pin.
+   *
+   * Empty by default: nothing is trusted until an operator opts a repository in. That
+   * is why a file write on an unlisted repository is at least `HIGH` (D-006).
+   */
+  readonly trustedSourceRepos: readonly string[];
 }
 
 /**
@@ -228,7 +246,27 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     readinessTimeoutMs: readInteger(env, 'READINESS_TIMEOUT_MS', 2_000),
     artifactRoot: resolveRoot(env['ARTIFACT_ROOT'], '.artifacts', repositoryRoot),
     workspaceRoot: resolveRoot(env['WORKSPACE_ROOT'], '.workspaces', repositoryRoot),
+    approvalTtlHours: readPositiveInteger(env, 'APPROVAL_TTL_HOURS', 24),
+    trustedSourceRepos: (env['TRUSTED_SOURCE_REPOS'] ?? '')
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0),
   };
+}
+
+/**
+ * A positive integer, or the default. Zero and negatives are refused rather than
+ * accepted: `APPROVAL_TTL_HOURS=0` would expire every grant the moment it is created,
+ * which looks like a misconfiguration but behaves like an outage.
+ */
+function readPositiveInteger(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const value = readInteger(env, name, fallback);
+
+  if (value < 1) {
+    throw new Error(`${name} must be at least 1, received "${String(value)}".`);
+  }
+
+  return value;
 }
 
 /**

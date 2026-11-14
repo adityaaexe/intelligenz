@@ -130,6 +130,27 @@ export async function startAttempt(input: {
  * The terminal write for an attempt. Scoped by `orgId` even though the id is unique:
  * every write in this codebase says which tenant it belongs to.
  */
+export interface AttemptResources {
+  /**
+   * What actually bounded this attempt: the profile name (`standard`) when cgroups were
+   * enforced, or the literal `rlimit-only` when they were not. Read by an operator as
+   * "what was in force", so it is never the profile that was *intended*.
+   */
+  readonly executionProfile: string;
+  /** `cpu.stat usage_usec` → ms. Null when no cgroup existed. */
+  readonly cpuTimeMs: number | null;
+  /** `memory.peak`. BigInt because a byte count does not fit an Int comfortably. */
+  readonly memoryPeakBytes: number | null;
+  /** `pids.peak`. Null on a kernel without the file. */
+  readonly pidsPeak: number | null;
+  /** `completed | timeout | cancelled | oom | pids | cpu | crashed | workspace_error`. */
+  readonly terminationReason: string;
+}
+
+/**
+ * The terminal write for an attempt. Scoped by `orgId` even though the id is unique:
+ * every write in this codebase says which tenant it belongs to.
+ */
 export async function finalizeAttempt(input: {
   readonly orgId: string;
   readonly attemptId: string;
@@ -137,6 +158,7 @@ export async function finalizeAttempt(input: {
   readonly simulated: boolean;
   readonly error?: ExecutionResult['error'] | undefined;
   readonly finishedAt?: Date;
+  readonly resources?: AttemptResources;
 }): Promise<void> {
   await db().executionAttempt.updateMany({
     where: { id: input.attemptId, orgId: input.orgId },
@@ -145,7 +167,37 @@ export async function finalizeAttempt(input: {
       simulated: input.simulated,
       finishedAt: input.finishedAt ?? new Date(),
       ...(input.error === undefined ? {} : { error: { ...input.error } }),
+      ...(input.resources === undefined
+        ? {}
+        : {
+            executionProfile: input.resources.executionProfile,
+            cpuTimeMs: input.resources.cpuTimeMs,
+            memoryPeakBytes:
+              input.resources.memoryPeakBytes === null
+                ? null
+                : BigInt(Math.max(0, Math.round(input.resources.memoryPeakBytes))),
+            pidsPeak: input.resources.pidsPeak,
+            terminationReason: input.resources.terminationReason,
+          }),
     },
+  });
+}
+
+/**
+ * Whether this attempt's workspace bytes were reclaimed.
+ *
+ * Separate from `finalizeAttempt` on purpose: the run's outcome is decided before the
+ * cleanup runs, and a cleanup that fails after a successful run must not rewrite the
+ * run's status. That is the whole reason the column exists.
+ */
+export async function markAttemptCleanupState(input: {
+  readonly orgId: string;
+  readonly attemptId: string;
+  readonly cleanupState: 'pending' | 'done' | 'failed' | 'skipped';
+}): Promise<void> {
+  await db().executionAttempt.updateMany({
+    where: { id: input.attemptId, orgId: input.orgId },
+    data: { cleanupState: input.cleanupState },
   });
 }
 

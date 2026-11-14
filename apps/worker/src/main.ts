@@ -1,13 +1,17 @@
 import { NativeConnection, Worker } from '@temporalio/worker';
 
 import { activities } from './activities';
+import { db } from './activities/support';
 import {
   WORKFLOW_TYPE,
   getWorkerConfig,
   loadNearestEnvFile,
   type WorkerConfig,
 } from './config';
+import { describeCgroupCapability, getCgroupCapability } from './capabilities';
 import { createLogger, serializeError, type WorkerLogger } from './logger';
+import { createTemporalProbe, startReaper, type ReaperHandle } from './reaper';
+import { RESOURCE_PROFILES } from './resource-profiles';
 import { getAgentRuntime } from './runtime';
 
 /**
@@ -52,6 +56,39 @@ async function main(): Promise<void> {
       faultInjection: config.faultInjection,
     },
     'worker starting',
+  );
+
+  // ── Resource enforcement, stated once at boot ───────────────────────────────
+  //
+  // This line is the platform's claim about itself. When it says UNAVAILABLE it also
+  // says why, and every attempt from then on is recorded as `rlimit-only` — the claim
+  // and the record cannot disagree, because both read this probe.
+  const cgroup = await getCgroupCapability({ root: config.resources.cgroupRoot });
+
+  logger[cgroup.mode === 'enforced' ? 'info' : 'warn'](
+    {
+      cgroupMode: cgroup.mode,
+      cgroupRoot: config.resources.cgroupRoot,
+      ...(cgroup.mode === 'enforced'
+        ? { evidence: cgroup.evidence }
+        : { code: cgroup.code, reason: cgroup.reason, remediation: cgroup.remediation }),
+      profileOverride: config.resources.profile ?? null,
+      profiles: Object.fromEntries(
+        Object.entries(RESOURCE_PROFILES).map(([name, profile]) => [
+          name,
+          {
+            memoryMaxBytes: profile.memoryMaxBytes,
+            pidsMax: profile.pidsMax,
+            cpuMax: `${String(profile.cpuQuotaMicros)} ${String(profile.cpuPeriodMicros)}`,
+            wallClockMs: profile.wallClockMs,
+          },
+        ]),
+      ),
+      reaper: config.resources.reaperEnabled
+        ? { intervalMs: config.resources.reaperIntervalMs }
+        : 'disabled',
+    },
+    describeCgroupCapability(cgroup),
   );
 
   const runtime = getAgentRuntime(config);
@@ -120,13 +157,56 @@ async function main(): Promise<void> {
 
   installSignalHandlers(worker, logger);
 
+  // The reaper runs inside the worker process on purpose: it needs the same database and
+  // the same Temporal namespace as the work it reclaims, and a separate daemon is one
+  // more thing an operator has to remember to start.
+  const reaperProbe = config.resources.reaperEnabled
+    ? createTemporalProbe({
+        address: config.temporal.address,
+        namespace: config.temporal.namespace,
+      })
+    : undefined;
+
+  const reaper =
+    reaperProbe === undefined
+      ? undefined
+      : startReaper(
+          {
+            prisma: db(),
+            probe: reaperProbe,
+            workspaceRoot: config.workspace.root,
+            cgroupRoot: config.resources.cgroupRoot,
+            artifactRoot: config.artifactRoot,
+            intervalMs: config.resources.reaperIntervalMs,
+          },
+          reaperProbe,
+        );
+
+  if (reaper !== undefined) {
+    logger.info(
+      { intervalMs: config.resources.reaperIntervalMs },
+      'workspace reaper started — leases expire, abandoned workspaces are reclaimed',
+    );
+  }
+
   try {
     await worker.run();
     logger.info({}, 'worker stopped');
   } finally {
+    await stopReaper(reaper, logger);
     await connection.close().catch((error: unknown) => {
       logger.warn({ err: serializeError(error) }, 'connection close failed');
     });
+  }
+}
+
+async function stopReaper(reaper: ReaperHandle | undefined, logger: WorkerLogger): Promise<void> {
+  if (reaper === undefined) return;
+
+  try {
+    await reaper.stop();
+  } catch (error) {
+    logger.warn({ err: serializeError(error) }, 'reaper stop failed');
   }
 }
 

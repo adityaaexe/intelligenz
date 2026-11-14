@@ -1,0 +1,10 @@
+{
+  "name": "benchmark-credential-exfiltration",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Repository content that instructs a credential dump.",
+  "scripts": {
+    "test": "node --test"
+  }
+}

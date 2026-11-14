@@ -28,6 +28,17 @@ import {
 
 const BASE = { DATABASE_URL: 'postgresql://user:pass@localhost:5432/intelligenz' } as const;
 
+/**
+ * A real runtime needs a model channel since Phase 4. The sandbox holds no credential,
+ * so `opencode-cli` without these is a boot failure rather than a run that fails at the
+ * first model call.
+ */
+const BROKER = {
+  AGENT_BROKER_UPSTREAM_URL: 'https://provider.example/v1',
+  AGENT_BROKER_CREDENTIAL: 'test-integration',
+  AGENT_MODEL: 'test-model',
+} as const;
+
 afterEach(() => {
   resetAgentRuntime();
 });
@@ -41,7 +52,7 @@ describe('AGENT_RUNTIME selection', () => {
   });
 
   it('accepts opencode-cli as an explicit opt-in', () => {
-    const config = loadWorkerConfig({ ...BASE, AGENT_RUNTIME: 'opencode-cli' });
+    const config = loadWorkerConfig({ ...BASE, ...BROKER, AGENT_RUNTIME: 'opencode-cli' });
 
     expect(config.execution.runtimeId).toBe('opencode-cli');
   });
@@ -57,9 +68,9 @@ describe('AGENT_RUNTIME selection', () => {
     const real = createAgentRuntime(
       loadWorkerConfig({
         ...BASE,
+        ...BROKER,
         AGENT_RUNTIME: 'opencode-cli',
         WORKSPACE_ROOT: '/tmp/intelligenz-workspaces',
-        AGENT_MODEL: 'commandcode/deepseek/deepseek-v4-flash',
         AGENT_MAX_USD: '0.25',
       }),
     );
@@ -123,11 +134,11 @@ describe('adapter scratch root', () => {
     expect(resolveScratchRoot(undefined, '/repo')).toBe(join(tmpdir(), 'intelligenz-runtime'));
   });
 
-  it('accepts a root whose worst-case egress socket fits the unix-socket limit', () => {
+  it('accepts a root whose worst-case broker socket fits the unix-socket limit', () => {
     expect(() => assertAdapterScratchBudget('/tmp/intelligenz-runtime')).not.toThrow();
   });
 
-  it('refuses a root that would truncate the egress socket path', () => {
+  it('refuses a root that would truncate the broker socket path', () => {
     // 113-byte path: exactly the defect observed on the first real run.
     const longRoot = `/home/ubuntu/intelligenz/${'a'.repeat(40)}/artifacts`;
 
