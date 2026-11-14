@@ -62,10 +62,11 @@ EXIT=0
 EXIT=0
 ```
 
-**This gate spends money.** `packages/agent-runtime/test/opencode-cli.test.ts` runs the
-real adapter against the real model for the contract suite; it is skipped only when
-`OPENCODE_CLI_SKIP=1`. A "green unit suite" here includes real provider calls. See §3 for
-what that does and does not prove.
+**This gate does not spend money by default.** `packages/agent-runtime/test/opencode-cli.test.ts`
+runs the adapter against a fixture; the two contract cases that need a live provider are skipped
+unless **both** `IZ_REAL_PROVIDER=1` and a non-empty `AGENT_MODEL` are set. (Phase 4 replaced the
+old `OPENCODE_CLI_SKIP` opt-out with this opt-in; the polarity is inverted, and only cases 7 and 8
+are gated, not the whole describe.) See §3 for what a green suite does and does not prove.
 
 ### 1.4 `pnpm --filter @intelligenz/api test:e2e`
 
@@ -302,10 +303,12 @@ Stated plainly, because a green run invites over-reading:
    (`deterministic: false`), it appears in the report as skipped, and the reason is in
    `runtime-contract.ts`. It is not a flaky test being suppressed; it is a property the
    adapter cannot have. §4 of `RUNTIME-ADAPTER-GUIDE.md` explains what that costs.
-6. **The real adapter suite is skipped without credentials.** `OPENCODE_CLI_SKIP=1` skips
-   the whole `opencode-cli` describe. A CI environment without provider credentials would
-   show those tests as skipped, not failed — the green/red signal would be weaker than it
-   looks.
+6. **The live-provider cases skip silently without credentials.** Two contract cases in
+   `opencode-cli.test.ts` need a real provider. They run only when `IZ_REAL_PROVIDER=1`
+   **and** `AGENT_MODEL` is non-empty; otherwise they skip and print the reason. A CI
+   environment without provider credentials therefore shows them as skipped, not failed — the
+   green/red signal is weaker than it looks. (Phase 4 replaced `OPENCODE_CLI_SKIP` with this
+   opt-in; the flag no longer exists.)
 7. **The UI was verified against seeded data.** `executions.e2e.ts` reads attempts the
    seed created (`local-simulated`). The real run's rows come from the same endpoints and
    were not opened in a browser.
@@ -341,5 +344,11 @@ npx vitest run \
   --reporter=verbose
 ```
 
-To skip the paid runs: `OPENCODE_CLI_SKIP=1 pnpm test`. The suite will report the
-`opencode-cli` describe as skipped; nothing else changes.
+To run the two cases that need a live provider (paid, opt-in):
+
+```bash
+IZ_REAL_PROVIDER=1 AGENT_MODEL=gemini-3.5-flash-lite pnpm test
+```
+
+Without both variables they skip, and the suite reports them as skipped. `OPENCODE_CLI_SKIP`
+no longer exists; Phase 4 inverted the switch from opt-out to opt-in.

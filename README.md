@@ -5,21 +5,30 @@ workspace → project → task → Temporal workflow → agent run → artifact 
 audit event.
 
 Two runtimes exist. The **default is simulated**: deterministic, no shell, no network, no
-model call, $0. **Phase 3 adds a real path**: `opencode-cli` runs an actual coding agent
+model call, $0. **Phase 3 added a real path**: `opencode-cli` runs an actual coding agent
 inside a `bwrap` sandbox against a disposable clone of a repository. That path is opt-in,
 spends provider credit, and is proven end to end on this host — one task, one fixture
 repository, `$0.0006`.
 
+**Phase 4 makes that path defensible.** The provider credential no longer enters the
+sandbox: authentication is terminated by a host broker over a per-attempt unix socket
+(`packages/egress-broker`). Resource limits are per-attempt cgroup v2 files — memory, pids
+and CPU — with effective values read back from the kernel, and they are **opt-in** (see
+*Enable cgroup enforcement*). Risk is derived server-side and approvals are bound,
+single-use and re-checked at the worker. There is an evaluation harness, and its real
+baseline is blocked by provider quota, not by code.
+
 It runs on one host with PostgreSQL and the Temporal dev server. Redis is running but no
-code path uses it. It is **not production-ready**, and the real runtime has an open
-security condition: the sandbox can read the provider credential it runs with. Read
-[`docs/engineering/DEPLOYMENT-READINESS.md`](docs/engineering/DEPLOYMENT-READINESS.md) and
-[`docs/engineering/WORKSPACE-SECURITY-MODEL.md`](docs/engineering/WORKSPACE-SECURITY-MODEL.md)
+code path uses it. It is **not production-ready**: single host, shared kernel with no
+seccomp or per-tenant uid, an unauthenticated Temporal listener on loopback, one database
+role, no CI execution, no remote push, and no real evaluation baseline. Read
+[`docs/engineering/PHASE-4-IMPLEMENTATION-STATUS.md`](docs/engineering/PHASE-4-IMPLEMENTATION-STATUS.md)
+§7 and [`docs/engineering/DEPLOYMENT-READINESS.md`](docs/engineering/DEPLOYMENT-READINESS.md)
 before treating any part of it as deployable.
 
 > **Repository state.** The instructions below assume a checkout that contains the
-> Phase 2 and Phase 3 source. At the time of writing the implementation is an uncommitted
-> working tree on `phase-3/real-agent-runtime`; the last commit is `43d5c17`. If a fresh
+> Phase 2, 3 and 4 source. At the time of writing the implementation is an uncommitted
+> working tree on `phase-4/execution-trust`; the last commit is `c104e64`. If a fresh
 > clone contains no `apps/api/src` or `apps/web/src`, the tree was never committed. See
 > `docs/engineering/DEPLOYMENT-READINESS.md` §2.3.
 
@@ -41,9 +50,10 @@ You do **not** get a coding agent by default. `LocalSimulatedRuntime` is determi
 no shell, no network and no model call, and costs `$0.0000`.
 
 If you opt in (§ *Run a real task*), you get a real agent — `opencode v2.2.7` in a `bwrap`
-sandbox, with a shell, editing a disposable clone. That path is proven, but narrow: one
-fixture repository, one adapter, no evaluation set, and a credential residual that makes it
-unsuitable for a repository whose contents are sensitive.
+sandbox, with a shell, editing a disposable clone, authenticating through a host broker
+that holds the key. That path is proven, but narrow: one fixture repository, one adapter,
+a small simulated-only evaluation set, and resource limits that are on only when you start
+the worker through the cgroup wrapper.
 
 ---
 
@@ -163,9 +173,15 @@ pnpm --filter @intelligenz/web test:e2e
 ```
 
 Current results, with literal output:
-[`docs/engineering/PHASE-3-TEST-RESULTS.md`](docs/engineering/PHASE-3-TEST-RESULTS.md) for
-the current tree. Note that `pnpm audit --audit-level high` currently exits 1 (two high
-PostCSS advisories through Next.js); that gate is red, not waived.
+[`docs/engineering/PHASE-4-TEST-RESULTS.md`](docs/engineering/PHASE-4-TEST-RESULTS.md) for the
+current tree: typecheck 0, lint 0, build 0, **62 test files / 655 passed / 11 skipped**,
+79 API e2e, 57 web e2e. The 11 skips are environmental and each prints its reason: 8 cgroup
+kill tests need the full-tier wrapper, 2 live-provider contract cases need
+`IZ_REAL_PROVIDER=1`, and 1 broker run needs a real provider.
+
+`pnpm audit --audit-level high` **exits 0**: no high or critical advisory remains (the Phase 3
+gate was red with two). Three vulnerabilities remain — 1 low, 2 moderate — carried through
+Next.js dependencies; they are not waived, they are visible on every run.
 
 ---
 
@@ -175,10 +191,15 @@ PostCSS advisories through Next.js); that gate is red, not waived.
 > default. Nothing here happens unless you set `AGENT_RUNTIME=opencode-cli`, and the
 > worker refuses to boot that adapter without a positive `AGENT_MAX_USD`.
 >
-> **Do not point this at a repository whose contents are sensitive.** The sandbox can read
-> the provider credential it authenticates with, and can send it to the provider. Read
-> [`docs/engineering/WORKSPACE-SECURITY-MODEL.md`](docs/engineering/WORKSPACE-SECURITY-MODEL.md)
-> §5 first.
+> **The credential does not enter the sandbox.** The agent authenticates through a
+> per-attempt unix socket to a host broker, which injects the provider key at request
+> time. The sandbox holds a random canary that authenticates nothing. Read
+> [`docs/engineering/PHASE-4-CREDENTIAL-ISOLATION.md`](docs/engineering/PHASE-4-CREDENTIAL-ISOLATION.md)
+> for the traffic path and the mount table.
+>
+> **Resource limits are opt-in.** Start the worker through the cgroup wrapper or it runs
+> with rlimits only and records `executionProfile = "rlimit-only"`. See *Enable cgroup
+> enforcement* below.
 
 **Prerequisites, measured on this host:**
 
@@ -195,9 +216,20 @@ PostCSS advisories through Next.js); that gate is red, not waived.
 |---|---|---|
 | `AGENT_RUNTIME` | `opencode-cli` enables real execution; `local-simulated` does nothing | `local-simulated` |
 | `WORKSPACE_SOURCE_REPO` | Repository cloned per attempt. Unset = empty workspace, and the adapter refuses | unset |
-| `AGENT_MODEL` | Provider-qualified model id | `commandcode/deepseek/deepseek-v4-flash` |
+| `AGENT_MODEL` | **Upstream** model id. The sandbox sees `izbroker/<key>`, never the vendor | required |
+| `AGENT_BROKER_UPSTREAM_URL` | Provider base URL the host broker forwards to | required |
+| `AGENT_BROKER_CREDENTIAL` | opencode integration id read from the host SQLite store | unset |
+| `AGENT_BROKER_CREDENTIAL_ENV` | Or: environment variable holding the key | unset |
 | `AGENT_MAX_USD` | Hard per-run cap, checked against provider-reported cost. `0` is refused | `0.5` |
 | `AGENT_BWRAP_PATH` | Sandbox binary. Missing `bwrap` fails closed, never unsandboxed | `bwrap` on `PATH` |
+
+**Where the credential lives since Phase 4.** Nowhere inside the sandbox. The agent
+authenticates through a per-attempt channel to a host broker
+(`packages/egress-broker`), which injects the provider key at request time and strips
+anything the sandbox sent. The sandbox holds a random canary that authenticates
+nothing, and no credential database is mounted — so `~/.local/share/opencode` is absent
+rather than narrowed. See `docs/engineering/PHASE-4-BASELINE.md` for the measurement
+that forced this, and `docs/engineering/PHASE-4-CREDENTIAL-ISOLATION.md` for the path.
 
 **Fastest proof — no API, no Temporal.** Provisions a temporary workspace, runs one real
 task, prints the diff, re-runs the suite inside the sandbox, and checks the fixture is
@@ -206,6 +238,40 @@ untouched:
 ```bash
 npx tsx infra/scripts/p3-real-run.ts
 ```
+
+The structured Gate A proof — sandbox probe, broker refusals attempted from **inside** the
+sandbox, one real run, log scan, provider-reported cost — is:
+
+```bash
+npx tsx infra/scripts/p4-broker-proof.ts
+```
+
+**Live-provider contract tests.** Two adapter tests need a real provider and are skipped
+by default. Both conditions are required:
+
+```bash
+IZ_REAL_PROVIDER=1 AGENT_MODEL=gemini-3.5-flash-lite \
+  npx vitest run packages/agent-runtime/test/opencode-cli.test.ts
+```
+
+`IZ_REAL_PROVIDER` must be exactly `1`, and `AGENT_MODEL` must be non-empty; anything else
+skips with the reason printed. There is no other switch — `OPENCODE_CLI_SKIP` no longer
+exists.
+
+**Enable cgroup enforcement (opt-in).** Aggregate memory, pid and CPU limits require one
+root step and a wrapper. Without them the worker records `rlimit-only` and refuses `HEAVY`.
+
+```bash
+# Once, as root. Idempotent.
+sudo bash infra/scripts/setup-cgroups.sh
+
+# Then start the worker inside its delegated leaf:
+sudo bash infra/scripts/worker-with-cgroup.sh pnpm dev
+```
+
+Verify with `cat /sys/fs/cgroup/intelligenz/cgroup.controllers` (expect `cpu memory pids`).
+A plain directory or a non-delegated tree is reported as `unavailable`, not as
+`enforced`. See `docs/engineering/PHASE-4-RESOURCE-ENFORCEMENT.md`.
 
 **The product path — API → Temporal → worker → agent:**
 
@@ -216,7 +282,9 @@ pnpm temporal:start
 # Terminal B
 AGENT_RUNTIME=opencode-cli \
 WORKSPACE_SOURCE_REPO=infra/fixtures/sample-repo \
-AGENT_MODEL=commandcode/deepseek/deepseek-v4-flash \
+AGENT_MODEL=gemini-3.5-flash \
+AGENT_BROKER_UPSTREAM_URL=https://generativelanguage.googleapis.com/v1beta/openai \
+AGENT_BROKER_CREDENTIAL=google \
 AGENT_MAX_USD=0.5 \
 pnpm dev
 ```
@@ -273,15 +341,20 @@ apps/
   worker/              Temporal worker · runTaskWorkflow + six activities
 packages/
   contracts/           Zod DTOs, event envelope, task state machine
-  database/            Prisma schema (15 models), migrations, seed
+  database/            Prisma schema, migrations, seed
   design-system/       138 --iz-* tokens, 14 component modules
-  workspace-manager/   paths, containment, git, bwrap argv, lifecycle
+  workspace-manager/   paths, containment, git, bwrap argv, leases, reclaim
   agent-runtime/       AgentRuntime port · LocalSimulatedRuntime · OpencodeCliRuntime
-infra/scripts/         bootstrap-db · start-temporal · dev · verify · p3-real-run · p3-sandbox-audit
+  egress-broker/       per-attempt unix socket · capability token · credential injection
+  evaluation/          benchmarks · judges · rubric · security gate · result ledger
+infra/scripts/         bootstrap-db · start-temporal · dev · verify · eval
+                       setup-cgroups · worker-with-cgroup · check-spawn-discipline
+                       p3-real-run · p3-sandbox-audit · p4-broker-proof
+infra/benchmarks/      8 fixtures, simulations, results, BASELINE-simulated.md
 infra/fixtures/        sample-repo, the repository a real run clones
 docs/
-  decisions/           ADR-001 … ADR-010, OPEN-DECISIONS
-  engineering/         Phase 2 record + Phase 3 execution, security, lifecycle
+  decisions/           ADR-001 … ADR-010, OPEN-DECISIONS (D-006)
+  engineering/         Phase 2/3/4 records: status, tests, security, resources, evaluation
   design/              frozen Phase 1 design output
 prototype/             frozen Phase 1 prototype: plain HTML/CSS/JS, zero dependencies
 ```
@@ -293,27 +366,38 @@ Not created on purpose: `apps/orchestrator`, `apps/research`, `apps/engineering`
 
 ## What is real and what is simulated
 
-**Real:** PostgreSQL rows, tenant scoping, role checks, task state machine, approvals,
-Temporal workflow execution, workflow run ids, artifact files with SHA-256 checksums,
-audit events with correlation ids, workspace leases, attempt identity, tool traces.
+**Real:** PostgreSQL rows, tenant scoping, role checks, task state machine, server-derived
+risk, bound single-use approvals re-checked at the worker, Temporal workflow execution,
+workflow run ids, artifact files with SHA-256 checksums and attempt provenance, audit
+events with correlation ids, workspace leases and a reaper, attempt identity, tool traces.
 
 **Real, opt-in:** the agent's work, when `AGENT_RUNTIME=opencode-cli`. A real model runs
-in a `bwrap` sandbox against a disposable clone, edits files, runs a shell, and reports
-tokens and cost. It is proven on one fixture repository. It is not proven on a real
-codebase, and its sandbox has an open credential condition (§ *Run a real task*).
+in a `bwrap` sandbox against a disposable clone, edits files, runs a shell, authenticates
+through a host broker, and reports tokens and cost. It is proven on one fixture
+repository. It is not proven on a real codebase. **Resource enforcement is separately
+opt-in** and needs the cgroup wrapper; without it the attempt says `rlimit-only`.
+
+**Measured, but blocked:** the evaluation harness runs and its simulated baseline is
+recorded. A **real** baseline does not exist: the provider's free tier returned
+`429 RESOURCE_EXHAUSTED` (20 requests/day). See
+[`docs/engineering/PHASE-4-EVALUATION-FRAMEWORK.md`](docs/engineering/PHASE-4-EVALUATION-FRAMEWORK.md).
 
 **Simulated by default:** `LocalSimulatedRuntime` has no shell, no network, no repository
 read, no model call, no code change, no cost. `AgentRun.model` is the literal string
 `simulated`. Every surface labels a run from its `simulated` column, so the two cases are
-never visually confused.
+never visually confused. The evaluation suite's 87.50 mean is a **harness self-test**, not
+a model score.
 
 **Not implemented:** everything except Overview and the execution detail screen. Fifteen of
 sixteen navigation destinations are placeholders. There is no mutation UI: you can read,
-not create, run, cancel or approve in the browser.
+not create, run, cancel or approve in the browser. Disk quota and I/O bandwidth are not
+enforced. CI has never run. Nothing is pushed.
 
 The full list: [`docs/engineering/PHASE-3-KNOWN-LIMITATIONS.md`](docs/engineering/PHASE-3-KNOWN-LIMITATIONS.md)
-(thirty-one items). Phase 2's [`KNOWN-LIMITATIONS.md`](docs/engineering/KNOWN-LIMITATIONS.md) is
-still true where not superseded.
+(thirty-one items, some superseded by Phase 4 and marked there). Phase 2's
+[`KNOWN-LIMITATIONS.md`](docs/engineering/KNOWN-LIMITATIONS.md) is still true where not superseded.
+Phase 4 residuals are in
+[`docs/engineering/PHASE-4-IMPLEMENTATION-STATUS.md`](docs/engineering/PHASE-4-IMPLEMENTATION-STATUS.md) §7.
 
 ---
 
@@ -331,6 +415,12 @@ still true where not superseded.
 | Real run fails with `SANDBOX_UNAVAILABLE` | `bwrap` is not installed, and the adapter refuses to run unsandboxed | Install bubblewrap, or set `AGENT_BWRAP_PATH` |
 | Real run fails with `WORKSPACE_REQUIRED` | `WORKSPACE_SOURCE_REPO` is unset, so the lease is empty and there is no `repo/` | Set it to a local path or a clone URL |
 | Worker exits at boot: `AGENT_MAX_USD must be greater than 0` | `AGENT_RUNTIME=opencode-cli` with `AGENT_MAX_USD=0` | Set a positive cap; a real runtime with no cap is refused on purpose |
+| Worker exits at boot: `AGENT_BROKER_UPSTREAM_URL is required` | Real runtime selected, but no broker configured | The sandbox has no credential; the broker is the only authentication path. Set the URL |
+| Worker exits at boot: `A provider credential source is required` | Neither `AGENT_BROKER_CREDENTIAL` nor `AGENT_BROKER_CREDENTIAL_ENV` is set | Set one; the broker reads the key host-side |
+| Attempts record `executionProfile = "rlimit-only"` | Worker started outside the cgroup wrapper | `sudo bash infra/scripts/setup-cgroups.sh`, then start via `worker-with-cgroup.sh` |
+| `HEAVY` refused with `RESOURCE_PROFILE_UNAVAILABLE` | cgroups unavailable, and `HEAVY` requires aggregate limits | Run the setup script and the wrapper, or avoid `HEAVY` |
+| Broker `403 BROKER_TOKEN` in a run that should work | The sandbox presented a foreign or absent capability | Check the per-attempt socket and config; a stale socket from a crashed attempt is unlinked on the next start |
+| `EADDRINUSE` on the broker socket after a worker crash | A previous attempt left `broker.sock` (audit F6) | Per-attempt directories make this rare; remove the stale attempt directory |
 
 ---
 
@@ -338,9 +428,17 @@ still true where not superseded.
 
 | Document | What it answers |
 |---|---|
-| [`docs/engineering/PHASE-3-IMPLEMENTATION-STATUS.md`](docs/engineering/PHASE-3-IMPLEMENTATION-STATUS.md) | What Phase 3 actually runs, the real run's numbers, and where the chain stops being real |
-| [`docs/engineering/PHASE-3-TEST-RESULTS.md`](docs/engineering/PHASE-3-TEST-RESULTS.md) | Literal gate output and the fifteen security cases, with gaps stated |
-| [`docs/engineering/WORKSPACE-SECURITY-MODEL.md`](docs/engineering/WORKSPACE-SECURITY-MODEL.md) | The mount table, what is not enforced, and the credential residual |
+| [`docs/engineering/PHASE-4-IMPLEMENTATION-STATUS.md`](docs/engineering/PHASE-4-IMPLEMENTATION-STATUS.md) | What Phase 4 actually runs, the executed chain, how to run a real task, and the residuals |
+| [`docs/engineering/PHASE-4-TEST-RESULTS.md`](docs/engineering/PHASE-4-TEST-RESULTS.md) | Literal gate output, the 28 attack scenarios and the 15 authorization cases, with gaps stated |
+| [`docs/engineering/PHASE-4-SECURITY-RESULTS.md`](docs/engineering/PHASE-4-SECURITY-RESULTS.md) | The independent audit, its verdict history, and the remediation record (F1–F3 closed, F4–F6 open) |
+| [`docs/engineering/PHASE-4-CREDENTIAL-ISOLATION.md`](docs/engineering/PHASE-4-CREDENTIAL-ISOLATION.md) | Traffic path, where the secret lives, the mount table, adversarial results |
+| [`docs/engineering/PHASE-4-RESOURCE-ENFORCEMENT.md`](docs/engineering/PHASE-4-RESOURCE-ENFORCEMENT.md) | Profiles, effective-vs-configured limits, measured kills, and what is **not** enforced |
+| [`docs/engineering/PHASE-4-EVALUATION-FRAMEWORK.md`](docs/engineering/PHASE-4-EVALUATION-FRAMEWORK.md) | Benchmarks, rubric, disqualification, simulated baseline, blocked real baseline |
+| [`docs/engineering/PHASE-4-WORKSPACE-RECOVERY.md`](docs/engineering/PHASE-4-WORKSPACE-RECOVERY.md) | Leases, the reaper decision table, the 13 crash tests, quarantine rules |
+| [`docs/engineering/PHASE-4-IMPLEMENTATION-PLAN.md`](docs/engineering/PHASE-4-IMPLEMENTATION-PLAN.md) | The executed decomposition, unit by unit, recorded post-hoc |
+| [`docs/engineering/PHASE-3-IMPLEMENTATION-STATUS.md`](docs/engineering/PHASE-3-IMPLEMENTATION-STATUS.md) | What Phase 3 runs, the real run's numbers, and where the chain stops being real |
+| [`docs/engineering/PHASE-3-TEST-RESULTS.md`](docs/engineering/PHASE-3-TEST-RESULTS.md) | Phase 3 literal gate output and the fifteen security cases |
+| [`docs/engineering/WORKSPACE-SECURITY-MODEL.md`](docs/engineering/WORKSPACE-SECURITY-MODEL.md) | The Phase 3 mount table and credential residual (superseded on the credential by Phase 4) |
 | [`docs/engineering/EXECUTION-LIFECYCLE.md`](docs/engineering/EXECUTION-LIFECYCLE.md) | States, rows, cancellation, failure and recovery for an operator |
 | [`docs/engineering/RUNTIME-ADAPTER-GUIDE.md`](docs/engineering/RUNTIME-ADAPTER-GUIDE.md) | How to write a second adapter against the port |
 | [`docs/engineering/PHASE-3-KNOWN-LIMITATIONS.md`](docs/engineering/PHASE-3-KNOWN-LIMITATIONS.md) | Thirty-one limitations, flat, including the evaluation gap |
@@ -350,7 +448,7 @@ still true where not superseded.
 | [`docs/engineering/SECURITY-RESULTS.md`](docs/engineering/SECURITY-RESULTS.md) | Phase 2 security findings; `PHASE-3-SECURITY-RESULTS.md` holds the Phase 3 audit and remediation |
 | [`docs/engineering/DEPLOYMENT-READINESS.md`](docs/engineering/DEPLOYMENT-READINESS.md) | Why this is not deployable, and the path to staging |
 | [`docs/engineering/KNOWN-LIMITATIONS.md`](docs/engineering/KNOWN-LIMITATIONS.md) | Phase 2 limitations, still true where not superseded |
-| [`docs/decisions/`](docs/decisions/) | ADR-001 … ADR-010 and the open product decisions |
+| [`docs/decisions/`](docs/decisions/) | ADR-001 … ADR-010, D-006 and the open product decisions |
 | [`apps/api/api-contract.md`](apps/api/api-contract.md) | Route map, envelopes, error codes, state machine |
 | [`DESIGN.md`](DESIGN.md) · [`docs/design/`](docs/design/) · [`prototype/`](prototype/) | Frozen Phase 1 design authority |
 
@@ -367,6 +465,26 @@ Every claim in the engineering documents uses contract §13:
 - `NOT IMPLEMENTED` — nothing exists.
 
 A stub, fixture or mock is never described as a working integration.
+
+---
+
+## Not production-ready
+
+This build is a local vertical slice. The Phase 4 controls are real and measured; the
+deployment around them is not. Before any shared environment, at minimum:
+
+- a seccomp allowlist and either a per-tenant uid or a VM/microVM boundary — the sandbox
+  shares the host kernel and the worker's uid today;
+- the cgroup wrapper in the start path, with an alert when an attempt records `rlimit-only`;
+- a filesystem quota and an I/O limit — neither is enforced by the current cgroups;
+- an authenticated Temporal listener, a database role separated from the worker's
+  credential store, and a secret manager instead of `opencode.db`;
+- CI that actually runs, and a real evaluation baseline (currently **BLOCKED** by provider
+  quota);
+- audit F4–F6 closed, and a decision recorded for the open residuals in
+  `PHASE-4-IMPLEMENTATION-STATUS.md` §7.
+
+Nothing in this repository has been pushed to a remote.
 
 ---
 

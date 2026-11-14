@@ -44,16 +44,24 @@ evidence can be found in `PHASE-3-SECURITY-RESULTS.md`.
    assistive technology.
    *Unblocks with:* a manual NVDA/VoiceOver pass over the execution detail screen.
 
-6. **The real adapter suite spends provider credit, and skips silently without it.**
-   `pnpm test` makes real model calls unless `OPENCODE_CLI_SKIP=1`. In an environment
-   without credentials the whole `opencode-cli` describe is skipped, so the suite reports
-   green while testing nothing about the real adapter.
+6. **The live-provider cases spend provider credit, and skip silently without it.**
+   `pnpm test` contacts a real provider only when `IZ_REAL_PROVIDER=1` **and** `AGENT_MODEL`
+   are both set (Phase 4 replaced the old `OPENCODE_CLI_SKIP` opt-out). Without them the two
+   contract cases that need a provider are skipped, so the suite reports green while testing
+   nothing about a live model.
    *Unblocks with:* a separate, clearly-labelled paid test job, and a CI check that fails
    when a required suite is skipped.
 
 ---
 
 ## Security residuals
+
+> **Phase 4 supersedes items 7, 8 and 10.** The credential is no longer in the sandbox
+> (host broker), aggregate cgroup limits exist although they are opt-in, and D-006 is
+> decided and implemented server-side. The text below is the Phase 3 record and is kept
+> unedited; read `PHASE-4-CREDENTIAL-ISOLATION.md`, `PHASE-4-RESOURCE-ENFORCEMENT.md` and
+> `PHASE-4-TEST-RESULTS.md` §5 for the current state. Items 9 (shared kernel, no seccomp)
+> remains true.
 
 7. **The provider credential is readable inside the sandbox (F2).**
    `<data>/opencode/opencode.db` — 1.07 GB — holds the credential and, by the audit's

@@ -199,3 +199,5 @@ gate is only an API-layer courtesy.
 ### Owner
 
 Founder / product owner. This is a risk-appetite decision, not an engineering one.
+
+> **Decided (Phase 4, 2026-11-14):** the entry above is kept as the Phase 3 record and is not amended. Option B was superseded by a stronger rule — server-derived classification plus bound, single-use approvals, self-approval refused by default. Rationale, rejected alternatives and residual limits: [`docs/engineering/decisions/D-006-risk-classification-and-approval.md`](../engineering/decisions/D-006-risk-classification-and-approval.md).
