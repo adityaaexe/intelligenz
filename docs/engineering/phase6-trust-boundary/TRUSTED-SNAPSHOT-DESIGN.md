@@ -22,20 +22,27 @@ filesystem, not by a program the repository can configure.
 
 `.git` is still **read**, but only as metadata: `config` digest, `HEAD`, and (name, kind,
 sha256) for every hook, under `SnapshotGitMetadata`. That answers "did the repository's own
-control surface change", and it never substitutes for observing the tree.
+control surface change", and it never substitutes for observing the tree. A `.git/hooks`
+that is a symbolic link is recorded by its target (`hooksDirectoryLinkTarget`) and
+contributes **no** hook entries: a link is a fact about the repository's control surface,
+and listing what it points at would make that field a read primitive for the host
+filesystem.
 
 ## Traversal
 
 | Property | Implementation | Line |
 |---|---|---|
-| `lstat` only, never `stat` | symlinks classified, not followed | `snapshot.ts:239` |
-| Symlink target recorded as a string | `readlink`, hashed as `symlink:<target>` | `:320` |
-| Lexical containment | `isContained()` on every directory **and** every entry; throws `SNAPSHOT_PATH_ESCAPE` | `:462`, `:495` |
-| `realpath` deliberately **not** used | would follow exactly the symlinks the module refuses to | `:426` |
-| `.git` excluded at any depth | skipped in the walk, recorded as metadata instead | `:481` |
-| Deterministic order | `Buffer.compare` on path bytes, not `Array.sort` (UTF-16 would mis-order astral characters) | `:187-193` |
-| Deterministic truncation | sorted frontier, breadth-first, so a bounded walk stops in the same place on every host | `:442-454` |
-| Root must be a real directory | rejects symlinked or non-directory root | `:666` |
+| `lstat` only, never `stat` | symlinks classified, not followed | `snapshot.ts:361` |
+| Symlink target recorded as a string | `readlink`, hashed as `symlink:<target>` | `:391` |
+| **Every directory is enumerated through one helper** | `listDirectory()` `lstat`s the path first; a symlink is recorded by target and **never listed**. Used for the content walk and for `.git/hooks`. | `:391` |
+| Lexical containment of every path string | `isContained()` on every directory **and** every entry; throws `SNAPSHOT_PATH_ESCAPE` | `:671`, `:713` |
+| Contested entries are refused | `open(O_RDONLY \| O_NOFOLLOW)` + `fstat`; `dev`/`ino`/`size` compared with the `lstat` that classified the entry | `:301` |
+| `realpath` deliberately **not** used | would follow exactly the symlinks the module refuses to | `:671` |
+| `.git` excluded at any depth | skipped in the walk, recorded as metadata instead | `:729` |
+| Definite git metadata is not read through links | `config`/`index`/`hooks` follow the same rule; `.git/HEAD` and `.git` itself are read with `O_NOFOLLOW` | `:433`, `:470` |
+| Deterministic order | `Buffer.compare` on path bytes, not `Array.sort` (UTF-16 would mis-order astral characters) | `:221` |
+| Deterministic truncation | sorted frontier, breadth-first, so a bounded walk stops in the same place on every host | `:690` |
+| Root must be a real directory | rejects symlinked or non-directory root | `:912` |
 
 ## Entry model
 
@@ -48,14 +55,60 @@ partial answer.
 
 ## Consistency during capture
 
-A file can change between `lstat` and `readFile`. The implementation hashes the bytes it
-actually read and compares against the size `lstat` reported; a mismatch is the observable
-signal that the entry was not stable, which is why the size is carried alongside the digest
-rather than being decorative (`:205`).
+A file can change between `lstat` and the read that hashes it. Four things are checked, and
+they are not the same check:
+
+1. **The path is opened without following a link.** `O_NOFOLLOW` makes `open` fail (`ELOOP`)
+   if the final component became a symlink after it was classified as a regular file. That
+   swap is the `lstat` → `open` race, and it used to be resolved in the attacker's favour.
+2. **The descriptor is the inode that was classified.** `fstat` is compared with the
+   `lstat` result: different `dev`/`ino` or a different `size` is a contested entry, and a
+   contested entry **fails** — it is reported as `stopReason: 'unstable'`, never hashed.
+3. **The descriptor did not change while it was read.** `size` and `mtimeMs` are re-read
+   after hashing; a writer that appended or rewrote during the read is detected.
+4. **The bytes hashed match the size the budget was checked against.** A short read with an
+   unchanged descriptor size would be a digest covering fewer bytes than it claims.
+
+What this does **not** catch, stated plainly because an earlier version of this document
+implied otherwise: **a same-size, in-place rewrite that also preserves `mtimeMs`.** The
+inode does not change, the size does not change, and the timestamp is under the writer's
+control (`utimes`). One pass cannot distinguish that from a quiet file, and a second pass
+narrows the window without closing it. The old document said the size check was "the
+observable signal that the entry was not stable"; it is a signal for a size *change*, and
+that is all it ever was. The consequence is bounded: the recorded digest is of a byte
+sequence that may not have existed at any single instant, and a later snapshot of the same
+path will report a different digest, so a rewrite cannot make a changed file look unchanged
+*relative to the baseline*.
 
 A directory that disappears after being queued (`ENOENT`) is not ignored — the walk stops
 with `stopReason: 'unreadable'`, because the tree it was describing is no longer the tree
-that exists.
+that exists. A directory that was queued as a directory and is a symlink by the time it is
+enumerated stops the walk with `stopReason: 'unstable'` for the same reason: it is not the
+tree that was classified.
+
+## What "never descend through a link" covers, exactly
+
+`isContained()` is a lexical check on path strings, and a path string built from a symlinked
+parent passes it every time. Containment is therefore the *second* line, not the first. The
+first is that no enumeration ever happens through a link:
+
+* the walk only queues a path after `lstat` reports a real directory, and `listDirectory()`
+  re-`lstat`s immediately before `readdir`;
+* `.git/hooks` — the field that made this concrete, because `readdir` on a symlinked hooks
+  directory returned `/etc` and every name in it read as a path inside the root — goes
+  through the same helper. A symlinked hooks directory is recorded as
+  `hooksDirectoryLinkTarget` and produces zero hook entries;
+* `.git` itself, and `.git/HEAD`, are read with `O_NOFOLLOW`: a link is a link, and the
+  honest answer for "HEAD is a link" is `null`.
+
+A **parent** directory swapped for a link between the `readdir` that produced a name and the
+`open` that hashes it is still not closed by this: Node exposes no `openat` over a directory
+descriptor, so the final path is always resolved from the root. The identity check makes the
+swap *detected* whenever the target is a different inode, which is every case except a
+same-inode/same-size substitution. The same window exists, one step earlier, between
+`listDirectory`'s `lstat` and its `readdir`: a directory that becomes a link in that instant
+would be listed through. Closing it needs `open(O_DIRECTORY | O_NOFOLLOW)` followed by a
+`readdir` on the descriptor, which the Node `fs` API does not offer.
 
 ## Bounds, and the failure direction
 
@@ -67,8 +120,8 @@ An incomplete snapshot is **not** authority, and the chain enforces it end to en
 ```
 snapshot.complete: false
   → manifest.complete: false
-  → evidence.authoritative: manifest.complete           (evidence.ts:242)
-  → Artifact.authoritative = evidence.authoritative && workspaceId !== null   (persist-result.ts:354)
+  → evidence.authoritative: manifest.complete           (evidence.ts:412)
+  → Artifact.authoritative = evidence.authoritative && workspaceId !== null   (persist-result.ts:365)
 ```
 
 The artifact is still written. It is written as **not authoritative**. That is the correct
@@ -112,14 +165,20 @@ meaningful source change by inventing an ignore rule.
 6. **Path bytes.** Names are carried as JavaScript strings from `readdir`. A name that is not
    valid UTF-8 cannot be represented faithfully by that API; such an entry would be
    represented lossily rather than rejected. Recorded as a known limitation.
-7. **This is not isolation.** A hash establishes content identity, not authenticity. There is
+7. **A same-size rewrite is not detected.** See "Consistency during capture": if a writer
+   changes bytes without changing the inode, the size or `mtimeMs`, one pass records a
+   digest of a state that may never have existed at a single instant. It cannot make a
+   changed file look unchanged against a *baseline*, and a later snapshot reports a
+   different digest, but the `after` fingerprint of that entry is not provably true of any
+   instant.
+8. **This is not isolation.** A hash establishes content identity, not authenticity. There is
    no signing key and no signature, and the same-UID worker compromise remains open.
 
 ## Evidence paths
 
 - `packages/workspace-manager/src/snapshot.ts` (schemas, traversal, `.git` metadata, bounds)
 - `packages/workspace-manager/src/manifest.ts` (canonical form, digest, change derivation)
-- `apps/worker/src/activities/evidence.ts` (capture + `manifestsEqual`/`verifyManifestFile`)
-- `apps/worker/src/activities/execute-agent.ts:613,756,1007` (capture points)
-- `apps/worker/src/activities/persist-result.ts:270-380` (authority persistence)
+- `apps/worker/src/activities/evidence.ts` (capture, final-evidence outcome, `verifyManifestFile`)
+- `apps/worker/src/activities/execute-agent.ts:701,844,1149` (capture points)
+- `apps/worker/src/activities/persist-result.ts:365` (authority persistence; workspace binding at `:513`)
 - `packages/database/prisma/migrations/20261115180000_phase6_host_evidence_authority/`

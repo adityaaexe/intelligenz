@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -5,7 +6,7 @@ import { join } from 'node:path';
 import { WorkflowNotFoundError } from '@temporalio/client';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { PrismaClient } from '@intelligenz/database';
-import { workspacePath, type WorkspaceState } from '@intelligenz/workspace-manager';
+import { reclaimWorkspace, workspacePath, type WorkspaceState } from '@intelligenz/workspace-manager';
 
 import {
   classifyProbeError,
@@ -352,6 +353,161 @@ describe.skipIf(!enabled)('reaper', () => {
     expect(row.cleanupAttempts).toBe(1);
     expect(await exists(seeded.derivedPath)).toBe(false);
   }, 30_000);
+
+  /**
+   * F-G3 — the reaper must not delete the bytes its own authority rows point at.
+   *
+   * `keepArtifacts: !artifactsPreserved` was one flag for two directories. Once the
+   * artifacts copy succeeded it became `false`, `reclaimWorkspace` forced `evidencePresent`
+   * off, and the whole workspace — manifests included — was removed. Measured before the
+   * fix: `{ removed: true, evidenceKept: false }` with `Artifact.authoritative: true` and a
+   * URI into the deleted directory.
+   */
+  describe('F-G3: evidence is retained with the artifacts, or demoted with a reason', () => {
+    /** An `evidence/` directory with a real manifest file and its digest. */
+    async function writeEvidence(rootPath: string): Promise<{ uri: string; digest: string }> {
+      const directory = join(rootPath, 'evidence');
+      await mkdir(directory, { recursive: true });
+
+      const body = '{"complete":true,"changeCount":0}\n';
+      const uri = join(directory, 'change-manifest.json');
+      await writeFile(uri, body);
+
+      return { uri, digest: createHash('sha256').update(body).digest('hex') };
+    }
+
+    /** The authority row a production run would have written for that manifest. */
+    async function writeAuthority(
+      seeded: Seeded,
+      evidence: { uri: string; digest: string },
+    ): Promise<string> {
+      const attempt = await client.executionAttempt.findFirstOrThrow({
+        where: { orgId: seeded.tenant.orgId, taskId: seeded.task.taskId },
+        select: { id: true },
+      });
+
+      const artifact = await client.artifact.create({
+        data: {
+          orgId: seeded.tenant.orgId,
+          taskId: seeded.task.taskId,
+          runtimeId: 'opencode-cli',
+          kind: 'change-manifest',
+          uri: evidence.uri,
+          checksum: evidence.digest,
+          sizeBytes: 32n,
+          attemptId: attempt.id,
+          workspaceId: seeded.workspaceId,
+          evidenceSource: 'host-snapshot',
+          authoritative: true,
+          manifestDigest: evidence.digest,
+          initialManifestDigest: 'a'.repeat(64),
+          finalManifestDigest: 'b'.repeat(64),
+        },
+        select: { id: true },
+      });
+
+      return artifact.id;
+    }
+
+    it('keeps evidence beside a preserved artifact, and the URI stays readable', async () => {
+      const seeded = await seed({ label: 'reaper-evidence-kept' });
+      await writeWorkspaceTree(seeded.derivedPath);
+
+      // The adapter produced something, so `preserveArtifacts` succeeds and the workspace's
+      // `artifacts/` copy is dropped. That is the branch that used to take `evidence/` too.
+      await mkdir(join(seeded.derivedPath, 'artifacts'), { recursive: true });
+      await writeFile(join(seeded.derivedPath, 'artifacts', 'transcript.ndjson'), '{"line":1}\n');
+
+      const evidence = await writeEvidence(seeded.derivedPath);
+      await writeAuthority(seeded, evidence);
+
+      const result = await runReaperPass(deps());
+      const action = actionFor(result, seeded.workspaceId);
+
+      expect(action?.outcome).toBe('reaped');
+      expect(action?.authorityRevoked).toBe(0);
+
+      // The directory survives with the evidence in it, and nothing else: the checkout and
+      // the copied artifacts are gone.
+      expect(await exists(join(seeded.derivedPath, 'evidence'))).toBe(true);
+      expect(await exists(join(seeded.derivedPath, 'repo'))).toBe(false);
+      expect(await exists(join(seeded.derivedPath, 'artifacts'))).toBe(false);
+
+      // The URI the row names is still readable. This is the assertion the finding asked
+      // for: "retained" means the bytes can still be produced, not that a directory exists.
+      expect(await readFile(evidence.uri, 'utf8')).toContain('changeCount');
+
+      const artifact = await client.artifact.findFirstOrThrow({
+        where: { orgId: seeded.tenant.orgId, kind: 'change-manifest' },
+        select: { authoritative: true },
+      });
+
+      expect(artifact.authoritative).toBe(true);
+    }, 30_000);
+
+    it('demotes an authoritative row whose bytes were removed, with the reason recorded', async () => {
+      const seeded = await seed({ label: 'reaper-evidence-gone' });
+      await writeWorkspaceTree(seeded.derivedPath);
+
+      const evidence = await writeEvidence(seeded.derivedPath);
+      await writeAuthority(seeded, evidence);
+
+      // ── The removal path ────────────────────────────────────────────────────
+      //
+      // Not simulated: the reclaim primitive is asked to keep nothing, which is the exact
+      // call whose evidence branch produced the original `{ removed: true }`. The rows are
+      // left behind, which is the state the reaper has to be able to repair.
+      const reclaimed = await reclaimWorkspace({
+        root: workspaceRoot,
+        ids: {
+          orgId: seeded.tenant.orgId,
+          taskId: seeded.task.taskId,
+          workspaceId: seeded.workspaceId,
+        },
+        recordedRootPath: workspacePath(workspaceRoot, {
+          orgId: seeded.tenant.orgId,
+          taskId: seeded.task.taskId,
+          workspaceId: seeded.workspaceId,
+        }),
+        keepArtifacts: false,
+        keepEvidence: false,
+      });
+
+      expect(reclaimed).toMatchObject({ removed: true, evidenceRemoved: true });
+
+      // ── The repair ─────────────────────────────────────────────────────────
+      const result = await runReaperPass(deps());
+      const action = actionFor(result, seeded.workspaceId);
+
+      expect(action?.outcome).toBe('reaped');
+      expect(action?.authorityRevoked).toBe(1);
+
+      const artifact = await client.artifact.findFirstOrThrow({
+        where: { orgId: seeded.tenant.orgId, kind: 'change-manifest' },
+        select: { authoritative: true },
+      });
+
+      // Never an authority row pointing at nothing. The demotion is the whole point.
+      expect(artifact.authoritative).toBe(false);
+
+      const audit = await client.auditEvent.findFirst({
+        where: {
+          orgId: seeded.tenant.orgId,
+          eventType: 'artifact.authority_revoked.v1',
+          aggregateId: seeded.workspaceId,
+        },
+      });
+
+      expect(audit).not.toBeNull();
+      // The reason, and where the claim pointed — an operator can tell a lost volume from
+      // a path that was never written.
+      expect(audit?.payload).toMatchObject({
+        workspaceId: seeded.workspaceId,
+        reason: 'evidence bytes are not readable for an authoritative artifact row',
+        artifacts: [{ kind: 'change-manifest', uri: evidence.uri }],
+      });
+    }, 30_000);
+  });
 
   describe('negative controls: the reaper does not delete', () => {
     it('leaves a workspace alone while its workflow is still running', async () => {

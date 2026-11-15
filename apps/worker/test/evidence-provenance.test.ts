@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { mkdtemp } from 'node:fs/promises';
@@ -6,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { ExecutionResult } from '@intelligenz/agent-runtime';
 import type { PrismaClient } from '@intelligenz/database';
-import { createWorkspaceManager, evidencePath } from '@intelligenz/workspace-manager';
+import { createWorkspaceManager, evidencePath, manifestDigest, serialiseManifest } from '@intelligenz/workspace-manager';
 import type { WorkspaceHandle } from '@intelligenz/workspace-manager';
 
 import { persistResult } from '../src/activities/persist-result';
@@ -350,6 +351,154 @@ describe.runIf(enabled)('artifact provenance — the manifest is authority, the 
     ).rejects.toThrow(/EVIDENCE_INTEGRITY_FAILED|does not describe its own bytes/);
 
     expect(await client.artifact.count({ where: { orgId: arrangement.tenant.orgId } })).toBe(0);
+  });
+
+  /**
+   * F-G6 — the body must agree with the record, not only with itself.
+   *
+   * The pre-fix check was: `checksum === manifestDigest`, the file's length, and the file's
+   * hash. Every one of those is satisfied by a body rewritten to `complete: false,
+   * changeCount: 0, changes: []` and presented with a re-hashed envelope, because all the
+   * values agree with each other and none of them agrees with the run. The record they have
+   * to agree with is `ExecutionWorkspace`, written by the worker before the agent existed.
+   */
+  it('refuses an internally consistent body that claims a different final tree than the workspace recorded', async () => {
+    // The positive control first, or "refused" below proves only that something is broken.
+    const control = await arrange('evidence-workspace-binding-control');
+    const controlSummary = control.summary;
+    if (controlSummary === null) throw new Error('unreachable');
+
+    // The record production writes: both digests, before the summary is returned.
+    await client.executionWorkspace.update({
+      where: { id: control.workspaceId },
+      data: {
+        initialManifestDigest: controlSummary.initialManifestDigest,
+        finalManifestDigest: controlSummary.finalManifestDigest,
+      },
+    });
+
+    await persistResult({
+      orgId: control.tenant.orgId,
+      taskId: control.task.taskId,
+      result: { ...resultFor(control), evidence: controlSummary },
+    });
+
+    const persisted = await client.artifact.findFirst({
+      where: { orgId: control.tenant.orgId, kind: 'change-manifest' },
+    });
+    expect(persisted?.authoritative).toBe(true);
+
+    // ── The forgery ─────────────────────────────────────────────────────────
+    const arrangement = await arrange('evidence-workspace-binding-forged');
+    const summary = arrangement.summary;
+    if (summary === null) throw new Error('unreachable');
+
+    await client.executionWorkspace.update({
+      where: { id: arrangement.workspaceId },
+      data: {
+        initialManifestDigest: summary.initialManifestDigest,
+        finalManifestDigest: summary.finalManifestDigest,
+      },
+    });
+
+    const path = join(evidencePath(arrangement.rootPath), CHANGE_MANIFEST_FILE);
+    const body = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+    const forgedFinal = 'b'.repeat(64);
+
+    // Self-consistent in every way the old check looked at: the body is re-serialised
+    // canonically, its digest is recomputed, and the envelope is rewritten to match.
+    (body['final'] as Record<string, unknown>)['digest'] = forgedFinal;
+    const bytes = Buffer.from(serialiseManifest(body as never), 'utf8');
+    const digest = manifestDigest(body as never);
+
+    await writeFile(path, bytes);
+
+    await expect(
+      persistResult({
+        orgId: arrangement.tenant.orgId,
+        taskId: arrangement.task.taskId,
+        result: {
+          ...resultFor(arrangement),
+          evidence: {
+            ...summary,
+            manifestDigest: digest,
+            finalManifestDigest: forgedFinal,
+            artifact: { ...summary.artifact, checksum: digest, sizeBytes: bytes.byteLength },
+          },
+        },
+      }),
+    ).rejects.toThrow(/EVIDENCE_INTEGRITY_FAILED|workspace recorded final/);
+
+    expect(
+      await client.artifact.count({ where: { orgId: arrangement.tenant.orgId, authoritative: true } }),
+    ).toBe(0);
+  });
+
+  it('refuses an authoritative claim whose own body says the walk was incomplete', async () => {
+    const arrangement = await arrange('evidence-body-incomplete');
+    const summary = arrangement.summary;
+    if (summary === null) throw new Error('unreachable');
+
+    const path = join(evidencePath(arrangement.rootPath), CHANGE_MANIFEST_FILE);
+    const body = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+
+    // The reviewer's probe: a body that no longer claims to have seen the whole tree,
+    // re-hashed and presented with an envelope that agrees with it — except that the
+    // envelope still calls itself authority.
+    body['complete'] = false;
+    body['stopReason'] = 'final-incomplete';
+    body['changes'] = [];
+    body['changeCount'] = 0;
+
+    const bytes = Buffer.from(serialiseManifest(body as never), 'utf8');
+    const digest = manifestDigest(body as never);
+
+    await writeFile(path, bytes);
+
+    await expect(
+      persistResult({
+        orgId: arrangement.tenant.orgId,
+        taskId: arrangement.task.taskId,
+        result: {
+          ...resultFor(arrangement),
+          evidence: {
+            ...summary,
+            manifestDigest: digest,
+            complete: false,
+            authoritative: true,
+            changeCount: 0,
+            artifact: { ...summary.artifact, checksum: digest, sizeBytes: bytes.byteLength },
+          },
+        },
+      }),
+    ).rejects.toThrow(/authoritative manifest cannot describe an incomplete walk/);
+  });
+
+  it('refuses a manifest body that is not JSON, rather than crashing', async () => {
+    const arrangement = await arrange('evidence-body-garbage');
+    const summary = arrangement.summary;
+    if (summary === null) throw new Error('unreachable');
+
+    const path = join(evidencePath(arrangement.rootPath), CHANGE_MANIFEST_FILE);
+    const bytes = Buffer.from('this is not a manifest\n', 'utf8');
+    const digest = createHash('sha256').update(bytes).digest('hex');
+
+    await writeFile(path, bytes);
+
+    await expect(
+      persistResult({
+        orgId: arrangement.tenant.orgId,
+        taskId: arrangement.task.taskId,
+        result: {
+          ...resultFor(arrangement),
+          evidence: {
+            ...summary,
+            manifestDigest: digest,
+            artifact: { ...summary.artifact, checksum: digest, sizeBytes: bytes.byteLength },
+          },
+        },
+      }),
+    ).rejects.toThrow(/EVIDENCE_INTEGRITY_FAILED|not JSON/);
   });
 
   it('does not re-attribute a content-addressed manifest to a later attempt', async () => {

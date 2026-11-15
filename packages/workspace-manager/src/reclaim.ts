@@ -21,7 +21,9 @@ import { artifactsPath, assertContained, evidencePath, safeSegment, workspacePat
  *      path that happens to be inside the root — which is precisely how a symlinked
  *      `orgId` turns `rm -rf` into a host deletion.
  *   4. The resolved path must equal the resolved expected path and be inside the root.
- *   5. Only then is anything removed, and `artifacts/` survives by default.
+ *   5. Only then is anything removed. `artifacts/` survives by default and `evidence/`
+ *      follows it, but each has its own flag: an artifacts copy that succeeded is not a
+ *      reason to drop the manifest, which nothing else holds.
  *
  * "Never delete on age alone" is enforced by the caller (the reaper requires an expired
  * lease and no live workflow); "never recursively delete an unvalidated path" is enforced
@@ -41,6 +43,17 @@ export interface ReclaimRequest {
   /** The row's `rootPath`. Compared against the recomputed path; never the target. */
   readonly recordedRootPath: string;
   readonly keepArtifacts?: boolean;
+  /**
+   * Whether `evidence/` survives. Defaults to `keepArtifacts`.
+   *
+   * They are separate flags because they answer separate questions. `artifacts/` is the
+   * adapter's output: it can be copied to an artifact store and the workspace copy dropped.
+   * `evidence/` is the host manifest and the snapshots behind it, the only bytes that can
+   * explain what the run did, and no copy of it exists anywhere. One flag for both meant a
+   * successful artifacts copy silently removed the authority — while the `Artifact` rows
+   * kept `authoritative: true` and a URI into the deleted directory.
+   */
+  readonly keepEvidence?: boolean;
 }
 
 export interface ReclaimResult {
@@ -58,6 +71,14 @@ export interface ReclaimResult {
    * one and dropped the other is a fact an operator should see rather than infer.
    */
   readonly evidenceKept: boolean;
+  /**
+   * True when an `evidence/` directory existed and this call removed it.
+   *
+   * Reported so the caller can act on it rather than discover it later: bytes gone while an
+   * `Artifact` row still points at them is the one state that must never be left behind, and
+   * a boolean is what makes a demotion possible in the same operation.
+   */
+  readonly evidenceRemoved: boolean;
   /** True when there was nothing to remove. Idempotent, not an error. */
   readonly alreadyAbsent: boolean;
 }
@@ -192,25 +213,37 @@ export async function reclaimWorkspace(request: ReclaimRequest): Promise<Reclaim
       removed: true,
       artifactsKept: false,
       evidenceKept: false,
+      evidenceRemoved: false,
       alreadyAbsent: true,
     };
   }
 
   const keepArtifacts = request.keepArtifacts ?? true;
+  // Defaulted to `keepArtifacts` so every existing caller keeps the meaning it had, while a
+  // caller that copies artifacts elsewhere can still say "the manifest stays".
+  const keepEvidence = request.keepEvidence ?? keepArtifacts;
+
   const artifacts = artifactsPath(resolvedExpected);
-  const artifactsPresent = keepArtifacts && (await exists(artifacts));
+  const artifactsExist = await exists(artifacts);
+  const artifactsPresent = keepArtifacts && artifactsExist;
 
   // `evidence/` is preserved on the same terms, and its presence alone is enough to take
   // the preserve branch. Without this, a reaped workspace whose adapter produced no
   // artifacts would lose the manifests while `finalManifestDigest` stayed in the row —
   // a digest pointing at bytes nothing can produce again.
   const evidence = evidencePath(resolvedExpected);
-  const evidencePresent = keepArtifacts && (await exists(evidence));
+  const evidenceExist = await exists(evidence);
+  const evidencePresent = keepEvidence && evidenceExist;
+  const evidenceRemoved = evidenceExist && !keepEvidence;
   const preserved = artifactsPresent || evidencePresent;
 
   if (preserved) {
     for (const entry of await readdir(resolvedExpected)) {
-      if (entry === 'artifacts' || entry === 'evidence') continue;
+      // Each directory is skipped only when it is being kept. A workspace whose artifacts
+      // were copied out has `artifactsPresent: false`, so this branch removes the copy
+      // while the evidence beside it survives — which is the whole point of two flags.
+      if (entry === 'artifacts' && artifactsPresent) continue;
+      if (entry === 'evidence' && evidencePresent) continue;
 
       await rm(join(resolvedExpected, entry), { recursive: true, force: true });
     }
@@ -231,6 +264,7 @@ export async function reclaimWorkspace(request: ReclaimRequest): Promise<Reclaim
     removed: !preserved,
     artifactsKept: artifactsPresent,
     evidenceKept: evidencePresent,
+    evidenceRemoved,
     alreadyAbsent: false,
   };
 }

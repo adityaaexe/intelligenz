@@ -9,6 +9,7 @@ import {
   EVIDENCE_SOURCE_GIT_IN_SANDBOX,
   EVIDENCE_SOURCE_HOST_SNAPSHOT,
   verifyManifestFile,
+  type ManifestExpectation,
 } from './evidence';
 import { agentRunIdFor, artifactIdFor, evidenceIdFor, executionWorkspaceIdFor } from './ids';
 import { db, nonRetryable } from './support';
@@ -94,7 +95,12 @@ export async function persistResult(
    * is the only place both are available.
    */
   if (result.evidence !== undefined) {
-    const problem = await verifyManifestFile(result.evidence);
+    // The record the worker wrote *before* the agent ran, read outside the transaction for
+    // the same reason the bytes are: file I/O and a lock are a bad pair. This resolves the
+    // same (newest) run → attempt → derived workspace the transaction does, so the value
+    // compared and the value written cannot be about different attempts.
+    const expected = await workspaceEvidenceBinding({ orgId, taskId });
+    const problem = await verifyManifestFile(result.evidence, expected);
 
     if (problem !== null) {
       throw nonRetryable(
@@ -494,6 +500,53 @@ function normaliseInvocations(result: ExecutionResult): {
  * attempt (a runtime that needs none, a provisioning failure, a row written before Phase 3).
  * The caller turns that into `authoritative = false` — less claim, never more.
  */
+/**
+ * The two snapshot digests `ExecutionWorkspace` recorded for the attempt this result
+ * belongs to.
+ *
+ * "Belongs to" is resolved exactly as the write resolves it — newest run for the task,
+ * newest attempt of that run, workspace id derived from the pair — because a comparison
+ * against a different attempt's record would be a check that can pass for the wrong reason.
+ * `null` means there is nothing to compare with (no run yet, or a row that predates the
+ * columns); `verifyManifestFile` treats that as "cannot contradict" rather than as a match.
+ */
+async function workspaceEvidenceBinding(input: {
+  readonly orgId: string;
+  readonly taskId: string;
+}): Promise<ManifestExpectation | null> {
+  const run = await db().workflowRun.findFirst({
+    where: { orgId: input.orgId, taskId: input.taskId },
+    orderBy: { createdAt: 'desc' },
+    select: { id: true },
+  });
+
+  if (run === null) return null;
+
+  const attempt = await db().executionAttempt.findFirst({
+    where: { orgId: input.orgId, workflowRunId: run.id },
+    orderBy: { attemptNumber: 'desc' },
+    select: { attemptNumber: true },
+  });
+
+  if (attempt === null) return null;
+
+  const workspace = await db().executionWorkspace.findFirst({
+    where: {
+      id: executionWorkspaceIdFor(run.id, attempt.attemptNumber),
+      orgId: input.orgId,
+      taskId: input.taskId,
+    },
+    select: { initialManifestDigest: true, finalManifestDigest: true },
+  });
+
+  if (workspace === null) return null;
+
+  return {
+    initialManifestDigest: workspace.initialManifestDigest,
+    finalManifestDigest: workspace.finalManifestDigest,
+  };
+}
+
 async function resolveWorkspaceId(
   transaction: Prisma.TransactionClient,
   input: {

@@ -1776,3 +1776,386 @@ conclusions I reached in round 3.
 | claim-release reachability | `grep` + `execution-boundary.test.ts:1893` | not imported from `src/activities/` |
 
 Verification status: **verified** for every command and probe result quoted here.
+
+---
+
+# Addendum — SEC-605 Gate G re-review of `9461d27`
+
+**Commit reviewed:** `9461d2773a2902dee91d0f36a22977356548c01e`
+**Parent:** `58476b0a105c3fb405d63278d38e1eb965fc28d4`
+**Branch:** `phase-5/isolation-readiness`
+**Reviewer:** Security Architect (independent; did not author this commit)
+**Date:** 2026-11-15
+**Method:** read every new module end to end, traced the four call paths named in the claim
+(snapshot → manifest → capture → persist), ran the shipped suites, and ran seven adversarial
+probes that live outside the repository (`/tmp/opencode/gateg-probes/`, scratch trees under
+`/home/ubuntu/.cache/gateg/`). Every probe that asserts "nothing happened" has a positive
+control in the same run. Two mutations were applied to a *scratch copy* of
+`packages/workspace-manager` to test assertion sensitivity; the repository was not modified
+except for this file.
+
+## Verdict
+
+**FAIL — the core mechanism is real and the headline attack is genuinely closed, but two
+agent-reachable paths break the boundary this gate exists to establish, and a third deletes
+evidence after the fact.**
+
+What is verified, and is the hardest part of this commit: the authority is now a host walk.
+Staging, a `clean` filter, a commit, `textconv`, an external diff and a hook all leave
+`git diff` empty or lying, and none of them moves the manifest. I measured each of those
+against a live git binary with a positive control, not by reading comments. That is a real
+improvement over the previous evidence path and it should not be lost in the verdict.
+
+The verdict is FAIL because the walk is not contained and the evidence is not undeletable:
+
+1. **`.git/hooks` as a directory symlink escapes the tree.** `readGitMetadata` calls
+   `readdir(join(gitPath, 'hooks'))` (`snapshot.ts:359`) and then `lstat`s and hashes each
+   name; `isContained` (`snapshot.ts:368`) is lexical, so `<root>/.git/hooks/<anything>`
+   passes. Measured: `.git/hooks -> /etc` produced 98 hook entries with the SHA-256 of
+   `/etc/passwd`; `.git/hooks -> <outside dir>` hashed files outside the workspace. The
+   agent can create that symlink inside its own checkout. The same swap during a run
+   produces **zero change rows** (`changeCount: 0`, `complete: true`) because the
+   manifest compares `entries` only and `.git` is excluded from `entries` — the only trace
+   is that the two side digests differ.
+2. **One `chmod 000` directory deletes the manifest, and the task still succeeds.**
+   `captureFinalEvidence` catches the `EACCES` from `readdir` and returns `null`
+   (`evidence.ts:256-266`); `attachEvidence` then returns the adapter's result unchanged
+   (`execute-agent.ts:497`), `finalStatus` stays `succeeded` (`:968-984`). Measured: initial
+   snapshot present, final snapshot file never written, no manifest, no artifact row, one
+   warning log. The agent does not have to forge the evidence — it only has to make its own
+   report impossible to produce.
+3. **The reaper deletes `evidence/` after preserving artifacts.** `reaper.ts:497` calls
+   `reclaimWorkspace({ keepArtifacts: !artifactsPreserved })`; with `false`,
+   `evidencePresent` is gated off (`reclaim.ts:212`) and the whole directory is removed
+   (`reclaim.ts:220`). Measured: `removed: true`, `evidenceKept: false`, directory gone —
+   while the `Artifact` row keeps `authoritative: true` and a `uri` that can never be read
+   again. This directly contradicts the comment added in this commit at `reclaim.ts:203-214`.
+
+So: **the bytes on disk are now authority; the definition of which bytes are looked at, and
+whether a report exists at all, is still the agent's.**
+
+| Question | Answer |
+|---|---|
+| Is the staging/filter/commit attack closed? | **Yes.** Verified with live git and positive controls. |
+| Does the walk stay inside the workspace? | **No.** `.git/hooks` directory symlink; also a race on the final component. |
+| Can the agent suppress its own manifest? | **Yes**, with one unreadable directory; the task still reports success. |
+| Does evidence survive cleanup? | **Normal cleanup yes; the reaper no.** |
+| Is the Git report demoted? | **Yes**, on both create and update (`persist-result.ts:301,314`). |
+| Is Phase 5 regressed? | **No.** Diff touches no cgroup/isolation/volume/termination file; targeted suites green. |
+
+## G-01…G-20 acceptance matrix
+
+| # | Question | Verdict | Evidence |
+|---|---|---|---|
+| **G-01** | Git staging cannot shape authority | **PASS** | Probe §A: modified file, `git add -A`, `git diff` = **0 bytes**, staged diff 152 bytes; manifest = `modified`, `after.sha256` = SHA-256 of the on-disk bytes. Mutation M1 (comparator blind to `sha256`) makes this test fail. |
+| **G-02** | Clean/smudge filter cannot execute during snapshotting | **PASS** | Probe §B: control `git diff` ran the filter (marker appeared, 150-byte diff); snapshot pair ran with the same armed config and the marker never appeared; manifest hashed `SECRET=THIRD`, the disk bytes, not the filtered text. |
+| **G-03** | Hooks, external diff, textconv cannot execute during snapshotting | **PASS** | Probe §C/§D/p6b: `git commit` fired the hook (control true); `git diff --ext-diff` fired the external diff (control true); `git diff` on a binary-marked file fired textconv (`plainFired: true`, which is the exact command shape the old collector used) — and none of the three fired during a snapshot pair. |
+| **G-04** | A symlink or path replacement cannot escape the workspace | **FAIL** | Root symlink → `SNAPSHOT_ROOT_INVALID`; entry symlinks (`..`, absolute, chain, `../../../etc/passwd`) recorded and never followed; `/etc/passwd` digest absent from `entries`. **But** `.git/hooks -> /etc` produced 98 `git.hooks` entries including `/etc/passwd`'s SHA-256 (probe §I/§J). Containment is lexical and a parent component is not checked. |
+| **G-05** | A file cannot change during capture without detection | **FAIL** | Probe §Q: 96 MiB file rewritten in place, same size, during the walk → `complete: true`, `stopReason: null`, and the recorded SHA-256 is **neither** the original nor the final content. The size comparison at `snapshot.ts:564` cannot see a same-size rewrite. Design doc line 51-54 claims the mechanism covers "a file can change between `lstat` and `readFile`"; it covers only the size-changing case. Secondary, reasoned: `digestFile` opens by path (`snapshot.ts:213`) after `lstat` (`:504`) with no `O_NOFOLLOW` and no `fstat`/dev-ino comparison, so a file swapped to a symlink in that window is read through; a swap to a FIFO blocks. Not reproduced (race), marked as such. |
+| **G-06** | The final snapshot cannot occur while an agent process is active | **PASS** (caveat) | `execute-agent.ts:756` runs after `runtime.execute` resolves; `killCgroup` at `:931` is **after** the snapshot, so the guarantee is not the cgroup. It is `--unshare-pid` in `buildSandboxCommand` (`sandbox.ts:322`, unconditional) plus `--die-with-parent`: when pid 1 (bwrap) exits, the kernel kills the namespace, so the tree really is gone. `opencode-cli` has no unsandboxed fallback (comment `:95`). Caveat: the evidence code *assumes* the runtime is sandboxed; nothing asserts that linkage, so a future non-sandboxed adapter would inherit a false guarantee. |
+| **G-07** | Evidence cannot be persisted before the initial snapshot exists | **PASS** | `captureFinalEvidence` returns `null` when `initial === null` (`evidence.ts:219-223`); `attachEvidence` then omits `evidence`; `persistResult` only writes evidence from `result.evidence` (`persist-result.ts:355`). The ordering is structural, not comment-enforced. |
+| **G-08** | Cleanup cannot happen before final evidence is durable | **PARTIAL** | Normal path: snapshot files are written before the `finally`, and `cleanup({ keepArtifacts: true })` preserves `evidence/` (`workspace.ts:258`, `manager.ts:633`) — verified by the shipped lifecycle test and by probe §N's initial path. Reaper path: `reaper.ts:497` passes `keepArtifacts: !artifactsPreserved`, so after a successful artifact preservation the evidence is deleted (probe §p7: `removed: true`, `evidenceKept: false`). Authority rows outlive their bytes. |
+| **G-09** | A client or the agent cannot mark its own artifact authoritative | **PASS** | Only two writes to `Artifact.authoritative`: `persist-result.ts:301/314` (git report, hard `false`) and `:359/376` (host manifest, `evidence.authoritative && workspaceId !== null`). `candidate` is gone: no occurrence in `persist-result.ts`; the parent's `result.providerMeta['workspaceId']` read is absent (`git show 58476b0:…/persist-result.ts:136,334`). Derivation is `executionWorkspaceIdFor(run.id, attempt.attemptNumber)` scoped by `orgId` + `taskId` (`:508`). `providerMeta.workspaceId` is now written by the worker for display (`execute-agent.ts:832-834`) and never read as authority. `result.artifacts` naming `change-manifest` is refused (`:267`). The adapter cannot set `evidence` at all: `ExecutionResult` is `.strict()` and `attachEvidence` is the only writer. |
+| **G-10** | An artifact cannot be replayed across tenants, tasks or attempts | **PARTIAL** | IDs include `taskId` (`ids.ts:75-81`); API reads are `(id, orgId)` (`artifacts.service.ts:133-136`, `:31` comment). Content-addressing is intentional. Two gaps: (a) IDs omit `orgId`, so a `Task.id` collision across tenants would make the `upsert({ where: { id } })` update another org's row — unreachable in practice because `Task.id` is a server-generated UUID (`schema.prisma:252`), but the safety depends on that; (b) the attempt binding is the **newest** attempt of the **newest** run (`persist-result.ts:120-140`), not the execution in context, so a delayed persist can bind a manifest to a later attempt's `workspaceId`/`attemptId`. Requires overlapping attempts/runs; pre-existing shape, inherited by the evidence columns. |
+| **G-11** | A malformed or truncated manifest cannot pass verification | **PARTIAL** | Probe §S: truncated body refused (size), one flipped byte refused (hash), bounded manifest → `complete: false` → `authoritative: false` (probe §P; `evidence.ts:242`; `persist-result.ts:359`). But `verifyManifestFile` never parses the body: a body that says `complete: false` with an envelope claiming `authoritative: true` and a correct checksum **passes** (`selfConsistentContradiction: null`). `authoritative` is asserted by the writer, not re-derived at the boundary; the manifest is also never compared against `ExecutionWorkspace.initialManifestDigest`, so it is not bound to the row it claims to describe. Not agent-reachable today (only the worker writes the envelope), so this is hardening, not an exploit. |
+| **G-12** | Legacy artifacts cannot be mistaken for authoritative | **PASS** | Migration is additive, `authoritative BOOLEAN NOT NULL DEFAULT false`, no back-fill; `evidenceSource`/`manifestDigest` nullable and reported verbatim (`artifact-summary.ts:63-69`); the legacy test asserts `evidenceSource: null`, `authoritative: false` (`evidence-provenance.test.ts:399-423`), and the summary test covers a row that predates the columns. Nothing infers provenance from `kind`. |
+| **G-13** | A failure path cannot silently produce a successful task state | **FAIL** | Probe §N: `chmod 000` on one directory inside the repo → `captureFinalEvidence` returns `null`, no `final-snapshot.json`, no manifest, no artifact; `finalStatus` remains `succeeded` and `workspaceOutcome` is `completed`. The same happens on ENOSPC/IO error during evidence writing. The design intent ("evidence bookkeeping must not fail a run") is defensible, but it means the agent chooses whether evidence exists, and absence is not escalated anywhere. Contrast: an integrity failure at persist *does* fail the task (`persist-result.ts:96-105`), so the two failure modes are asymmetric — a manifest that is absent is fine, a manifest that is present-but-wrong is fatal. |
+| **G-14** | The trust boundary is not overstated | **PASS** (with one inaccurate comment) | The design doc is honest: "This is not isolation… the same-UID worker compromise remains open" (`TRUSTED-SNAPSHOT-DESIGN.md:115-116`), and the phase docs already record same-UID. `evidence/` invisibility is a mount-table property, and the isolation test states the tmpfs caveat rather than claiming UID separation. Inaccurate: `snapshot.ts:30-31` says files under `packages/workspace-manager/src` "may not import `child_process` at all", but `manager.ts:1` does and is allowlisted (`eslint.config.mjs:36-40`). The rule is real; the sentence is wrong. |
+| **G-15** | Phase 3–6 findings still hold | **PASS** | Diff touches no `cgroup.ts`, `termination.ts`, `sandbox.ts`, volumes, isolation or CPU-budget file (empty `--stat`). The only deletions in `execute-agent.ts` are the three `return` expressions being wrapped in `attachEvidence`; no gate logic removed. Phase 5 targeted suites: 23 passed, 4 skipped (the host-limited cgroup/io tests, unchanged). |
+| **G-16** | The staging test fails on the pre-fix behaviour | **PASS** | Measured, not reasoned: in the staging scenario `git diff` is 0 bytes and `git diff --cached` is 152 bytes, i.e. the pre-fix collector's evidence for a fully rewritten tree was "nothing". Mutation M1 on a scratch copy (comparator ignores `sha256`) fails the staging, clean-filter, commit and hostile tests (8 failures). Mutation M2 (`complete: true` unconditionally) fails exactly the two bounded-manifest tests. Mutation M3 (follow symlinks) fails the symlink test and the hostile `/etc/passwd` assertion. |
+| **G-17** | The provenance test fails on the pre-fix code | **PASS** (reasoned) | Parent code: `candidate: result.providerMeta?.['workspaceId']` and `findFirst({ id: candidate, orgId, taskId })` (`git show 58476b0:apps/worker/src/activities/persist-result.ts:136,334-337`). The test provisions the sibling as a **real** `ExecutionWorkspace` row in the same org and task (`evidence-provenance.test.ts:191-215`), so the parent predicate would return it and `expect(manifest.workspaceId).toBe(own.workspaceId)` would fail. Not executed against the old code because that requires editing the tree; the parent source and the fixture are quoted so the conclusion does not rest on inference. |
+| **G-18** | No assertion weakened, no test skipped-as-passed, no retry added | **PASS** | `git diff --numstat` shows **0 deleted lines** in every test file; `reclaim.test.ts` is additive only. No `.only`, no `it.fails`, no retry config in the diff. One new gated suite (`evidence-capture-points.test.ts:189`, `skipIf(!temporalEnabled)`) **ran and passed** on this host (Temporal available). The 12 worker skips are the pre-existing set. |
+| **G-19** | Suites, types and lint are green | **PASS** | `packages/workspace-manager` 131/131; `apps/worker` 266 passed / 12 skipped; `apps/api/src` 29/29; phase-5 targeted 23 passed / 4 skipped; `tsc -p packages/workspace-manager` clean; `eslint` clean on all changed source. |
+| **G-20** | The gate's own claim: the agent no longer authors the evidence used to judge it | **FAIL** | True for *content* of a manifest that exists: staging, filters, hooks and commits cannot move it. False for *existence* (G-13) and for *what is read* (G-04). An agent can both leave the change list empty while making the host walk read `/etc`, and remove the manifest entirely while the task reports success. Both are the inversion this gate was written to remove, in a narrower form. |
+
+## New findings
+
+### F-G1 — High — `.git/hooks` can be a symlink to any directory, and the walk reads through it
+
+`packages/workspace-manager/src/snapshot.ts:358-405`.
+
+`readdir(join(gitPath, 'hooks'))` follows a symlinked hooks directory. Each name is then
+turned into `<root>/.git/hooks/<name>` and checked with `isContained`, which is lexical
+(`:431-433`), so the path is always "inside" the root even when the parent is a link to
+`/etc`. `statOrUndefined` (`:375`) then `lstat`s the target and `digestFile` (`:389`) hashes
+it.
+
+Reproduction (probe §I/§J, `/tmp/opencode/gateg-probes/p2-paths.mts`):
+
+```
+rm -rf .git/hooks && ln -s /etc .git/hooks     # agent, inside its own checkout
+takeWorkspaceSnapshot(repo)
+→ hooks: 98 entries, first: ['.pwd.lock', '.resolv.conf.systemd-resolved.bak', ...]
+→ hooks['passwd'].sha256 === sha256(readFile('/etc/passwd'))   true
+```
+
+Impact:
+
+- **Boundary violation and a hash oracle.** The manifest digest covers `git.hooks`
+  (`serialiseSnapshot` → `git.hooks[].sha256`), so the artifact `checksum` returned to the
+  tenant depends on the SHA-256 of arbitrary readable host files. A tenant that can guess a
+  file's exact content can confirm the guess by predicting the checksum. No raw content is
+  returned, but "never read outside the tree" is false.
+- **Availability.** There is no aggregate byte budget for hooks (`GIT_METADATA_MAX_BYTES`
+  is per file, 256 MiB; `MAX_HOOKS` is 1,024). `.git/hooks -> /usr` makes one snapshot hash
+  up to 1,024 files of up to 256 MiB each, twice per attempt.
+- **Silence.** A mid-run swap produces `changeCount: 0`, `complete: true` (probe §R):
+  `.git` is excluded from `entries`, and `buildChangeManifest` compares only `entries`
+  (`manifest.ts:181-216`). The only trace is that `initial.digest !== final.digest` with no
+  row explaining why.
+
+Fix: `lstat` the hooks directory; if it is a symlink or not a directory, record that fact
+and do not enumerate. Equivalently, open it with `O_DIRECTORY | O_NOFOLLOW` and `readdir`
+the fd. Add `git` metadata (config/index/hooks digests) to the manifest as an explicit
+`git_changed` row so a swap is visible rather than inferred from a digest inequality. Give
+git metadata an aggregate byte budget. The regression test should be the probe above: a
+`.git/hooks` symlink to a directory containing a known file must either throw or record the
+link, and the file's digest must appear nowhere.
+
+### F-G2 — High — one unreadable directory suppresses the manifest, and the task still succeeds
+
+`apps/worker/src/activities/evidence.ts:256-266`, `apps/worker/src/activities/execute-agent.ts:497,755-765,968-993`.
+
+`takeWorkspaceSnapshot` propagates `EACCES` from `readdir` (only `ENOENT` is treated as
+`unreadable`), `captureFinalEvidence` catches everything and returns `null`, and the success
+path then attaches nothing. Measured (probe §N, `/tmp/opencode/gateg-probes/p4-corrected.mts`):
+
+```
+mkdir hidden && chmod 000 hidden
+captureInitialEvidence → present
+captureFinalEvidence   → null   (warn: "Final workspace snapshot failed…")
+evidence/final-snapshot.json    → absent
+task status                     → succeeded, workspace outcome completed
+```
+
+The same shape is reachable through ENOSPC while writing the snapshot file, or any I/O
+error. The agent cannot forge the report, but it can delete it — and "no manifest" is
+indistinguishable to a reviewer from "the agent made no changes" unless they know to look
+for absence.
+
+Fix: treat an agent-caused capture failure as a first-class outcome. Minimum: record a
+`evidence_unavailable` reason on the attempt/workspace row and force `authoritative: false`
+with an explicit absence marker, so the API can render "evidence missing" rather than an
+empty list. Better: fail the attempt closed when the *final* snapshot cannot be taken for a
+reason other than the workspace being absent, because at that point the run cannot be
+reviewed. A `chmod 000` inside the repo is not an infrastructure fault; it is the agent
+choosing not to be measured.
+
+### F-G3 — Medium — the reaper deletes `evidence/` after preserving artifacts, leaving dangling authority
+
+`apps/worker/src/reaper.ts:497` (and the second pass at `:736`), `packages/workspace-manager/src/reclaim.ts:203-220`.
+
+`preserveArtifacts` copies only `artifacts/` (`reclaim.ts:256-264`). The reaper then calls
+`reclaimWorkspace({ keepArtifacts: !artifactsPreserved })`; when preservation succeeded this
+is `false`, so `evidencePresent` is forced false and the else branch removes the whole
+workspace directory, evidence included. Measured (probe §p7):
+
+```
+{ removed: true, artifactsKept: false, evidenceKept: false, directoryAfter: null }
+```
+
+The `Artifact` row keeps `authoritative: true`, `evidenceSource: 'host-snapshot'` and a
+`uri` under the deleted directory; `summariseArtifact` will report integrity `missing`.
+This is exactly the outcome the new comment at `reclaim.ts:203-214` says must not happen
+("a digest pointing at bytes nothing can produce again"), contradicted by the only
+unattended caller. It also means a worker death mid-run — the case the reaper exists for —
+destroys the one artifact that could have explained the run.
+
+Fix: `preserveArtifacts` should copy `evidence/` beside `artifacts/` (or the reaper should
+pass `keepArtifacts: true` and remove `repo/` itself), and the reaper should not delete a
+workspace whose `finalManifestDigest` is set until the manifest bytes are durable somewhere
+else. Add a test that runs the **reaper** path over a workspace with evidence and asserts
+`evidenceKept: true`; the current lifecycle test covers `cleanup`, not `reclaim`.
+
+### F-G4 — Medium — a same-size rewrite during capture yields a silently mixed digest
+
+`packages/workspace-manager/src/snapshot.ts:207-234,504-567`; claim in `TRUSTED-SNAPSHOT-DESIGN.md:49-54`.
+
+The only stability signal is `digest.sizeBytes !== stat.size` (`:564`). A writer that
+rewrites bytes in place without changing the length produces a digest of a state that never
+existed, with `complete: true`. Measured (probe §Q, 96 MiB file, paced writer):
+
+```
+complete: true, stopReason: null
+recorded sha: e039ca72…   (neither the original e0cc8db8… nor the final cdd1e9d7…)
+```
+
+Impact is bounded — it cannot make a changed file look unchanged relative to the baseline,
+and a later re-walk detects the mismatch (the shipped test at `hostile-repository.test.ts:269`
+shows that). But the manifest then carries an `after` fingerprint that is not true of any
+instant, and the design doc's consistency paragraph overstates what the size check covers.
+
+Fix: after opening, `fstat` the fd and compare `dev`, `ino`, `size` and `mtimeNs` with the
+`lstat` result; hash from the fd. Re-`lstat` after hashing and compare again. That closes
+both the same-size rewrite and the `lstat`→`open` symlink swap, and it is the same change
+that fixes F-G5. If that is too strong a guarantee to buy, the doc should say "a size change
+is detected; a same-size rewrite is not".
+
+### F-G5 — Medium (race-dependent) — `lstat` then `open` by path: no `O_NOFOLLOW`, no identity check
+
+`packages/workspace-manager/src/snapshot.ts:213` (`createReadStream(absolute)`), `:504` (`lstat`), `:556`.
+
+Between the `lstat` that classifies an entry as a regular file and the `open` that hashes it,
+the entry can be replaced by a symlink. `createReadStream` follows it, so the walk reads
+outside the tree; if the target's size equals the `lstat` size, `:564` sees no instability
+and records the target's digest. A swap to a FIFO blocks the read (the FIFO classification
+only helps if the FIFO is there at `lstat` time). I did not win the race in a controlled
+probe, so this is a code-level finding, not a demonstrated exploit; it is the same class as
+F-G1 and the fix is the same `open`-with-`O_NOFOLLOW` + `fstat` pattern.
+
+### F-G6 — Low — `verifyManifestFile` verifies self-consistency, not meaning or provenance
+
+`apps/worker/src/activities/evidence.ts:109-141`.
+
+It checks `checksum === manifestDigest`, the file's length, and the file's hash. It never
+parses the body, so `complete`/`changeCount`/`changes` are not re-derived; and it never
+compares `initialManifestDigest` with the `ExecutionWorkspace.initialManifestDigest` the
+worker wrote *before* the run, so the manifest is not bound to the row it describes.
+Measured (probe §S): a body rewritten to `complete: false`, `changeCount: 0`, `changes: []`,
+re-hashed and presented with a matching envelope, returns `null` ("verified").
+
+Not agent-reachable — `result.evidence` is worker-authored and `ExecutionResult` is strict —
+so this is a hardening item, not a bypass. Fix: parse with a schema, re-derive
+`manifestDigest`, require `body.complete === envelope.authoritative`, require
+`body.initial.digest === repositoryRow.initialManifestDigest`, and require
+`body.final.digest === envelope.finalManifestDigest`. All four are cheap and turn "the
+writer said so" into "the record agrees".
+
+### F-G7 — Low — `.git` metadata changes never appear as a change row
+
+`packages/workspace-manager/src/manifest.ts:181-232`; `TRUSTED-SNAPSHOT-DESIGN.md:23-25`.
+
+`buildChangeManifest` compares `entries` only; `.git` is excluded from `entries` by design
+(`snapshot.ts:483`). So a rewritten `.git/config`, a replaced index or a hooks change moves
+`initial.digest`/`final.digest` but produces no row. Probe §R measured `changeCount: 0` for a
+run in which `.git/hooks` was entirely replaced. The design says the digest "covers it" —
+true, but a reader of the change list is told nothing, and no field says "git metadata
+changed". Add an explicit `git` comparison to the manifest (before/after config/index/hook
+digests, plus a boolean) so this is a row rather than an inference.
+
+### F-G8 — Low — documentation overstates two properties
+
+- `snapshot.ts:29-31`: "files under `packages/workspace-manager/src` may not import
+  `child_process` at all". `manager.ts:1` imports `execFile` and is on the allowlist
+  (`eslint.config.mjs:36-40`). The rule is scoped to the spawn boundary, not the package.
+- `TRUSTED-SNAPSHOT-DESIGN.md:33`: "Lexical containment … on every directory **and** every
+  entry; throws `SNAPSHOT_PATH_ESCAPE`". It is checked on every path string, but a parent
+  component that is a symlink is not a path string that can fail the check (F-G1). The table
+  row should say "lexical containment of every path string; parent symlinks are refused only
+  for the root and for the final component".
+
+### F-G9 — Informational — evidence is bound to the newest attempt, not the one that produced it
+
+`apps/worker/src/activities/persist-result.ts:120-140,161-166`. Both the run and the attempt
+are resolved as "newest for this task", not from the execution identity in context, and
+`EvidenceSummary` carries no attempt id with which to cross-check. With overlapping
+attempts/runs a delayed persist can write a manifest that describes attempt *N*'s tree with
+attempt *N+1*'s `attemptId`/`workspaceId`. The one-live-workflow invariant makes this hard to
+reach; it is listed because the commit's comment ("the attempt row the worker opened") is
+stronger than the code.
+
+### F-G10 — Informational — content-addressed IDs omit `orgId`
+
+`apps/worker/src/activities/ids.ts:75-81`. `artifactIdFor(taskId, kind, checksum)` and
+`evidenceIdFor(...)` are scoped by task only. The upsert matches on `id`, so a cross-tenant
+`Task.id` collision would update another organisation's row. `Task.id` is a server-generated
+UUID (`schema.prisma:252`), so this is not reachable; adding `orgId` to the derivation would
+remove the dependence on that fact.
+
+## Regression, sensitivity and test integrity
+
+**Phase 3–6 (G-15).** The diff modifies 37 files, all evidence/claim/workspace/docs. `git
+diff --stat` for `cgroup.ts`, `termination.ts`, `sandbox.ts`, volumes and isolation is
+empty. The only removed lines in `execute-agent.ts` are the three return expressions now
+wrapped by `attachEvidence`; no condition, threshold or ordering in the resource path
+changed. Phase 5 targeted suites: 23 passed, 4 skipped (host-limited), same as before.
+
+**Sensitivity (G-16/G-17).** Three mutations on a scratch copy of the workspace-manager
+package, each run against the shipped tests:
+
+| Mutation | Result |
+|---|---|
+| `compareEntry` blind to `sha256` | **8 failed**, including staged change, clean filter, committed change, hostile repository |
+| `manifest.complete` always `true` | **2 failed**: change cap, bounded snapshot |
+| `classify` treats symlinks as files | **3 failed**: symlink recorded-not-followed, hostile repository, post-manifest modification |
+
+The provenance test's pre-fix sensitivity is established from the parent source
+(`git show 58476b0:…:136,334-337`) plus the fixture's real sibling row, not by executing the
+old code.
+
+**Test integrity (G-18).** `--numstat` shows zero deleted test lines. No `.only`, no
+`it.fails`, no retry added. The one new gated suite executed here and passed. Nothing was
+bent to pass.
+
+## What Gate G does not establish
+
+1. **Authenticity.** No signing key, no signature, no MAC. A compromised worker (same UID)
+   can write any manifest it likes; the digest only proves the bytes did not change after
+   the worker wrote them.
+2. **Containment of the walk.** `.git/hooks` is a directory symlink away from reading
+   arbitrary host paths (F-G1), and the final component is raceable (F-G5).
+3. **That evidence exists.** One unreadable directory suppresses it (F-G2).
+4. **That evidence survives.** The reaper deletes it (F-G3).
+5. **History.** Endpoints only; a change made and reverted within the run is invisible.
+6. **Content pre-image.** Hashes, not old bytes; a display patch cannot be derived.
+7. **That anything enforces `authoritative`.** No approval path reads the column; the gate
+   records provenance but no consumer refuses an approval on a missing or non-authoritative
+   manifest. The field is currently descriptive.
+8. **Cross-attempt accumulation.** Each attempt's baseline is the tree it inherited, so an
+   earlier attempt's changes are "pre-existing" by construction; the approver must read every
+   attempt, and nothing tells them to.
+9. **That a non-sandboxed adapter would be safe.** G-06 depends on `--unshare-pid`, not on
+   the evidence code.
+10. **VM isolation.** Unchanged by this commit; the design doc says so.
+
+## What I would refuse to ship
+
+1. **The sentence "the walk cannot leave the tree"** while `.git/hooks` is a symlink hole
+   (F-G1). Either fix the enumeration or strike the claim; a boundary statement that is
+   false in one reachable case is worse than a narrower true one.
+2. **The sentence "the agent cannot control the evidence used to judge it"** while one
+   `chmod 000` directory deletes the manifest and the task reports success (F-G2). The
+   correct claim today is "the agent cannot *forge* the content of a manifest that exists".
+3. **The reaper deleting `evidence/` while the row keeps `authoritative: true` and a dead
+   URI** (F-G3). This is a data-loss bug in the one path that runs when nobody is watching.
+4. **"The final snapshot is the tree as the agent left it"** while a same-size concurrent
+   write can produce a digest of a state that never existed and still say `complete: true`
+   (F-G4), and while the doc claims the size check covers mid-read changes.
+
+I would **not** refuse the commit for F-G6…F-G10: none makes a gate statement untrue that
+is not already listed above, all are cheap hardening, and they are recorded with concrete
+fixes.
+
+## Test and probe evidence gathered during this addendum
+
+| Item | Command / artefact | Result |
+|---|---|---|
+| workspace-manager suite | `npx vitest run packages/workspace-manager/test` | **131 passed** |
+| worker suite | `npx vitest run apps/worker/test` | **266 passed, 12 skipped** |
+| api unit | `npx vitest run apps/api/src` | **29 passed** |
+| phase-5 targeted | `isolation-gate`, `cpu-budget`, `volumes`, `io-limits` | **23 passed, 4 skipped** |
+| typecheck | `tsc --noEmit -p packages/workspace-manager/tsconfig.json` | clean |
+| lint | `eslint` on every changed source file | clean |
+| §A staging | `/tmp/opencode/gateg-probes/p1-git-cannot-shape.mts` | `git diff` 0 B, staged 152 B, manifest `modified`, on-disk sha |
+| §B clean filter | same | control marker **true**, snapshot marker **false**, on-disk sha |
+| §C external diff / textconv | same + `p6b-textconv.mts` | controls **true**, snapshot markers **false** |
+| §D hooks | same | control (commit) **true**, snapshot **false** |
+| §E symlink root | `p2-paths.mts` | `SNAPSHOT_ROOT_INVALID` |
+| §F entry symlinks | same | recorded, not followed, `/etc/passwd` digest absent |
+| §I `.git/hooks -> outside` | same | **hashed outside file** (`loot.txt` digest matches) |
+| §J `.git/hooks -> /etc` | same | **98 entries, `/etc/passwd` digest matches** |
+| §K `.git/config -> /etc/passwd` | same | recorded as `symlink:/etc/passwd`, not read |
+| §L `.git -> other repo` | same | not followed, kind `file`, `head`/`config` null |
+| §M dir -> symlink | same | not descended |
+| §N evidence suppression | `p4-corrected.mts` | initial present, **final `null`**, snapshot file absent |
+| §O unreadable file | same | `complete: false`, `stopReason: unreadable` (honest) |
+| §P bounded manifests | same | `maxChanges` → `complete: false`; bounded initial → `initial-incomplete`, `authoritative: false` |
+| §Q same-size rewrite | same | `complete: true`, digest **neither** endpoint |
+| §R `.git` swap mid-run | `p5-verify.mts` | **`changeCount: 0`**, `complete: true`, digests differ |
+| §S verify | same | truncated/edited refused; **body/envelope contradiction accepted** |
+| §p7 reaper | `p7-reaper.mts` | `removed: true`, **`evidenceKept: false`**, directory gone |
+| mutation M1/M2/M3 | scratch copy `/home/ubuntu/.cache/gateg/mut` | 8 / 2 / 3 targeted failures |
+
+Verification status: **verified** for every command and probe result quoted here. The one
+finding marked race-dependent (F-G5) is explicitly reasoned from `snapshot.ts:213,504,556`
+and was not reproduced; F-G9 is reasoned from `persist-result.ts:120-166`.

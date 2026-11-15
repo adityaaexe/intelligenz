@@ -1,4 +1,6 @@
 import { Client, Connection, WorkflowNotFoundError } from '@temporalio/client';
+import { constants as fsConstants } from 'node:fs';
+import { access } from 'node:fs/promises';
 import { Prisma, type PrismaClient } from '@intelligenz/database';
 import {
   ContainmentError,
@@ -43,7 +45,10 @@ import { deterministicId } from './activities/ids';
  *   only decides *whether* to remove, never *what*.
  * - **Never destroy evidence.** `<workspace>/artifacts` is copied into the artifact store
  *   before the directory is removed, and a copy that fails moves the row to
- *   `quarantined` rather than losing the bytes.
+ *   `quarantined` rather than losing the bytes. `<workspace>/evidence` is not copied —
+ *   nothing else holds it — so it is **retained in place** on every pass, and an
+ *   authoritative `Artifact` row whose bytes cannot be read is demoted with the reason
+ *   recorded rather than left pointing at a directory that is gone.
  */
 
 export type WorkflowLiveness = 'active' | 'finished' | 'absent' | 'unknown';
@@ -222,6 +227,13 @@ export interface ReaperAction {
   readonly killedPids: number;
   readonly artifactsPreserved: boolean;
   readonly artifactsBytes: number;
+  /**
+   * Authoritative `Artifact` rows demoted by this pass because their bytes were gone.
+   *
+   * Non-zero is not routine: it means the pass found an authority claim that could not be
+   * read, and it is reported so "the evidence is intact" is never inferred from silence.
+   */
+  readonly authorityRevoked?: number;
 }
 
 export interface ReaperResult {
@@ -495,6 +507,11 @@ async function reapOne(deps: ReaperDeps, candidate: Candidate): Promise<ReaperAc
       },
       recordedRootPath: candidate.rootPath,
       keepArtifacts: !artifactsPreserved,
+      // Evidence is **not** a copy of the artifacts and nothing else holds it. Tying it to
+      // `keepArtifacts` meant a successful copy dropped the manifests while their
+      // `Artifact` rows kept `authoritative: true` and a URI into the deleted directory —
+      // the measured `{ removed: true, evidenceKept: false }`. It survives every pass.
+      keepEvidence: true,
     });
   } catch (error) {
     return quarantineOrRetry(deps, candidate, error, {
@@ -504,6 +521,18 @@ async function reapOne(deps: ReaperDeps, candidate: Candidate): Promise<ReaperAc
       artifactsBytes,
     });
   }
+
+  // ── No authority row without readable bytes ─────────────────────────────────
+  //
+  // The retention above is the fix, and this is the guard that makes it an invariant
+  // rather than a convention. Bytes can still be gone: deleted out-of-band, lost with a
+  // volume, or removed by a pass that ran before this fix. When that is true, an
+  // `authoritative: true` row is a claim pointing at nothing, so it is demoted with the
+  // reason recorded **in the same transaction** — the demotion and the explanation cannot
+  // disagree, and a retry cannot demote twice without also finding the first record.
+  const authorityRevoked = await revokeUnbackedAuthority(deps, candidate, {
+    reason: 'evidence bytes are not readable for an authoritative artifact row',
+  });
 
   const attempts = candidate.cleanupAttempts + 1;
 
@@ -524,9 +553,11 @@ async function reapOne(deps: ReaperDeps, candidate: Candidate): Promise<ReaperAc
   });
 
   await recordReaped(deps, candidate, {
-    reason: result.artifactsKept
-      ? 'abandoned attempt; checkout removed, artifacts kept in place'
-      : 'abandoned attempt; workspace removed after artifacts were preserved',
+    reason: result.evidenceKept
+      ? 'abandoned attempt; checkout removed, evidence kept in place'
+      : result.artifactsKept
+        ? 'abandoned attempt; checkout removed, artifacts kept in place'
+        : 'abandoned attempt; workspace removed after artifacts were preserved',
     killedPids,
     artifactsPreserved,
     artifactsBytes,
@@ -540,7 +571,130 @@ async function reapOne(deps: ReaperDeps, candidate: Candidate): Promise<ReaperAc
     killedPids,
     artifactsPreserved,
     artifactsBytes,
+    authorityRevoked,
   };
+}
+
+/**
+ * A path whose bytes can be read. `access(R_OK)` rather than `stat`: the question is
+ * whether the authority row's URI still yields its content, and a file that exists but
+ * cannot be opened answers that question with "no".
+ */
+async function readable(path: string): Promise<boolean> {
+  try {
+    await access(path, fsConstants.R_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Demote authoritative rows whose bytes are not readable, and record why.
+ *
+ * The invariant this enforces is the one the schema's `authoritative` comment promises:
+ * authority is "a host process measured these bytes", so a row whose bytes cannot be read
+ * is not authority — it is a dangling claim. Two writes, one transaction:
+ *
+ *   1. `authoritative: false` on every affected row;
+ *   2. an `artifact.authority_revoked.v1` audit event carrying the reason, the ids and the
+ *      URIs that could not be read.
+ *
+ * Scoped two ways on purpose. By `workspaceId`, and by URI prefix under that workspace's
+ * `rootPath`: only bytes this reclaim could have removed are candidates. An artifact whose
+ * URI points into the artifact store, or at a relative path resolved elsewhere, is not
+ * touched by this pass and must not be demoted because a `stat` from the wrong directory
+ * said no.
+ *
+ * Idempotent: a second pass finds no `authoritative: true` rows and returns 0. The audit id
+ * is derived from the set of demoted ids, so re-running against the same set cannot write a
+ * second event.
+ */
+async function revokeUnbackedAuthority(
+  deps: ReaperDeps,
+  candidate: {
+    readonly orgId: string;
+    readonly taskId: string;
+    readonly workspaceId: string;
+    readonly rootPath: string;
+    readonly now: Date;
+  },
+  input: { readonly reason: string },
+): Promise<number> {
+  const rows = await deps.prisma.artifact.findMany({
+    where: {
+      orgId: candidate.orgId,
+      workspaceId: candidate.workspaceId,
+      authoritative: true,
+    },
+    select: { id: true, uri: true, kind: true },
+  });
+
+  if (rows.length === 0) return 0;
+
+  const prefix = `${candidate.rootPath}/`;
+  const missing: typeof rows = [];
+
+  for (const row of rows) {
+    if (!row.uri.startsWith(prefix)) continue;
+
+    if (!(await readable(row.uri))) missing.push(row);
+  }
+
+  if (missing.length === 0) return 0;
+
+  const ids = missing.map((row) => row.id).sort();
+  const eventId = deterministicId(`artifact-authority-revoked:${candidate.workspaceId}:${ids.join(',')}`);
+
+  try {
+    await deps.prisma.$transaction(async (transaction) => {
+      await transaction.artifact.updateMany({
+        where: { orgId: candidate.orgId, id: { in: ids }, authoritative: true },
+        data: { authoritative: false },
+      });
+
+      await transaction.auditEvent.create({
+        data: {
+          id: eventId,
+          orgId: candidate.orgId,
+          actorType: 'system',
+          actorId: `reaper:${workerIdentity()}`,
+          action: 'artifact.authority_revoked',
+          aggregateType: 'ExecutionWorkspace',
+          aggregateId: candidate.workspaceId,
+          eventType: 'artifact.authority_revoked.v1',
+          correlationId: candidate.taskId,
+          idempotencyKey: `artifact.authority_revoked.v1:${candidate.workspaceId}:${ids.join(',')}`,
+          payload: {
+            workspaceId: candidate.workspaceId,
+            taskId: candidate.taskId,
+            reason: input.reason,
+            // What was claimed, and where the claim pointed. A demotion without the URIs
+            // is a fact an operator cannot act on: they cannot tell a lost volume from a
+            // path that was never written.
+            artifacts: missing.map((row) => ({ id: row.id, kind: row.kind, uri: row.uri })),
+            revokedAt: candidate.now.toISOString(),
+            worker: workerIdentity(),
+          },
+          occurredAt: candidate.now,
+        },
+        select: { id: true },
+      });
+    });
+  } catch (error) {
+    // A demotion that failed must not abandon the reclamation that already happened, and
+    // it must not be silent: the rows are still authoritative and the bytes are still gone.
+    if ((error as { code?: string }).code === 'P2002') return missing.length;
+
+    workerLogger().error(
+      { workspaceId: candidate.workspaceId, err: messageOf(error) },
+      'artifact.authority_revoked.v1 could not be written; authority rows still dangle',
+    );
+
+    return 0;
+  }
+
+  return missing.length;
 }
 
 /**
@@ -734,7 +888,23 @@ export async function runOrphanSweep(deps: ReaperDeps): Promise<ReaperResult> {
         ids: { orgId: row.orgId, taskId: row.taskId, workspaceId: row.id },
         recordedRootPath: row.rootPath,
         keepArtifacts: !preserved.preserved,
+        // Same rule as `reapOne`: the manifest is not a copy of the artifacts and must not
+        // disappear because the artifacts were copied. A terminal run's evidence is the
+        // only record of what it changed.
+        keepEvidence: true,
       });
+
+      const authorityRevoked = await revokeUnbackedAuthority(
+        deps,
+        {
+          orgId: row.orgId,
+          taskId: row.taskId,
+          workspaceId: row.id,
+          rootPath: row.rootPath,
+          now: now(),
+        },
+        { reason: 'evidence bytes are not readable for an authoritative artifact row' },
+      );
 
       await deps.prisma.executionWorkspace.updateMany({
         where: { id: row.id, orgId: row.orgId },
@@ -754,6 +924,7 @@ export async function runOrphanSweep(deps: ReaperDeps): Promise<ReaperResult> {
         killedPids: 0,
         artifactsPreserved: preserved.preserved,
         artifactsBytes: preserved.bytes,
+        authorityRevoked,
       });
 
       void result;

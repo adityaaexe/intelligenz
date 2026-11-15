@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readdir, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -91,6 +91,70 @@ describe('reclaimWorkspace', () => {
     });
 
     expect(result.removed).toBe(true);
+    await expect(readdir(path)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  /**
+   * F-G3 — the two directories are separate decisions.
+   *
+   * The reaper copies `artifacts/` into a store and then asks for the workspace copy to be
+   * dropped. One flag for both directories meant that request also dropped `evidence/`,
+   * which has no copy anywhere — so the `Artifact` row kept `authoritative: true` and a URI
+   * into a deleted directory. Measured before the fix: `{ removed: true, evidenceKept:
+   * false }`.
+   */
+  it('keeps evidence when artifacts were copied out, and removes only the copied artifacts', async () => {
+    const { root, ids } = await fixture();
+    const path = workspacePath(root, ids);
+
+    await mkdir(join(path, 'repo', 'src'), { recursive: true });
+    await mkdir(join(path, 'artifacts'), { recursive: true });
+    await mkdir(join(path, 'evidence'), { recursive: true });
+    await writeFile(join(path, 'repo', 'src', 'index.ts'), 'export {};');
+    await writeFile(join(path, 'artifacts', 'transcript.ndjson'), '{"line":1}\n');
+    await writeFile(join(path, 'evidence', 'change-manifest.json'), '{"digest":"d"}');
+
+    const result = await reclaimWorkspace({
+      root,
+      ids,
+      recordedRootPath: path,
+      keepArtifacts: false,
+      keepEvidence: true,
+    });
+
+    expect(result).toMatchObject({
+      removed: false,
+      artifactsKept: false,
+      evidenceKept: true,
+      evidenceRemoved: false,
+    });
+
+    // The manifest is still where its row says it is; the copied artifacts are not.
+    expect(await readdir(path)).toEqual(['evidence']);
+    expect(
+      JSON.parse(await readFile(join(path, 'evidence', 'change-manifest.json'), 'utf8')),
+    ).toEqual({ digest: 'd' });
+  });
+
+  it('reports evidence it removed, so a caller can demote what pointed at it', async () => {
+    const { root, ids } = await fixture();
+    const path = workspacePath(root, ids);
+
+    await mkdir(join(path, 'repo'), { recursive: true });
+    await mkdir(join(path, 'evidence'), { recursive: true });
+    await writeFile(join(path, 'evidence', 'change-manifest.json'), '{"digest":"d"}');
+
+    const result = await reclaimWorkspace({
+      root,
+      ids,
+      recordedRootPath: path,
+      keepArtifacts: false,
+      keepEvidence: false,
+    });
+
+    // Not silent: `evidenceRemoved` is the fact the reaper needs to demote rows in the
+    // same pass. A removal that reported nothing would be the original bug in a new shape.
+    expect(result).toMatchObject({ removed: true, evidenceKept: false, evidenceRemoved: true });
     await expect(readdir(path)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 

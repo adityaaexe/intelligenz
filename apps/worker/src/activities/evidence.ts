@@ -6,8 +6,10 @@ import {
   buildChangeManifest,
   evidencePath,
   manifestCounts,
+  manifestDigest,
   serialiseManifest,
   takeWorkspaceSnapshot,
+  type ManifestDigestInput,
   type WorkspaceHandle,
   type WorkspaceSnapshot,
 } from '@intelligenz/workspace-manager';
@@ -68,8 +70,15 @@ export { EVIDENCE_SOURCE_GIT_IN_SANDBOX } from '../shared/evidence';
  *
  * The final snapshot is taken as soon as `runtime.execute` returns, on the success, failure
  * and cancellation paths, and the manifest is the comparison. Capture never throws into the
- * attempt: a run that produced a result must not be failed by evidence bookkeeping, and an
- * *absent* manifest is an honest "no claim" where an empty one would be a lying claim.
+ * attempt: a run that produced a result must not be replaced by an evidence bookkeeping
+ * error. But "never throws" is not "never fails" — and the distinction is the whole of F-G2:
+ *
+ * **if a baseline exists, a missing manifest is a failure of the attempt.** An empty
+ * manifest would be a lying claim; a *silently absent* one is worse, because the run reports
+ * success and only a reader who knows to look for an absence can tell. So this module
+ * reports *why* the manifest is missing (`captureFinalEvidenceOutcome`) and the caller
+ * decides the outcome. A missing manifest with **no** baseline is not a failure: that attempt
+ * leased no tree, so it owed no description.
  */
 
 export const INITIAL_SNAPSHOT_FILE = 'initial-snapshot.json';
@@ -96,7 +105,73 @@ function sha256(bytes: Buffer): string {
 }
 
 /**
- * Check the manifest the worker says it wrote against the bytes that are actually there.
+ * The digests the workspace row recorded for this attempt, when it recorded any.
+ *
+ * Supplied by the caller (which can read the database) so this function stays a pure
+ * verification of bytes against a claim. `null` means "not recorded" — a row that predates
+ * the columns, or a fixture — and is not the same fact as a disagreement.
+ */
+export interface ManifestExpectation {
+  readonly initialManifestDigest: string | null;
+  readonly finalManifestDigest: string | null;
+}
+
+/**
+ * The manifest body, checked for the fields this function relies on.
+ *
+ * Hand-rolled rather than a schema because `zod` is not a dependency of this package and a
+ * new one for six primitive checks is not a trade worth making. What matters is that every
+ * field the digest covers is present and has the right shape: `manifestDigest` re-derives
+ * the canonical form from these values, so a missing field would silently produce a
+ * different string, and a wrong type would throw.
+ */
+function parseManifestBody(bytes: Buffer): { ok: true; body: ManifestDigestInput } | { ok: false; reason: string } {
+  let parsed: unknown;
+
+  try {
+    parsed = JSON.parse(bytes.toString('utf8'));
+  } catch (error) {
+    return { ok: false, reason: `manifest is not JSON: ${error instanceof Error ? error.message : String(error)}` };
+  }
+
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return { ok: false, reason: 'manifest body is not an object' };
+  }
+
+  const body = parsed as Record<string, unknown>;
+  const rejection = (field: string): { ok: false; reason: string } => ({
+    ok: false,
+    reason: `manifest body has no valid ${field}`,
+  });
+
+  if (typeof body['version'] !== 'number') return rejection('version');
+  if (typeof body['root'] !== 'string') return rejection('root');
+  if (typeof body['changeCount'] !== 'number') return rejection('changeCount');
+  if (typeof body['complete'] !== 'boolean') return rejection('complete');
+  if (!Array.isArray(body['changes'])) return rejection('changes');
+
+  for (const sideName of ['initial', 'final'] as const) {
+    const side = body[sideName];
+
+    if (typeof side !== 'object' || side === null) return rejection(`${sideName} side`);
+
+    const record = side as Record<string, unknown>;
+
+    if (typeof record['digest'] !== 'string') return rejection(`${sideName}.digest`);
+    if (typeof record['complete'] !== 'boolean') return rejection(`${sideName}.complete`);
+    if (typeof record['entryCount'] !== 'number') return rejection(`${sideName}.entryCount`);
+    if (typeof record['totalBytes'] !== 'number') return rejection(`${sideName}.totalBytes`);
+    if (typeof record['capturedAt'] !== 'string') return rejection(`${sideName}.capturedAt`);
+  }
+
+  // The digest is re-derived from the parsed body through the same canonical writer the
+  // producer used, so key order in the file cannot matter and extra keys cannot vote.
+  return { ok: true, body: body as unknown as ManifestDigestInput };
+}
+
+/**
+ * Check the manifest the worker says it wrote against the bytes that are actually there,
+ * and against the record that was written before the run.
  *
  * This is not distrust of `executeAgentActivity` — it is the only place the claim and the
  * bytes meet. A truncated write, a full disk, an operator's `mv`, or a persist retry that
@@ -104,9 +179,19 @@ function sha256(bytes: Buffer): string {
  * happened to be true once. Refusing to write a claim we cannot re-derive keeps
  * `Artifact.checksum` meaning what it says.
  *
+ * An earlier version checked only self-consistency — checksum equal to digest, file length,
+ * file hash. That accepts a body rewritten to `complete: false, changeCount: 0` and
+ * presented with a matching envelope, because every value agrees with every other value in
+ * the envelope and none of them agrees with the run. So the body is now parsed, its digest
+ * re-derived, and its two snapshot digests compared with the summary **and** with
+ * `ExecutionWorkspace`, which the worker wrote before the agent existed.
+ *
  * Returns a reason rather than throwing so the caller can decide the error code.
  */
-export async function verifyManifestFile(evidence: EvidenceSummary): Promise<string | null> {
+export async function verifyManifestFile(
+  evidence: EvidenceSummary,
+  expected: ManifestExpectation | null = null,
+): Promise<string | null> {
   if (evidence.kind !== CHANGE_MANIFEST_KIND) {
     return `evidence.kind is ${String(evidence.kind)}, not ${CHANGE_MANIFEST_KIND}`;
   }
@@ -135,9 +220,74 @@ export async function verifyManifestFile(evidence: EvidenceSummary): Promise<str
 
   const actual = sha256(bytes);
 
-  return actual === evidence.manifestDigest
-    ? null
-    : `manifest hashes to ${actual}, not ${evidence.manifestDigest}`;
+  if (actual !== evidence.manifestDigest) {
+    return `manifest hashes to ${actual}, not ${evidence.manifestDigest}`;
+  }
+
+  const parsed = parseManifestBody(bytes);
+
+  if (!parsed.ok) return parsed.reason;
+
+  // ── The body must mean what the envelope says ──────────────────────────────
+  const derived = manifestDigest(parsed.body);
+
+  if (derived !== evidence.manifestDigest) {
+    return `manifest body derives ${derived}, not ${evidence.manifestDigest}`;
+  }
+
+  if (parsed.body.complete !== evidence.complete) {
+    return `manifest body is complete=${String(parsed.body.complete)} but the summary says complete=${String(evidence.complete)}`;
+  }
+
+  // `complete` and `stopReason` are two spellings of one fact in the producer
+  // (`buildChangeManifest` sets one from the other). A body where they disagree was not
+  // produced by that function.
+  if (parsed.body.complete !== (parsed.body.stopReason === null)) {
+    return `manifest body is complete=${String(parsed.body.complete)} with stopReason=${String(parsed.body.stopReason)}`;
+  }
+
+  // Authority on an incomplete manifest is a contradiction, not a lesser claim: the body
+  // itself says the walk stopped early.
+  if (evidence.authoritative && !parsed.body.complete) {
+    return 'an authoritative manifest cannot describe an incomplete walk';
+  }
+
+  if (parsed.body.initial.digest !== evidence.initialManifestDigest) {
+    return `manifest compares initial ${parsed.body.initial.digest}, not ${evidence.initialManifestDigest}`;
+  }
+
+  if (parsed.body.final.digest !== evidence.finalManifestDigest) {
+    return `manifest compares final ${parsed.body.final.digest}, not ${evidence.finalManifestDigest}`;
+  }
+
+  if (parsed.body.changeCount !== evidence.changeCount) {
+    return `manifest lists ${String(parsed.body.changeCount)} changes, not ${String(evidence.changeCount)}`;
+  }
+
+  // ── And it must be the manifest for *this* attempt ────────────────────────
+  //
+  // `ExecutionWorkspace.initialManifestDigest` was written the instant the lease was
+  // granted, before anything the agent can reach, and the final one the moment the process
+  // tree was gone. They are the only record of the two trees that the summary cannot
+  // rewrite. A row that records nothing cannot contradict; a row that records something
+  // else is refused.
+  if (expected !== null) {
+    if (
+      expected.initialManifestDigest !== null &&
+      expected.initialManifestDigest !== evidence.initialManifestDigest
+    ) {
+      return `the workspace recorded initial ${expected.initialManifestDigest}, not ${evidence.initialManifestDigest}`;
+    }
+
+    if (
+      expected.finalManifestDigest !== null &&
+      expected.finalManifestDigest !== evidence.finalManifestDigest
+    ) {
+      return `the workspace recorded final ${expected.finalManifestDigest}, not ${evidence.finalManifestDigest}`;
+    }
+  }
+
+  return null;
 }
 
 
@@ -167,9 +317,16 @@ async function writeSnapshotFile(
  * Take the baseline.
  *
  * Returns `null` if the tree cannot be described (a missing checkout, a permission refusal).
- * The attempt continues: no manifest is an honest absence, and failing a run because a
- * directory read failed would make the evidence path a new availability risk. The caller
- * logs the gap and the eventual summary is simply missing.
+ * The attempt continues: a baseline that could not be taken means this attempt has no
+ * manifest from the start, and failing every run whose checkout contains one unreadable
+ * directory would make the evidence path an availability risk before the agent has done
+ * anything.
+ *
+ * The consequence is stated rather than hidden, because it is a real limit of the F-G2
+ * invariant: the invariant is "**if** a baseline exists, a missing final manifest fails the
+ * attempt". When the baseline itself could not be taken, there is nothing to compare and
+ * the run is not failed. `captureInitialEvidence` therefore returns a `null` that means
+ * "never measured", and the caller logs it — it does not mean "measured and unchanged".
  */
 export async function captureInitialEvidence(
   handle: WorkspaceHandle,
@@ -199,6 +356,31 @@ export async function captureInitialEvidence(
 }
 
 /**
+ * Why a final manifest could not be produced.
+ *
+ * A reason, not an exception: the attempt's outcome is decided elsewhere, and an evidence
+ * failure changes that outcome rather than replacing it with an infrastructure error.
+ */
+export interface EvidenceCaptureFailure {
+  readonly code: 'SNAPSHOT_CAPTURE_FAILED';
+  readonly reason: string;
+}
+
+/**
+ * The result of trying to capture the final evidence.
+ *
+ * `summary: null` alone was ambiguous, and the ambiguity was the bug: "there was no
+ * baseline, so there is nothing to compare" and "there was a baseline, and I could not
+ * read the tree" both arrived as `null`, and the caller treated them the same. They are
+ * different facts and only one of them is a failure.
+ */
+export interface FinalEvidenceOutcome {
+  readonly summary: EvidenceSummary | null;
+  /** Set only when a baseline exists and the final manifest could not be built from it. */
+  readonly failure: EvidenceCaptureFailure | null;
+}
+
+/**
  * Take the final snapshot and build the manifest.
  *
  * `checksum` of the returned artifact is the manifest's own digest, because the file
@@ -206,11 +388,11 @@ export async function captureInitialEvidence(
  * a reviewer who recomputes `checksum` from the bytes on disk has verified the content,
  * the ordering, the counts and both snapshot digests at once.
  */
-export async function captureFinalEvidence(input: {
+export async function captureFinalEvidenceOutcome(input: {
   readonly handle: WorkspaceHandle;
   readonly initial: InitialEvidence | null;
   readonly maxChanges?: number;
-}): Promise<EvidenceSummary | null> {
+}): Promise<FinalEvidenceOutcome> {
   try {
     const finalSnapshot = await takeWorkspaceSnapshot(input.handle.repoPath);
     const directory = await ensureEvidenceDirectory(input.handle);
@@ -218,8 +400,9 @@ export async function captureFinalEvidence(input: {
 
     if (input.initial === null) {
       // A final snapshot without a baseline answers "what is there", not "what changed".
-      // Recorded on disk for forensics, never dressed up as a manifest.
-      return null;
+      // Recorded on disk for forensics, never dressed up as a manifest — and not a failure,
+      // because this attempt never had a tree whose change it could have described.
+      return { summary: null, failure: null };
     }
 
     const manifest = buildChangeManifest({
@@ -234,34 +417,62 @@ export async function captureFinalEvidence(input: {
     await writeFile(uri, body, { mode: 0o600 });
 
     return {
-      kind: CHANGE_MANIFEST_KIND,
-      manifestDigest: manifest.digest,
-      initialManifestDigest: input.initial.digest,
-      finalManifestDigest: finalSnapshot.digest,
-      evidenceSource: EVIDENCE_SOURCE_HOST_SNAPSHOT,
-      authoritative: manifest.complete,
-      complete: manifest.complete,
-      stopReason: manifest.stopReason,
-      changeCount: manifest.changeCount,
-      counts: manifestCounts(manifest),
-      artifact: {
+      summary: {
         kind: CHANGE_MANIFEST_KIND,
-        uri,
-        // Equal by construction: the file *is* the canonical body.
-        checksum: sha256(body),
-        sizeBytes: body.byteLength,
-        mediaType: CHANGE_MANIFEST_MEDIA_TYPE,
+        manifestDigest: manifest.digest,
+        initialManifestDigest: input.initial.digest,
+        finalManifestDigest: finalSnapshot.digest,
+        evidenceSource: EVIDENCE_SOURCE_HOST_SNAPSHOT,
+        authoritative: manifest.complete,
+        complete: manifest.complete,
+        stopReason: manifest.stopReason,
+        changeCount: manifest.changeCount,
+        counts: manifestCounts(manifest),
+        artifact: {
+          kind: CHANGE_MANIFEST_KIND,
+          uri,
+          // Equal by construction: the file *is* the canonical body.
+          checksum: sha256(body),
+          sizeBytes: body.byteLength,
+          mediaType: CHANGE_MANIFEST_MEDIA_TYPE,
+        },
       },
+      failure: null,
     };
   } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+
     workerLogger().warn(
       {
         workspaceId: input.handle.id,
-        reason: error instanceof Error ? error.message : String(error),
+        reason,
+        hadBaseline: input.initial !== null,
       },
-      'Final workspace snapshot failed; this attempt will have no change manifest',
+      'Final workspace snapshot failed; this attempt has no change manifest',
     );
 
-    return null;
+    return {
+      summary: null,
+      // A baseline existed, so a manifest was owed. `chmod 000` on one directory inside the
+      // repository is not an infrastructure fault — it is a choice not to be measured, and
+      // it must be visible as a failure of this attempt rather than as silence.
+      failure:
+        input.initial === null ? null : { code: 'SNAPSHOT_CAPTURE_FAILED', reason },
+    };
   }
+}
+
+/**
+ * The manifest, or `null`.
+ *
+ * Kept for callers that only need the summary (and for the fixtures that build one). A
+ * caller that decides an attempt's outcome must use `captureFinalEvidenceOutcome`: `null`
+ * here cannot distinguish "no baseline" from "the tree could not be read".
+ */
+export async function captureFinalEvidence(input: {
+  readonly handle: WorkspaceHandle;
+  readonly initial: InitialEvidence | null;
+  readonly maxChanges?: number;
+}): Promise<EvidenceSummary | null> {
+  return (await captureFinalEvidenceOutcome(input)).summary;
 }

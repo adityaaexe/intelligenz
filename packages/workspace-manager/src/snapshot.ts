@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
-import { createReadStream, type Stats } from 'node:fs';
-import { readdir, readFile, lstat, readlink } from 'node:fs/promises';
+import { constants as fsConstants, type Stats } from 'node:fs';
+import { readdir, lstat, open, readlink, type FileHandle } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
 
 import { SnapshotError } from './errors';
@@ -26,9 +26,12 @@ import { SnapshotError } from './errors';
  *
  * So the authority stopped being git and became a walk. This module reads the tree the
  * way the kernel presents it — `lstat`, `readlink`, `open` — and nothing else. It does not
- * spawn, does not read `.git/config`, and cannot be configured by anything inside the
- * tree it is describing. ESLint enforces the first of those structurally: files under
- * `packages/workspace-manager/src` may not import `child_process` at all.
+ * spawn, does not read `.git/config` as configuration, and cannot be configured by
+ * anything inside the tree it is describing. ESLint enforces the spawn discipline
+ * structurally (`SEC-403` in `eslint.config.mjs`): `child_process` may only be imported by
+ * the files on its reviewed allowlist, and `snapshot.ts` is not one of them. Two other
+ * files in this package are — `sandbox.ts` and `manager.ts` — so the rule is an allowlist
+ * over the spawn boundary, not a package-wide ban. A test asserts this module imports none.
  *
  * ## What a snapshot is, and is not
  *
@@ -41,7 +44,9 @@ import { SnapshotError } from './errors';
  *
  * 1. **`lstat` only.** A symlink is recorded as a link and its target string, never
  *    followed. A link to `/etc/passwd` produces one entry with that target; the file is
- *    never opened. A link to a directory outside the tree is not walked into.
+ *    never opened. A link to a directory outside the tree is not walked into — neither as
+ *    an entry of the tree nor as `.git/hooks`, which is enumerated through the same
+ *    helper and therefore has the same rule.
  * 2. **Special files are classified, never opened.** Opening a FIFO blocks until a writer
  *    appears, and reading a character device can block or stream forever. A snapshot of a
  *    repository containing a FIFO must not hang, so `fifo`/`socket`/`device` become
@@ -50,10 +55,18 @@ import { SnapshotError } from './errors';
  *    Exceeding either stops it and sets `complete: false` with the counts actually
  *    reached. A partial manifest that looks whole is the same failure as the empty
  *    `git diff`: a confident wrong answer.
+ *
+ * A fourth property is narrower and stated precisely because an earlier version of this
+ * comment overstated it: **a file is hashed through a descriptor whose identity was
+ * checked.** `open` uses `O_NOFOLLOW`, the descriptor is `fstat`ed, and `dev`/`ino`/`size`
+ * are compared with the `lstat` that classified the entry. A path swapped for a different
+ * inode fails the entry as `unstable` instead of hashing the replacement. A same-size
+ * in-place rewrite that keeps the inode and the mtime is still not detectable by one pass;
+ * see `TRUSTED-SNAPSHOT-DESIGN.md`.
  */
 
 /** Bumped when the canonical form changes. A digest is only comparable at its version. */
-export const SNAPSHOT_VERSION = 1;
+export const SNAPSHOT_VERSION = 2;
 
 /** 50,000 entries is ~4× a large monorepo; beyond it, evidence stops being readable. */
 export const DEFAULT_MAX_ENTRIES = 50_000;
@@ -70,6 +83,9 @@ const GIT_METADATA_MAX_BYTES = 256 * 1024 * 1024;
 
 /** `HEAD` is a ref line or a commit id. Anything longer is not a HEAD; cap what we keep. */
 const GIT_HEAD_MAX_CHARS = 512;
+
+/** A `gitdir:` pointer is one line. A `.git` file larger than this is not one. */
+const GITFILE_MAX_BYTES = 4 * 1024;
 
 /** A hooks directory with more entries than this is not a hooks directory. */
 const MAX_HOOKS = 1_024;
@@ -140,6 +156,19 @@ export interface SnapshotGitMetadata {
   /** Hash of the `.git` file itself, for a worktree checkout. */
   readonly gitfileSha256: string | null;
   readonly hooks: readonly SnapshotHook[];
+  /**
+   * `.git/hooks` when it is a symbolic link: recorded, never enumerated.
+   *
+   * A symlinked hooks directory is a link, exactly like a symlinked file in the content
+   * walk, and it is described the only honest way — by its target string. `null` means
+   * `hooks` was a real directory (enumerated), absent, or not a directory.
+   *
+   * Recorded rather than thrown on purpose. A throw would delete the entire snapshot,
+   * which hands whatever made the link a switch that turns evidence off; recording keeps
+   * every other byte described and puts the anomaly in the digest, where a comparison
+   * between two snapshots sees it.
+   */
+  readonly hooksDirectoryLinkTarget: string | null;
   /** Metadata files that exceeded `GIT_METADATA_MAX_BYTES` and were not hashed. */
   readonly oversize: readonly string[];
   /** True when the hooks directory held more than `MAX_HOOKS` entries. */
@@ -198,19 +227,33 @@ function sha256Bytes(bytes: Buffer | string): string {
 }
 
 /**
- * Stream one file through SHA-256.
+ * An entry whose identity changed between classification and hashing.
  *
- * Streamed rather than read whole: a 2 GiB artifact in a workspace must cost a fixed
- * buffer, not its own size in the worker's heap. The byte count is returned because it is
- * the only way to notice that the file was not the size `lstat` reported.
+ * Not an error the caller reports to a user: it is the walk's answer to "the tree is not
+ * the one I was describing". Callers turn it into `stopReason: 'unstable'` (content walk)
+ * or a metadata gap (`.git` files), never into a digest.
  */
-function digestFile(absolute: string): Promise<{ sha256: string; sizeBytes: number }> {
+class UnstableEntryError extends Error {
+  constructor(absolute: string, detail: string) {
+    super(`Entry ${absolute} changed during capture: ${detail}`);
+    this.name = 'UnstableEntryError';
+  }
+}
+
+/**
+ * Stream one open descriptor through SHA-256.
+ *
+ * `start: 0` reads from the beginning regardless of the descriptor's position, and
+ * `autoClose: false` keeps the handle open so the caller can `fstat` it again afterwards —
+ * that second look is what notices a writer that changed the file while it was being read.
+ */
+function digestHandle(handle: FileHandle): Promise<{ sha256: string; sizeBytes: number }> {
   return new Promise((resolvePromise, reject) => {
     const hash = createHash('sha256');
     let sizeBytes = 0;
     let settled = false;
 
-    const stream = createReadStream(absolute);
+    const stream = handle.createReadStream({ autoClose: false, start: 0 });
 
     stream.on('data', (chunk) => {
       sizeBytes += chunk.length;
@@ -233,6 +276,87 @@ function digestFile(absolute: string): Promise<{ sha256: string; sizeBytes: numb
   });
 }
 
+/**
+ * Hash a regular file through a descriptor, refusing to follow a link or a swap.
+ *
+ * `expected` is the `lstat` that decided this path was a regular file. Four things are
+ * checked, and each closes a different hole:
+ *
+ *   1. `O_NOFOLLOW` — if the final component became a symlink, `open` fails with `ELOOP`
+ *      instead of reading the target. This is the `lstat` → `open` race: `lstat` says
+ *      "file", the agent replaces it with `.git/… -> /etc/passwd`, and a plain
+ *      `createReadStream` would have hashed the target.
+ *   2. `dev`/`ino` — the descriptor must be the very inode `lstat` described. A path
+ *      swapped for a different (possibly same-size) file fails here.
+ *   3. `size` — the descriptor's size must be the size the budget was checked against, so
+ *      a file that grew after `lstat` cannot exceed `maxTotalBytes` unannounced.
+ *   4. `size` and `mtimeMs` again after hashing — a writer that appended or rewrote while
+ *      the stream was open is detected. A same-size rewrite that also restores `mtimeMs`
+ *      is **not** detected; one pass cannot see it, and pretending otherwise is the
+ *      overstatement this check replaced.
+ *
+ * Exported for the escape suite: the identity comparison is the subject of a test and
+ * cannot be triggered deterministically without holding a stale `lstat`.
+ */
+export async function hashRegularFile(
+  absolute: string,
+  expected: Stats,
+): Promise<{ sha256: string; sizeBytes: number }> {
+  const handle = await open(absolute, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW).catch(
+    (error: NodeJS.ErrnoException) => {
+      // `O_NOFOLLOW` turns "the final component became a symlink" into an error rather
+      // than a read of the target. `ELOOP` is exactly that swap, so it is contested (the
+      // entry is not what `lstat` described) rather than unreadable.
+      if (error.code === 'ELOOP' || error.code === 'EMLINK') {
+        throw new UnstableEntryError(absolute, 'became a symbolic link after classification');
+      }
+
+      throw error;
+    },
+  );
+
+  try {
+    const opened = await handle.stat();
+
+    if (opened.dev !== expected.dev || opened.ino !== expected.ino) {
+      throw new UnstableEntryError(
+        absolute,
+        `inode ${String(opened.dev)}:${String(opened.ino)} is not the ${String(expected.dev)}:${String(expected.ino)} that was classified`,
+      );
+    }
+
+    if (opened.size !== expected.size) {
+      throw new UnstableEntryError(
+        absolute,
+        `size ${String(opened.size)} is not the ${String(expected.size)} that was budgeted`,
+      );
+    }
+
+    const digest = await digestHandle(handle);
+    const after = await handle.stat();
+
+    if (after.size !== opened.size || after.mtimeMs !== opened.mtimeMs) {
+      throw new UnstableEntryError(
+        absolute,
+        `written during capture (${String(opened.size)}→${String(after.size)} bytes, mtime ${String(opened.mtimeMs)}→${String(after.mtimeMs)})`,
+      );
+    }
+
+    // The stream's own byte count is what was hashed; a short read with an unchanged
+    // descriptor size would mean the digest covers fewer bytes than it claims.
+    if (digest.sizeBytes !== opened.size) {
+      throw new UnstableEntryError(
+        absolute,
+        `hashed ${String(digest.sizeBytes)} of ${String(opened.size)} bytes`,
+      );
+    }
+
+    return digest;
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
 /** `lstat` without throwing: `undefined` means the entry is gone. */
 async function statOrUndefined(absolute: string): Promise<Stats | undefined> {
   try {
@@ -243,6 +367,51 @@ async function statOrUndefined(absolute: string): Promise<Stats | undefined> {
   }
 }
 
+/**
+ * What is at a path we are about to enumerate.
+ *
+ * The one rule this whole module exists to enforce is "never descend through a link", and
+ * a directory listing is a descent. `readdir('…/.git/hooks')` where `hooks` is a symlink to
+ * `/etc` returns `/etc`'s entries, and every one of them then looks like
+ * `<root>/.git/hooks/<name>` to a lexical containment check — which is how a snapshot came
+ * to carry the SHA-256 of `/etc/passwd`.
+ *
+ * So every enumeration goes through here: `lstat` first, and a link is described, never
+ * listed. It is used for the content walk **and** for `.git` metadata, because the rule is
+ * about descending, not about which directory is being walked. For the content walk it is
+ * also a second look: a directory that was classified as `dir` and swapped for a link
+ * before it was read is refused here.
+ */
+type DirectoryListing =
+  | { readonly kind: 'listed'; readonly names: readonly string[] }
+  | { readonly kind: 'symlink'; readonly target: string | null }
+  | { readonly kind: 'not-a-directory' }
+  | { readonly kind: 'absent' };
+
+async function listDirectory(absolute: string): Promise<DirectoryListing> {
+  const stat = await statOrUndefined(absolute);
+
+  if (stat === undefined) return { kind: 'absent' };
+
+  if (stat.isSymbolicLink()) {
+    let target: string | null = null;
+
+    try {
+      target = await readlink(absolute);
+    } catch {
+      target = null;
+    }
+
+    return { kind: 'symlink', target };
+  }
+
+  if (!stat.isDirectory()) return { kind: 'not-a-directory' };
+
+  // `EACCES`/`EIO` propagate on purpose: a directory we were told exists and cannot read
+  // is a gap in the evidence, not an empty directory.
+  return { kind: 'listed', names: (await readdir(absolute)).sort(comparePathBytes) };
+}
+
 function classify(stat: Stats): SnapshotEntryKind {
   if (stat.isSymbolicLink()) return 'symlink';
   if (stat.isDirectory()) return 'dir';
@@ -250,6 +419,61 @@ function classify(stat: Stats): SnapshotEntryKind {
   // FIFO, socket, character device, block device — and anything the platform adds later.
   // Classified, never opened: `open()` on a FIFO blocks until a writer exists.
   return 'special';
+}
+
+/**
+ * Read a small file without following a link, and without trusting its length.
+ *
+ * `.git/HEAD` is a ref line and `.git` may be a `gitdir:` pointer; both are text, both are
+ * paths an agent can replace, and `readFile` follows symlinks and reads a length it did not
+ * choose. A `.git -> /etc/shadow` gitfile would have hashed the target into
+ * `gitfileSha256`; a multi-gigabyte `.git` file would have been read into the worker's
+ * heap. `O_NOFOLLOW` plus an explicit ceiling closes both.
+ */
+async function readSmallFileNoFollow(
+  absolute: string,
+  maxBytes: number,
+): Promise<Buffer | null> {
+  let handle: FileHandle;
+
+  try {
+    handle = await open(absolute, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch {
+    return null;
+  }
+
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) return null;
+    if (stat.size > maxBytes) return null;
+
+    const buffer = Buffer.alloc(stat.size);
+    const { bytesRead } = await handle.read(buffer, 0, stat.size, 0);
+
+    return buffer.subarray(0, bytesRead);
+  } catch {
+    return null;
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+/**
+ * Read `.git/HEAD` without following a link.
+ *
+ * `.git/HEAD` is a ref line or a commit id, so it is small and it is text — but it is also
+ * a path an agent can replace, and `readFile` follows symlinks. `.git/HEAD -> /etc/passwd`
+ * would have put up to 512 bytes of `/etc/passwd` into the manifest as `head`, which is the
+ * same boundary violation as the hooks directory in a different field. `O_NOFOLLOW` makes
+ * the link fail to open, and the honest answer for "HEAD is a link" is `null`.
+ */
+async function readHead(absolute: string): Promise<string | null> {
+  const bytes = await readSmallFileNoFollow(absolute, GIT_HEAD_MAX_CHARS * 4);
+  if (bytes === null) return null;
+
+  const trimmed = bytes.toString('utf8').trim();
+
+  return trimmed.length === 0 ? null : trimmed.slice(0, GIT_HEAD_MAX_CHARS);
 }
 
 /**
@@ -269,6 +493,7 @@ async function readGitMetadata(root: string): Promise<SnapshotGitMetadata> {
     indexSha256: null,
     gitfileSha256: null,
     hooks: [],
+    hooksDirectoryLinkTarget: null,
     oversize: [],
     hooksTruncated: false,
   };
@@ -291,13 +516,28 @@ async function readGitMetadata(root: string): Promise<SnapshotGitMetadata> {
       ...empty,
       present: true,
       kind: 'file',
-      gitfileSha256: sha256Bytes(target ?? ''),
+      // Prefixed like every other symlink digest in this module (`hooks`, `config`): a
+      // `.git` *file* containing exactly this path string and a `.git` *link* to it are
+      // different facts, and an unprefixed hash would represent both as one value.
+      gitfileSha256: sha256Bytes(`symlink:${target ?? ''}`),
     };
   }
 
   if (stat.isFile()) {
-    const bytes = await readFile(gitPath);
-    return { ...empty, present: true, kind: 'file', gitfileSha256: sha256Bytes(bytes) };
+    const bytes = await readSmallFileNoFollow(gitPath, GITFILE_MAX_BYTES);
+
+    // Unreadable, oversized, or replaced by a link: the pointer's own hash is the only
+    // thing that can be reported, and a `null` here is a **gap**, not a digest of nothing.
+    // Reporting it through `oversize` is what makes the snapshot `complete: false` — the
+    // alternative (present, hashed, complete) would say "the pointer was read" when it was
+    // not.
+    return {
+      ...empty,
+      present: true,
+      kind: 'file',
+      gitfileSha256: bytes === null ? null : sha256Bytes(bytes),
+      oversize: bytes === null ? [GIT_DIRECTORY] : [],
+    };
   }
 
   if (!stat.isDirectory()) {
@@ -331,8 +571,10 @@ async function readGitMetadata(root: string): Promise<SnapshotGitMetadata> {
     }
 
     try {
-      return (await digestFile(absolute)).sha256;
+      return (await hashRegularFile(absolute, candidate)).sha256;
     } catch {
+      // Oversize, contested, or unreadable: all three leave the same gap, and the gap is
+      // what has to be visible rather than a digest of something else.
       oversize.push(name);
       return null;
     }
@@ -343,22 +585,24 @@ async function readGitMetadata(root: string): Promise<SnapshotGitMetadata> {
     digestMetadata('index'),
   ]);
 
-  let head: string | null = null;
-  try {
-    const raw = await readFile(join(gitPath, 'HEAD'), 'utf8');
-    const trimmed = raw.trim();
-    head = trimmed.length === 0 ? null : trimmed.slice(0, GIT_HEAD_MAX_CHARS);
-  } catch {
-    head = null;
-  }
+  const head = await readHead(join(gitPath, 'HEAD'));
 
   const hooks: SnapshotHook[] = [];
   let hooksTruncated = false;
 
-  try {
-    const names = (await readdir(join(gitPath, 'hooks'))).sort(comparePathBytes);
+  // ── The hooks directory is a descent, so it obeys the descent rule ──────────
+  //
+  // `readdir` on a symlinked `hooks` follows it. Every name it returns then reads as
+  // `<root>/.git/hooks/<name>` to `isContained`, which is lexical and therefore always
+  // agrees — so the walk hashed `/etc/passwd` and reported it as a hook. Enumerate
+  // through `listDirectory` and a link is a link: recorded by target, never listed.
+  const hooksListing = await listDirectory(join(gitPath, 'hooks'));
+  let hooksDirectoryLinkTarget: string | null = null;
 
-    for (const name of names) {
+  if (hooksListing.kind === 'symlink') {
+    hooksDirectoryLinkTarget = hooksListing.target;
+  } else if (hooksListing.kind === 'listed') {
+    for (const name of hooksListing.names) {
       if (hooks.length >= MAX_HOOKS) {
         hooksTruncated = true;
         break;
@@ -386,7 +630,7 @@ async function readGitMetadata(root: string): Promise<SnapshotGitMetadata> {
         }
 
         try {
-          hooks.push({ name, kind, sha256: (await digestFile(absolute)).sha256 });
+          hooks.push({ name, kind, sha256: (await hashRegularFile(absolute, hookStat)).sha256 });
         } catch {
           oversize.push(join(GIT_DIRECTORY, 'hooks', name));
           hooks.push({ name, kind, sha256: null });
@@ -403,8 +647,6 @@ async function readGitMetadata(root: string): Promise<SnapshotGitMetadata> {
         }
       }
     }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
 
   return {
@@ -415,6 +657,7 @@ async function readGitMetadata(root: string): Promise<SnapshotGitMetadata> {
     indexSha256,
     gitfileSha256: null,
     hooks,
+    hooksDirectoryLinkTarget,
     oversize,
     hooksTruncated,
   };
@@ -466,18 +709,24 @@ async function walk(root: string, limits: SnapshotLimits): Promise<WalkResult> {
       );
     }
 
-    let names: string[];
-    try {
-      names = (await readdir(absoluteDirectory)).sort(comparePathBytes);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        // Removed after it was queued. The tree is not the one we started describing.
-        stopReason = 'unreadable';
-        break;
-      }
+    // The walk's own descent, through the same rule as `.git/hooks`. The queue only ever
+    // holds paths that `lstat` classified as a directory, so `symlink`/`not-a-directory`
+    // here means the entry was swapped between classification and enumeration — the tree
+    // is not the one this snapshot was describing, which is `unstable`, not a listing.
+    const listing = await listDirectory(absoluteDirectory);
 
-      throw error;
+    if (listing.kind === 'absent') {
+      // Removed after it was queued. The tree is not the one we started describing.
+      stopReason = 'unreadable';
+      break;
     }
+
+    if (listing.kind === 'symlink' || listing.kind === 'not-a-directory') {
+      stopReason = 'unstable';
+      break;
+    }
+
+    const names = listing.names;
 
     for (const name of names) {
       if (name === '.' || name === '..' || name.includes(sep) || name === GIT_DIRECTORY) {
@@ -553,16 +802,12 @@ async function walk(root: string, limits: SnapshotLimits): Promise<WalkResult> {
 
       let digest: { sha256: string; sizeBytes: number };
       try {
-        digest = await digestFile(absolute);
-      } catch {
-        stopReason = 'unreadable';
-        break;
-      }
-
-      // The file changed size while it was being read, so this digest describes a state
-      // that did not exist at one instant. Report it rather than record a half-truth.
-      if (digest.sizeBytes !== stat.size) {
-        stopReason = 'unstable';
+        digest = await hashRegularFile(absolute, stat);
+      } catch (error) {
+        // A contested entry is not "unreadable": the bytes were readable, the identity was
+        // wrong. Both stop the walk, but the reason is different and the reason is the
+        // only thing an operator can act on.
+        stopReason = error instanceof UnstableEntryError ? 'unstable' : 'unreadable';
         break;
       }
 
@@ -617,6 +862,7 @@ export function serialiseSnapshot(input: SnapshotDigestInput): string {
         kind: hook.kind,
         sha256: hook.sha256,
       })),
+      hooksDirectoryLinkTarget: input.git.hooksDirectoryLinkTarget,
       oversize: [...input.git.oversize].sort(comparePathBytes),
       hooksTruncated: input.git.hooksTruncated,
     },

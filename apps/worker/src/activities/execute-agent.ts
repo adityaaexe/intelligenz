@@ -61,7 +61,12 @@ import { getAgentRuntime, runtimeRequiresWorkspace } from '../runtime';
 import type { ExecuteAgentActivityInput, ExecuteAgentActivityResult } from '../shared/contracts';
 import { classifyTermination, type TerminationReason } from '../termination';
 import { materializeArtifacts } from './artifacts';
-import { captureFinalEvidence, captureInitialEvidence, type EvidenceSummary } from './evidence';
+import {
+  captureFinalEvidenceOutcome,
+  captureInitialEvidence,
+  type EvidenceCaptureFailure,
+  type EvidenceSummary,
+} from './evidence';
 import {
   RUN_STATUS,
   finalizeAttempt,
@@ -69,7 +74,7 @@ import {
   resolveWorkflowRun,
   startAttempt,
 } from './attempts';
-import { executionWorkspaceIdFor } from './ids';
+import { deterministicId, executionWorkspaceIdFor } from './ids';
 import { requireExecutionClaim, executionIdentity, executionWorkflowId } from './claim';
 import { workerIdentity } from '../identity';
 import { workerLogger } from '../log';
@@ -433,6 +438,15 @@ export async function executeAgentActivity(
   // look like a clean bill of health.
   let initialEvidence: Awaited<ReturnType<typeof captureInitialEvidence>> = null;
   let finalEvidence: EvidenceSummary | null = null;
+  /**
+   * Why the final manifest is missing, when a baseline existed.
+   *
+   * Separated from `finalEvidence === null` because that value is also the legitimate
+   * answer for a runtime that leases no workspace. `null` evidence for an attempt with a
+   * baseline is not "nothing to report" — it is "the report could not be produced", and it
+   * fails the attempt below.
+   */
+  let finalEvidenceFailure: EvidenceCaptureFailure | null = null;
 
   // ── Per-attempt enforcement state ─────────────────────────────────────────────
   // `cgroup` is created after the lease (the cgroup is named after the workspace) and
@@ -496,6 +510,80 @@ export async function executeAgentActivity(
    */
   function attachEvidence(value: ExecutionResult): ExecuteAgentActivityResult {
     return finalEvidence === null ? value : { ...value, evidence: finalEvidence };
+  }
+
+  /**
+   * The evidence gap for this attempt, or `null` when there is none.
+   *
+   * The `initialEvidence === null` arm is not a convenience. A runtime that leases no
+   * workspace never takes a baseline, so it owes no manifest; treating that absence as a
+   * failure would fail every simulated run for a report it was never asked to produce.
+   */
+  function evidenceGap(): EvidenceCaptureFailure | null {
+    if (initialEvidence === null) return null;
+
+    return finalEvidenceFailure;
+  }
+
+  /**
+   * Record an evidence failure durably, bound to the attempt.
+   *
+   * An audit event rather than a column: `AuditEvent` has no update path in this codebase,
+   * so the record cannot be rewritten by a later pass, and it is the same table an operator
+   * already reads for `workspace.reaped.v1` and `execution.claim_released.v1`. The id is
+   * deterministic from the attempt and the phase, so a retried activity cannot produce a
+   * second, disagreeing record.
+   *
+   * Failing to write it is logged, not thrown: the attempt is already being failed, and
+   * trading a recorded status for an exception would lose more than it gains.
+   */
+  async function recordEvidenceFailure(
+    gap: EvidenceCaptureFailure,
+    activityInput: ExecuteAgentActivityInput,
+    attemptRow: { readonly id: string; readonly attemptNumber: number },
+    workspaceId: string | null,
+  ): Promise<void> {
+    try {
+      await db().auditEvent.create({
+        data: {
+          id: deterministicId(`attempt-evidence-failed:${attemptRow.id}:final`),
+          orgId: activityInput.orgId,
+          actorType: 'system',
+          actorId: `worker:${workerIdentity()}`,
+          action: 'attempt.evidence_failed',
+          aggregateType: 'ExecutionAttempt',
+          aggregateId: attemptRow.id,
+          eventType: 'attempt.evidence_failed.v1',
+          correlationId: activityInput.correlationId,
+          idempotencyKey: `attempt.evidence_failed.v1:${attemptRow.id}:final`,
+          payload: {
+            taskId: activityInput.taskId,
+            attemptId: attemptRow.id,
+            attemptNumber: attemptRow.attemptNumber,
+            workflowRunId: workflowRun.id,
+            workspaceId,
+            phase: 'final',
+            code: gap.code,
+            reason: gap.reason,
+            // The digest of the tree the attempt *was* measured against. Without it,
+            // "no manifest" is a fact with no anchor; with it, the baseline it failed to
+            // compare against is named.
+            initialManifestDigest: initialEvidence?.digest ?? null,
+            recordedAt: new Date().toISOString(),
+            worker: workerIdentity(),
+          },
+          occurredAt: new Date(),
+        },
+        select: { id: true },
+      });
+    } catch (error) {
+      if ((error as { code?: string }).code === 'P2002') return;
+
+      workerLogger().error(
+        { attemptId: attemptRow.id, err: error instanceof Error ? error.message : String(error) },
+        'attempt.evidence_failed.v1 could not be written; the failure is only in the log',
+      );
+    }
   }
 
   if (task.status === 'cancelled') {
@@ -753,10 +841,13 @@ export async function executeAgentActivity(
     // run's result with an infrastructure error. A `null` result means no manifest, and
     // an absent manifest is visible as absent; an empty one would be a claim.
     if (lease !== undefined) {
-      finalEvidence = await captureFinalEvidence({
+      const captured = await captureFinalEvidenceOutcome({
         handle: lease.handle,
         initial: initialEvidence,
       });
+
+      finalEvidence = captured.summary;
+      finalEvidenceFailure = captured.failure;
 
       if (finalEvidence === null) {
         workerLogger().warn(
@@ -965,7 +1056,7 @@ export async function executeAgentActivity(
     // adapter described as "failed" stays failed; one it described as "succeeded" is
     // corrected, with the reason attached, because a run that lost a process to the
     // kernel did not succeed.
-    const finalStatus: ExecutionResult['status'] = verdict.overridesAdapter
+    let finalStatus: ExecutionResult['status'] = verdict.overridesAdapter
       ? verdict.reason === 'cancelled'
         ? 'cancelled'
         : verdict.reason === 'timeout'
@@ -973,13 +1064,47 @@ export async function executeAgentActivity(
           : 'failed'
       : result.status;
 
-    const finalError = verdict.overridesAdapter
+    let finalError = verdict.overridesAdapter
       ? resourceKillError(verdict.reason, usage, effectiveLimits, {
           profile,
           budgetSample,
           diskFreeBytes,
         })
       : result.error;
+
+    // ── No evidence, no success ────────────────────────────────────────────────
+    //
+    // The invariant: **if an initial snapshot exists for this attempt, a missing final
+    // manifest is a failure of the attempt.** The baseline is a promise that the run will
+    // be describable; a run that then removes the ability to describe it — `chmod 000` on
+    // one directory is enough — has not succeeded, whatever its adapter returned.
+    //
+    // Before this, the failure was silent in the worst way: `captureFinalEvidence` returned
+    // `null`, nothing was attached, the attempt was finalised `succeeded`, and "no
+    // manifest" was indistinguishable from "the agent changed nothing".
+    //
+    // The status vocabulary is unchanged — this is `failed`, with the reason in `error`.
+    // `terminationReason` stays `completed` because the *process* did complete; conflating
+    // "how the tree stopped" with "whether the claim holds" is what the two columns are for.
+    //
+    // A run with no baseline (a runtime that leases no workspace) never had a manifest to
+    // lose, so `evidenceGap()` is `null` and this branch is unreachable for it.
+    const gap = evidenceGap();
+
+    if (gap !== null) {
+      await recordEvidenceFailure(gap, input, attempt, lease === undefined ? null : lease.id);
+
+      if (finalStatus === 'succeeded') {
+        finalStatus = 'failed';
+        finalError = {
+          code: 'EVIDENCE_MISSING',
+          message:
+            'The final workspace snapshot could not be taken, so this attempt has no change ' +
+            `manifest and cannot be reviewed: ${gap.reason}`,
+          retryable: false,
+        };
+      }
+    }
 
     await finalize(finalStatus, result.simulated, finalError, verdict.reason);
 
@@ -998,7 +1123,17 @@ export async function executeAgentActivity(
             summary: resourceKillSummary(verdict.reason),
             ...(finalError === undefined ? {} : { error: finalError }),
           }
-        : result,
+        : // The evidence gate can correct `succeeded` to `failed` without a resource kill.
+          // Returning `result` unchanged here would have written `failed` to the attempt and
+          // told the workflow `succeeded` — the same silence, one layer up: the task would
+          // reach `succeeded` while its attempt did not.
+          finalStatus === result.status
+          ? result
+          : {
+              ...result,
+              status: finalStatus,
+              ...(finalError === undefined ? {} : { error: finalError }),
+            },
     );
   } catch (error) {
     attemptError = error;
@@ -1011,10 +1146,13 @@ export async function executeAgentActivity(
     // it. `finalEvidence` is left alone when the success path already captured it: two
     // snapshots of one instant would only make "which one is the manifest" a question.
     if (lease !== undefined && finalEvidence === null) {
-      finalEvidence = await captureFinalEvidence({
+      const captured = await captureFinalEvidenceOutcome({
         handle: lease.handle,
         initial: initialEvidence,
       });
+
+      finalEvidence = captured.summary;
+      finalEvidenceFailure = captured.failure;
 
       if (finalEvidence !== null) {
         await recordFinalSnapshot({
@@ -1087,6 +1225,17 @@ export async function executeAgentActivity(
 
     await finalize('failed', simulatedAdapter, normalised, verdict.reason);
     workspaceOutcome = 'failed';
+
+    // The thrown path already reaches `failed`, so this cannot change the outcome — but the
+    // *record* is still owed: "this attempt's evidence is missing" must be findable without
+    // reading a log line, on every path that can produce it.
+    {
+      const gap = evidenceGap();
+
+      if (gap !== null) {
+        await recordEvidenceFailure(gap, input, attempt, lease === undefined ? null : lease.id);
+      }
+    }
 
     // A budget kill is terminal on purpose. `retryable` is the adapter's opinion of its
     // own failure, and it cannot see the resource decision; rethrowing here would hand
