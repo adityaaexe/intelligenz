@@ -4,12 +4,18 @@ import { join } from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { ExecutionIsolation } from '@intelligenz/contracts';
+import type { ExecutionResult } from '@intelligenz/agent-runtime';
 import type { PrismaClient } from '@intelligenz/database';
 
-import { executeAgentActivity } from '../src/activities/execute-agent';
-import { persistResultActivity } from '../src/activities/persist-result';
+import { persistResult } from '../src/activities/persist-result';
 import { resetWorkerConfig } from '../src/config';
 import { resetAgentRuntime } from '../src/runtime';
+import {
+  createExecutionHarness,
+  temporalReachable,
+  type ExecutionHarness,
+  type ExecutionSession,
+} from './helpers/execution-harness';
 import type { ExecuteAgentActivityInput } from '../src/shared/contracts';
 import {
   createTask,
@@ -18,6 +24,7 @@ import {
   reserveAndClaim,
   testDatabaseUrl,
   useTestDatabase,
+  type TaskFixture,
   type TenantFixture,
 } from './helpers/database';
 
@@ -50,6 +57,8 @@ const databaseUrl = testDatabaseUrl();
 const enabled = databaseUrl !== undefined;
 
 let client: PrismaClient;
+let harness: ExecutionHarness | undefined;
+const temporalEnabled = enabled && (await temporalReachable());
 const tenants: TenantFixture[] = [];
 let artifactRoot: string;
 
@@ -85,12 +94,39 @@ async function withResourceProfile<T>(
   }
 }
 
-/** The thrown failure, so its Temporal `type` (the typed code) can be asserted. */
-async function attemptFailure(input: ExecuteAgentActivityInput): Promise<unknown> {
-  return executeAgentActivity(input).then(
+/**
+ * The thrown failure, so its Temporal `type` (the typed code) can be asserted.
+ *
+ * The activity runs inside a **real workflow** (AG-603): it takes its execution identity
+ * from the activity context, and there is no longer a way to hand it one. Refusals below
+ * are still the isolation gate's — the claim is what lets the activity get far enough to
+ * reach that gate.
+ */
+async function attemptFailure(
+  session: ExecutionSession,
+  input: ExecuteAgentActivityInput,
+): Promise<unknown> {
+  return session.call({ op: 'execute', input: input as unknown as Record<string, unknown> }).then(
     () => undefined,
     (error: unknown) => error,
   );
+}
+
+/** A session whose run id already holds the claim on `task`'s reservation. */
+async function claimedSession(
+  fixture: TenantFixture,
+  task: TaskFixture,
+): Promise<{ readonly session: ExecutionSession; readonly attemptId: string }> {
+  const session = await requireHarness().session();
+  const claim = await reserveAndClaim(client, fixture, task, session.runId);
+
+  return { session, attemptId: claim.attemptId };
+}
+
+function requireHarness(): ExecutionHarness {
+  if (harness === undefined)
+    throw new Error('no Temporal server: this test needs a real execution');
+  return harness;
 }
 
 beforeAll(async () => {
@@ -109,36 +145,45 @@ beforeAll(async () => {
 
   resetWorkerConfig();
   resetAgentRuntime();
+
+  if (temporalEnabled) harness = await createExecutionHarness();
 });
 
 afterAll(async () => {
   if (!enabled) return;
 
+  await harness?.close();
   for (const fixture of tenants) await dropTenant(client, fixture);
   await client.$disconnect();
 });
 
-describe.skipIf(!enabled)('isolation tier gate', () => {
+describe.skipIf(!temporalEnabled)('isolation tier gate', () => {
   it('refuses a vm profile, ends the attempt failed, and launches nothing', async () => {
     const fixture = await tenant('isolation-vm');
     const task = await createTask(client, fixture, { title: 'Requires a virtual machine' });
 
     // Phase 6: the executor requires a held execution claim before it does anything, so
-    // the fixture supplies the reservation `POST /run` would have created. The refusal
-    // under test is still the isolation gate's — the claim is what lets the activity run
-    // far enough to reach it.
-    const claim = await reserveAndClaim(client, fixture, task);
+    // the fixture supplies the reservation `POST /run` would have created — under the
+    // session's own run id, because the activity reads its identity from the context. The
+    // refusal under test is still the isolation gate's: the claim is what lets the activity
+    // run far enough to reach it.
+    const { session, attemptId } = await claimedSession(fixture, task);
 
-    const failure = await withResourceProfile('VM', () =>
-      attemptFailure({
-        taskId: task.taskId,
-        orgId: fixture.orgId,
-        correlationId: 'isolation-vm',
-        workflowRunId: task.workflowRunId,
-        attemptId: claim.attemptId,
-        executionRunId: claim.executionRunId,
-      }),
-    );
+    let failure: unknown;
+
+    try {
+      failure = await withResourceProfile('VM', () =>
+        attemptFailure(session, {
+          taskId: task.taskId,
+          orgId: fixture.orgId,
+          correlationId: 'isolation-vm',
+          workflowRunId: task.workflowRunId,
+          attemptId,
+        }),
+      );
+    } finally {
+      await session.stop();
+    }
 
     // The typed refusal: `type` is the ApplicationFailure code the workflow and an operator
     // filter on, and it is the same string the attempt records.
@@ -191,7 +236,7 @@ describe.skipIf(!enabled)('isolation tier gate', () => {
     const forged = ['WORKER_VM_AVAILABLE', 'KVM_AVAILABLE', 'VM_AVAILABLE', 'ISOLATION_TIER'];
     const previous = forged.map((name) => [name, process.env[name]] as const);
 
-    const claim = await reserveAndClaim(client, fixture, task);
+    const { session, attemptId } = await claimedSession(fixture, task);
 
     let failure: unknown;
 
@@ -199,16 +244,16 @@ describe.skipIf(!enabled)('isolation tier gate', () => {
       for (const name of forged) process.env[name] = '1';
 
       failure = await withResourceProfile('VM', () =>
-        attemptFailure({
+        attemptFailure(session, {
           taskId: task.taskId,
           orgId: fixture.orgId,
           correlationId: 'isolation-forged-env',
           workflowRunId: task.workflowRunId,
-          attemptId: claim.attemptId,
-          executionRunId: claim.executionRunId,
+          attemptId,
         }),
       );
     } finally {
+      await session.stop();
       for (const [name, value] of previous) {
         if (value === undefined) delete process.env[name];
         else process.env[name] = value;
@@ -232,21 +277,26 @@ describe.skipIf(!enabled)('isolation tier gate', () => {
 
     // Every field a client-side model might try: a tier, a boolean, and a whole report.
     // None of them is read — the requirement is `profile.isolation`, chosen server-side.
-    const claim = await reserveAndClaim(client, fixture, task);
+    const { session, attemptId } = await claimedSession(fixture, task);
 
     const forged = {
       taskId: task.taskId,
       orgId: fixture.orgId,
       correlationId: 'isolation-forged-input',
       workflowRunId: task.workflowRunId,
-      attemptId: claim.attemptId,
-      executionRunId: claim.executionRunId,
+      attemptId,
       isolationTier: 'restricted-shared-kernel',
       requiresVm: false,
       isolation: { required: 'restricted-shared-kernel', effective: 'restricted-shared-kernel' },
     } as unknown as ExecuteAgentActivityInput;
 
-    const failure = await withResourceProfile('VM', () => attemptFailure(forged));
+    let failure: unknown;
+
+    try {
+      failure = await withResourceProfile('VM', () => attemptFailure(session, forged));
+    } finally {
+      await session.stop();
+    }
 
     expect((failure as { type?: string }).type).toBe('ISOLATION_TIER_UNAVAILABLE');
 
@@ -273,18 +323,26 @@ describe.skipIf(!enabled)('isolation tier gate', () => {
       goal: 'Fix the failing test in src/sum.js and prove it passes. [simulate:ok]',
     });
 
-    const claim = await reserveAndClaim(client, fixture, task);
+    const { session, attemptId } = await claimedSession(fixture, task);
 
-    const result = await withResourceProfile(undefined, () =>
-      executeAgentActivity({
-        taskId: task.taskId,
-        orgId: fixture.orgId,
-        correlationId: 'isolation-restricted',
-        workflowRunId: task.workflowRunId,
-        attemptId: claim.attemptId,
-        executionRunId: claim.executionRunId,
-      }),
-    );
+    let result;
+
+    try {
+      result = await withResourceProfile(undefined, () =>
+        session.call<ExecutionResult>({
+          op: 'execute',
+          input: {
+            taskId: task.taskId,
+            orgId: fixture.orgId,
+            correlationId: 'isolation-restricted',
+            workflowRunId: task.workflowRunId,
+            attemptId,
+          },
+        }),
+      );
+    } finally {
+      await session.stop();
+    }
 
     expect(result.status).toBe('succeeded');
 
@@ -296,8 +354,10 @@ describe.skipIf(!enabled)('isolation tier gate', () => {
     // The controls the tier does not provide are part of the record, not a footnote.
     expect(isolation?.controlsUnavailable).toContain('kernel-isolation');
 
-    // Persisted, so the API can report it without re-deriving anything.
-    const persisted = await persistResultActivity({
+    // Persisted, so the API can report it without re-deriving anything. `persistResult` is
+    // the body `persistResultActivity` wraps; the wrapper's claim check is proved in
+    // `execution-boundary.test.ts`, and this test is about what the write records.
+    const persisted = await persistResult({
       taskId: task.taskId,
       orgId: fixture.orgId,
       result,

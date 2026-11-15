@@ -11,7 +11,7 @@ import type { PrismaClient } from '@intelligenz/database';
 
 import { activities } from '../src/activities';
 import { executionWorkspaceIdFor } from '../src/activities/ids';
-import { classifyLostClaim } from '../src/activities/claim';
+import { claimExecution, classifyLostClaim } from '../src/activities/claim';
 import { validateTaskActivity } from '../src/activities/validate-task';
 import { computeTaskContentHash } from '../src/approvals/task-binding';
 import { getWorkerConfig, resetWorkerConfig } from '../src/config';
@@ -33,15 +33,26 @@ import {
  * `attemptId` could both read it, both pass, and both proceed toward execution — one
  * grant, two agents, with Temporal's workflow-id dedupe as the only obstacle.
  *
- * These tests are written against the activity and the database, not against the claim
- * helper, so what they prove is the property the system needs: **one attempt authorises
- * one execution**, and a loser leaves nothing behind. Concurrency is real — two calls
- * race on separate pool connections against the real test database, with no mocks, no
- * fake clock and no injected interleaving.
+ * What they prove is the property the system needs: **one attempt authorises one
+ * execution**, and a loser leaves nothing behind. Concurrency is real — two calls race on
+ * separate pool connections against the real test database, with no mocks, no fake clock
+ * and no injected interleaving.
  *
- * Test 7 is the end-to-end statement of the same property through a real Temporal
- * worker: a workflow started directly, holding the genuine attempt id and a live grant,
- * cannot join an execution that already claimed it.
+ * ## AG-603: why the race tests call `claimExecution` directly
+ *
+ * The race used to be driven through `validateTaskActivity` with a supplied
+ * `workflowRunId`, because `executionIdentity` fell back to that field when there was no
+ * activity context. The re-review broke the fallback with a real standalone activity, so
+ * that seam is gone and a direct call to validation now has no identity to claim under.
+ *
+ * The write under test is `claimExecution`, and its only production caller is
+ * `validateTaskActivity`. Racing `claimExecution` therefore tests the exact statement that
+ * arbitrates — `UPDATE … WHERE status = 'queued' AND claimedByWorkflowRunId IS NULL` —
+ * without inventing an identity. What the round trip through validation adds is *identity
+ * provenance*, and that is proved separately and for real: `execution-identity.test.ts`
+ * shows a running workflow's activities claim under the server's run id and that no input
+ * can name a different one, and the two tests at the bottom of this file run the whole
+ * workflow through a real Temporal worker.
  */
 
 const databaseUrl = testDatabaseUrl();
@@ -169,15 +180,24 @@ async function reservedTask(
   };
 }
 
-/** A direct activity call: no Temporal context, so the identity is supplied explicitly. */
-function validateAs(
+/**
+ * The claim, written by the module `validateTaskActivity` uses.
+ *
+ * `workflowRunId` here is the execution identity **as an argument**, which is legitimate
+ * for this function and only for this function: `claimExecution` is an internal writer that
+ * is *given* an identity by its caller, and the one caller that matters
+ * (`validateTaskActivity`) derives it from the activity context. Nothing reachable from
+ * Temporal can choose the argument — see `execution-identity.test.ts`.
+ */
+function claimAs(
   reservation: Reservation,
   workflowRunId: string,
   overrides: { readonly attemptId?: string } = {},
 ): Promise<unknown> {
-  return validateTaskActivity({
-    taskId: reservation.taskId,
+  return claimExecution({
     orgId: reservation.orgId,
+    taskId: reservation.taskId,
+    projectId: reservation.projectId,
     attemptId: overrides.attemptId ?? reservation.attemptId,
     workflowRunId,
     correlationId: randomUUID(),
@@ -303,8 +323,8 @@ describe.skipIf(!databaseEnabled)('the claim is atomic at the database', () => {
       const second = `execution-b-${randomUUID()}`;
 
       const [a, b] = await Promise.allSettled([
-        validateAs(reservation, first),
-        validateAs(reservation, second),
+        claimAs(reservation, first),
+        claimAs(reservation, second),
       ]);
 
       const fulfilled = [a, b].filter((outcome) => outcome.status === 'fulfilled');
@@ -379,9 +399,9 @@ describe.skipIf(!databaseEnabled)('the claim is atomic at the database', () => {
     const reservation = await reservedTask(fixture, 'second-claim');
     const owner = `execution-owner-${randomUUID()}`;
 
-    await expect(validateAs(reservation, owner)).resolves.toMatchObject({ runnable: true });
+    await expect(claimAs(reservation, owner)).resolves.toMatchObject({ outcome: 'granted' });
 
-    await expect(validateAs(reservation, `execution-intruder-${randomUUID()}`)).rejects.toMatchObject(
+    await expect(claimAs(reservation, `execution-intruder-${randomUUID()}`)).rejects.toMatchObject(
       { type: 'EXECUTION_ALREADY_CLAIMED', nonRetryable: true },
     );
 
@@ -397,13 +417,14 @@ describe.skipIf(!databaseEnabled)('the claim is atomic at the database', () => {
     const reservation = await reservedTask(fixture, 'idempotent');
     const execution = `execution-retry-${randomUUID()}`;
 
-    await expect(validateAs(reservation, execution)).resolves.toMatchObject({ runnable: true });
+    await expect(claimAs(reservation, execution)).resolves.toMatchObject({ outcome: 'granted' });
 
     const afterGrant = await attemptRow(reservation.attemptId);
 
-    // Second and third calls: an activity retry of the same execution.
-    await expect(validateAs(reservation, execution)).resolves.toMatchObject({ runnable: true });
-    await expect(validateAs(reservation, execution)).resolves.toMatchObject({ runnable: true });
+    // Second and third calls: an activity retry of the same execution. Recognised as the
+    // same execution rather than refused as a duplicate of itself.
+    await expect(claimAs(reservation, execution)).resolves.toMatchObject({ outcome: 'retry' });
+    await expect(claimAs(reservation, execution)).resolves.toMatchObject({ outcome: 'retry' });
 
     const afterRetries = await attemptRow(reservation.attemptId);
 
@@ -442,7 +463,7 @@ describe.skipIf(!databaseEnabled)('the claim is atomic at the database', () => {
     const reservation = await reservedTask(fixture, 'terminal');
     const owner = `execution-terminal-${randomUUID()}`;
 
-    await expect(validateAs(reservation, owner)).resolves.toMatchObject({ runnable: true });
+    await expect(claimAs(reservation, owner)).resolves.toMatchObject({ outcome: 'granted' });
 
     const claimed = await attemptRow(reservation.attemptId);
 
@@ -452,13 +473,13 @@ describe.skipIf(!databaseEnabled)('the claim is atomic at the database', () => {
     });
 
     // A different execution: refused as a duplicate, whatever the status.
-    await expect(validateAs(reservation, `execution-late-${randomUUID()}`)).rejects.toMatchObject({
+    await expect(claimAs(reservation, `execution-late-${randomUUID()}`)).rejects.toMatchObject({
       type: 'EXECUTION_ALREADY_CLAIMED',
     });
 
     // The execution that held it: refused too. A finished attempt cannot be revived by
     // the retry branch, which is why that branch is limited to queued and running.
-    await expect(validateAs(reservation, owner)).rejects.toMatchObject({
+    await expect(claimAs(reservation, owner)).rejects.toMatchObject({
       type: 'EXECUTION_CLAIM_REFUSED',
     });
 
@@ -476,7 +497,7 @@ describe.skipIf(!databaseEnabled)('the claim is atomic at the database', () => {
       data: { status: 'failed', finishedAt: new Date() },
     });
 
-    await expect(validateAs(unclaimed, `execution-late-${randomUUID()}`)).rejects.toMatchObject({
+    await expect(claimAs(unclaimed, `execution-late-${randomUUID()}`)).rejects.toMatchObject({
       type: 'EXECUTION_CLAIM_REFUSED',
     });
 
@@ -487,11 +508,11 @@ describe.skipIf(!databaseEnabled)('the claim is atomic at the database', () => {
     const fixture = await tenant('claim-no-side-effects');
     const reservation = await reservedTask(fixture, 'no-side-effects');
 
-    await expect(validateAs(reservation, `execution-first-${randomUUID()}`)).resolves.toMatchObject(
-      { runnable: true },
-    );
+    await expect(
+      claimAs(reservation, `execution-first-${randomUUID()}`),
+    ).resolves.toMatchObject({ outcome: 'granted' });
 
-    await expect(validateAs(reservation, `execution-second-${randomUUID()}`)).rejects.toMatchObject({
+    await expect(claimAs(reservation, `execution-second-${randomUUID()}`)).rejects.toMatchObject({
       type: 'EXECUTION_ALREADY_CLAIMED',
     });
 
@@ -506,8 +527,16 @@ describe.skipIf(!databaseEnabled)('the claim is atomic at the database', () => {
     // Wrong attempt: the run names an attempt the grant does not name.
     const substituted = await reservedTask(fixture, 'wrong-attempt', { riskClass: 'HIGH' });
 
+    // A direct call to validation is the right shape here: every case below is a refusal
+    // that happens **before** the claim, so no execution identity is needed — and the fact
+    // that the approval gate runs first is part of what the test asserts.
     await expect(
-      validateAs(substituted, `execution-${randomUUID()}`, { attemptId: randomUUID() }),
+      validateTaskActivity({
+        taskId: substituted.taskId,
+        orgId: substituted.orgId,
+        attemptId: randomUUID(),
+        correlationId: randomUUID(),
+      }),
     ).rejects.toMatchObject({ type: 'APPROVAL_ATTEMPT_MISMATCH' });
     expect((await attemptRow(substituted.attemptId)).claimedByWorkflowRunId).toBeNull();
 
@@ -532,9 +561,14 @@ describe.skipIf(!databaseEnabled)('the claim is atomic at the database', () => {
       data: { consumedByAttemptId: otherAttempt.id },
     });
 
-    await expect(validateAs(rebound, `execution-${randomUUID()}`)).rejects.toMatchObject({
-      type: 'APPROVAL_ATTEMPT_MISMATCH',
-    });
+    await expect(
+      validateTaskActivity({
+        taskId: rebound.taskId,
+        orgId: rebound.orgId,
+        attemptId: rebound.attemptId,
+        correlationId: randomUUID(),
+      }),
+    ).rejects.toMatchObject({ type: 'APPROVAL_ATTEMPT_MISMATCH' });
 
     // Wrong content hash: the task moved after the grant was issued.
     const stale = await reservedTask(fixture, 'wrong-hash', { riskClass: 'HIGH' });
@@ -544,9 +578,14 @@ describe.skipIf(!databaseEnabled)('the claim is atomic at the database', () => {
       data: { goal: 'Something else entirely.' },
     });
 
-    await expect(validateAs(stale, `execution-${randomUUID()}`)).rejects.toMatchObject({
-      type: 'APPROVAL_STALE',
-    });
+    await expect(
+      validateTaskActivity({
+        taskId: stale.taskId,
+        orgId: stale.orgId,
+        attemptId: stale.attemptId,
+        correlationId: randomUUID(),
+      }),
+    ).rejects.toMatchObject({ type: 'APPROVAL_STALE' });
 
     for (const reservation of [substituted, rebound, stale]) {
       expect((await attemptRow(reservation.attemptId)).claimedByWorkflowRunId).toBeNull();
@@ -564,9 +603,10 @@ describe.skipIf(!databaseEnabled)('the claim is atomic at the database', () => {
     // The task is local, the attempt is not: the claim's predicate carries `orgId` and
     // `taskId`, so the read-back is null and the write matches nothing.
     await expect(
-      validateTaskActivity({
-        taskId: local.taskId,
+      claimExecution({
         orgId: attacking.orgId,
+        taskId: local.taskId,
+        projectId: attacking.projectId,
         attemptId: foreign.attemptId,
         workflowRunId: `execution-cross-tenant-${randomUUID()}`,
         correlationId: randomUUID(),
@@ -574,7 +614,7 @@ describe.skipIf(!databaseEnabled)('the claim is atomic at the database', () => {
     ).rejects.toMatchObject({ type: 'EXECUTION_CLAIM_REFUSED', nonRetryable: true });
 
     // An attempt of another task in the same tenant is the same answer.
-    await expect(validateAs(foreign, `execution-${randomUUID()}`, { attemptId: local.attemptId }))
+    await expect(claimAs(foreign, `execution-${randomUUID()}`, { attemptId: local.attemptId }))
       .rejects.toMatchObject({ type: 'EXECUTION_CLAIM_REFUSED' });
 
     expect((await attemptRow(foreign.attemptId)).claimedByWorkflowRunId).toBeNull();
@@ -672,7 +712,7 @@ describe.skipIf(!enabled)('a direct Temporal start cannot join a claimed executi
     const reservation = await reservedTask(fixture, 'direct-start', { riskClass: 'HIGH' });
     const owner = `execution-api-${randomUUID()}`;
 
-    await expect(validateAs(reservation, owner)).resolves.toMatchObject({ runnable: true });
+    await expect(claimAs(reservation, owner)).resolves.toMatchObject({ outcome: 'granted' });
 
     const claimedBefore = await attemptRow(reservation.attemptId);
 

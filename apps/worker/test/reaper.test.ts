@@ -2,11 +2,13 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from '
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { WorkflowNotFoundError } from '@temporalio/client';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { PrismaClient } from '@intelligenz/database';
 import { workspacePath, type WorkspaceState } from '@intelligenz/workspace-manager';
 
 import {
+  classifyProbeError,
   runReaperPass,
   type ReaperDeps,
   type ReaperResult,
@@ -230,6 +232,60 @@ afterAll(async () => {
       rm(path, { recursive: true, force: true }),
     ),
   );
+});
+
+
+/**
+ * `classifyProbeError` — the classifier the release path rests on. Re-review N2 / N6.
+ *
+ * The five F4 tests inject a fake probe, so the classification the shipped probe performs
+ * had **no** coverage — and that is exactly how the failure survived: `describe()` does not
+ * surface gRPC `NOT_FOUND`, it converts it into `WorkflowNotFoundError`, which carries
+ * `workflowId`/`runId` and neither `code` nor a coded `cause`. The old classifier looked
+ * only at `code`, so a genuinely missing execution was reported `unknown` and the `absent`
+ * arm was dead. Release therefore only ever worked for terminal runs; a run deleted or aged
+ * out of retention stranded its claim for ever.
+ *
+ * These are pure: no server, no database. The real error class from the SDK is used, not a
+ * shape-alike, because the shape-alike is what would have hidden the defect.
+ */
+describe('classifyProbeError (pure)', () => {
+  it('reads a deleted or aged-out execution as absent — the SDK error, not a code', () => {
+    // The exact constructor `WorkflowClient.rethrowGrpcError` uses for a NOT_FOUND:
+    // `new WorkflowNotFoundError(err.details ?? 'Workflow not found', workflowId, runId)`.
+    const error = new WorkflowNotFoundError('workflow not found', 'task-1', 'run-1');
+
+    expect(Object.prototype.hasOwnProperty.call(error, 'code')).toBe(false);
+    expect(error.cause).toBeUndefined();
+    expect(classifyProbeError(error)).toBe('absent');
+  });
+
+  it('reads a bare gRPC NOT_FOUND as absent as well, for a caller that keeps the status', () => {
+    expect(classifyProbeError(Object.assign(new Error('not found'), { code: 5 }))).toBe('absent');
+    // Wrapped, which is how a `ServiceError` carries it.
+    expect(classifyProbeError(new Error('rpc failed', { cause: { code: 5 } }))).toBe('absent');
+  });
+
+  it('keeps every other failure at unknown, so the pass skips instead of guessing', () => {
+    expect(classifyProbeError(new Error('connection refused'))).toBe('unknown');
+    expect(classifyProbeError(Object.assign(new Error('deadline'), { code: 4 }))).toBe('unknown');
+    // gRPC 3 is INVALID_ARGUMENT — a malformed run id, which is a wrong claim, not an
+    // absent execution. This is the case the re-review observed and it must stay unknown.
+    expect(classifyProbeError(Object.assign(new Error('Invalid RunId.'), { code: 3 }))).toBe(
+      'unknown',
+    );
+    expect(classifyProbeError(undefined)).toBe('unknown');
+    expect(classifyProbeError('not an error')).toBe('unknown');
+  });
+
+  it('recognises the marker the SDK writes, so a second copy of the library still works', () => {
+    // `SymbolBasedInstanceOfError('WorkflowNotFoundError')` writes this symbol on the
+    // prototype. A copy of the SDK in another realm shares the symbol but not the class.
+    const marker = Symbol.for('__temporal_isWorkflowNotFoundError');
+    const foreign = Object.assign(new Error('workflow not found'), { [marker]: true });
+
+    expect(classifyProbeError(foreign)).toBe('absent');
+  });
 });
 
 describe.skipIf(!enabled)('reaper', () => {

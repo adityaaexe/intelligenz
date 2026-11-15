@@ -7,12 +7,16 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { ExecutionResult } from '@intelligenz/agent-runtime';
 import type { PrismaClient } from '@intelligenz/database';
 
-import { executeAgentActivity } from '../src/activities/execute-agent';
-import { persistResultActivity } from '../src/activities/persist-result';
+import { persistResult } from '../src/activities/persist-result';
 import { resolveWorkflowRun, startAttempt } from '../src/activities/attempts';
 import { executionWorkspaceIdFor } from '../src/activities/ids';
 import { resetWorkerConfig } from '../src/config';
 import { resetAgentRuntime } from '../src/runtime';
+import {
+  createExecutionHarness,
+  temporalReachable,
+  type ExecutionHarness,
+} from './helpers/execution-harness';
 import {
   createTask,
   createTenant,
@@ -21,6 +25,7 @@ import {
   testDatabaseUrl,
   useTestDatabase,
   type TenantFixture,
+  type TaskFixture,
 } from './helpers/database';
 
 /**
@@ -37,12 +42,24 @@ import {
  *
  * The suite never truncates: it owns a randomly-suffixed tenant per test, because the
  * root test run executes other packages' integration files against the same database.
+ *
+ * ## AG-603: persistence is exercised as persistence
+ *
+ * `persistResultActivity` now requires the execution claim (re-review N4) and reads its
+ * identity from the activity context, so it can no longer be called as a plain function.
+ * These tests are about **what the write produces**, not about who may make it, so they
+ * call `persistResult` — the body the activity wraps — and the authority check is proved
+ * in `execution-boundary.test.ts` and `execution-identity.test.ts` against real dispatch.
+ * The runs that produce the results still execute inside a real workflow, because a
+ * result has to come from somewhere a claim authorises.
  */
 
 const databaseUrl = testDatabaseUrl();
 const enabled = databaseUrl !== undefined;
+const temporalEnabled = enabled && (await temporalReachable());
 
 let client: PrismaClient;
+let harness: ExecutionHarness | undefined;
 const tenants: TenantFixture[] = [];
 let artifactRoot: string;
 
@@ -67,16 +84,73 @@ beforeAll(async () => {
 
   resetWorkerConfig();
   resetAgentRuntime();
+
+  // A real worker, because the runs below have to be authorised by an identity the server
+  // mints — there is no longer a way to hand the activity one.
+  if (temporalEnabled) harness = await createExecutionHarness();
 });
 
 afterAll(async () => {
   if (!enabled) return;
 
+  await harness?.close();
   for (const fixture of tenants) await dropTenant(client, fixture);
   await client.$disconnect();
 });
 
-describe.skipIf(!enabled)('execution attempts', () => {
+function requireHarness(): ExecutionHarness {
+  if (harness === undefined)
+    throw new Error('no Temporal server: this test needs a real execution');
+  return harness;
+}
+
+/**
+ * One authorised run: a real execution, a claim written under its run id, and the executor
+ * called from inside it. The result is the value the persistence tests need; the authority
+ * is incidental to them and proved in `execution-boundary.test.ts`.
+ */
+async function authorisedRun(
+  fixture: TenantFixture,
+  task: TaskFixture,
+  correlationId: string,
+): Promise<{ readonly result: ExecutionResult; readonly runId: string }> {
+  const session = await requireHarness().session();
+
+  try {
+    const claim = await reserveAndClaim(client, fixture, task, session.runId);
+
+    const result = await session.call<ExecutionResult>({
+      op: 'execute',
+      input: executorInput(fixture, task, claim.attemptId, correlationId),
+    });
+
+    return { result, runId: session.runId };
+  } finally {
+    await session.stop();
+  }
+}
+
+/** The executor's input. There is no identity field any more — the activity reads it. */
+function executorInput(
+  fixture: TenantFixture,
+  task: TaskFixture,
+  attemptId: string,
+  correlationId: string,
+) {
+  return {
+    taskId: task.taskId,
+    orgId: fixture.orgId,
+    correlationId,
+    workflowRunId: task.workflowRunId,
+    attemptId,
+  };
+}
+
+/**
+ * A run needs an authorised execution, and an identity the server mints. Gated on a
+ * reachable server; skipped visibly without one.
+ */
+describe.skipIf(!temporalEnabled)('execution runs', () => {
   it('numbers attempts per workflow run and keeps the pair unique', async () => {
     const fixture = await tenant('attempts');
     const task = await createTask(client, fixture, {
@@ -84,61 +158,62 @@ describe.skipIf(!enabled)('execution attempts', () => {
       goal: 'Fix the failing test and prove it passes. [simulate:ok]',
     });
 
-    // The reservation and the claim, then the activity — the order production forces.
-    const claim = await reserveAndClaim(client, fixture, task);
+    // The reservation and the claim, then the activity — the order production forces. The
+    // claim is written under the session's run id, so the execution that calls the executor
+    // is the execution that holds it.
+    const live = await requireHarness().session();
 
-    const first = await executeAgentActivity({
-      taskId: task.taskId,
-      orgId: fixture.orgId,
-      correlationId: 'attempt-test-1',
-      workflowRunId: task.workflowRunId,
-      attemptId: claim.attemptId,
-      executionRunId: claim.executionRunId,
-    });
+    try {
+      const claim = await reserveAndClaim(client, fixture, task, live.runId);
 
-    expect(first.simulated).toBe(true);
-    expect(first.runtimeId).toBe('local-simulated');
+      const first = await live.call<ExecutionResult>({
+        op: 'execute',
+        input: executorInput(fixture, task, claim.attemptId, 'attempt-test-1'),
+      });
 
-    const afterFirst = await client.executionAttempt.findMany({
-      where: { orgId: fixture.orgId },
-      orderBy: { attemptNumber: 'asc' },
-    });
+      expect(first.simulated).toBe(true);
+      expect(first.runtimeId).toBe('local-simulated');
 
-    expect(afterFirst.map((row) => row.attemptNumber)).toEqual([1]);
-    expect(afterFirst[0]?.status).toBe('succeeded');
-    expect(afterFirst[0]?.simulated).toBe(true);
-    expect(afterFirst[0]?.startedAt).not.toBeNull();
-    expect(afterFirst[0]?.finishedAt).not.toBeNull();
+      const afterFirst = await client.executionAttempt.findMany({
+        where: { orgId: fixture.orgId },
+        orderBy: { attemptNumber: 'asc' },
+      });
 
-    // A Temporal retry re-runs the activity. That must be a second attempt, not a
-    // second run hidden behind the first one.
-    const second = await executeAgentActivity({
-      taskId: task.taskId,
-      orgId: fixture.orgId,
-      correlationId: 'attempt-test-2',
-      workflowRunId: task.workflowRunId,
-      // The same execution: a Temporal retry keeps its run id, and the claim it holds.
-      attemptId: claim.attemptId,
-      executionRunId: claim.executionRunId,
-    });
+      expect(afterFirst.map((row) => row.attemptNumber)).toEqual([1]);
+      expect(afterFirst[0]?.status).toBe('succeeded');
+      expect(afterFirst[0]?.simulated).toBe(true);
+      expect(afterFirst[0]?.startedAt).not.toBeNull();
+      expect(afterFirst[0]?.finishedAt).not.toBeNull();
 
-    expect(second.status).toBe('succeeded');
+      // A Temporal retry re-runs the activity. That must be a second attempt, not a
+      // second run hidden behind the first one.
+      const second = await live.call<ExecutionResult>({
+        op: 'execute',
+        input: executorInput(fixture, task, claim.attemptId, 'attempt-test-2'),
+      });
 
-    const afterSecond = await client.executionAttempt.findMany({
-      where: { orgId: fixture.orgId },
-      orderBy: { attemptNumber: 'asc' },
-    });
+      expect(second.status).toBe('succeeded');
 
-    expect(afterSecond.map((row) => row.attemptNumber)).toEqual([1, 2]);
-    expect(afterSecond.every((row) => row.simulated)).toBe(true);
-    // The retry's second attempt carries the same execution's claim: no attempt that ran
-    // is left with a NULL holder.
-    expect(afterSecond.map((row) => row.claimedByWorkflowRunId)).toEqual([
-      claim.executionRunId,
-      claim.executionRunId,
-    ]);
-  }, 30_000);
+      const afterSecond = await client.executionAttempt.findMany({
+        where: { orgId: fixture.orgId },
+        orderBy: { attemptNumber: 'asc' },
+      });
 
+      expect(afterSecond.map((row) => row.attemptNumber)).toEqual([1, 2]);
+      expect(afterSecond.every((row) => row.simulated)).toBe(true);
+      // The retry's second attempt carries the same execution's claim: no attempt that ran
+      // is left with a NULL holder.
+      expect(afterSecond.map((row) => row.claimedByWorkflowRunId)).toEqual([
+        live.runId,
+        live.runId,
+      ]);
+    } finally {
+      await live.stop();
+    }
+  }, 120_000);
+});
+
+describe.skipIf(!enabled)('execution attempts', () => {
   it('never reuses an attempt number even when a caller asks twice', async () => {
     const fixture = await tenant('attempt-direct');
     const task = await createTask(client, fixture, { title: 'Direct attempt allocation' });
@@ -172,7 +247,15 @@ describe.skipIf(!enabled)('execution attempts', () => {
   });
 });
 
-describe.skipIf(!enabled)('result persistence', () => {
+/**
+ * The persistence path, which needs a real run to persist.
+ *
+ * `authorisedRun` opens a real workflow, because a `ExecutionResult` has to come from an
+ * execution the platform authorised — there is no longer a way to hand the executor an
+ * identity. Gated on a reachable server and **skipped visibly** without one, rather than
+ * given an identity it should not have.
+ */
+describe.skipIf(!temporalEnabled)('result persistence', () => {
   it('persists simulated from the adapter report and links attempt, artifact and evidence', async () => {
     const fixture = await tenant('persist-simulated');
     const task = await createTask(client, fixture, {
@@ -180,21 +263,12 @@ describe.skipIf(!enabled)('result persistence', () => {
       goal: 'Write a report. [simulate:ok]',
     });
 
-    const claim = await reserveAndClaim(client, fixture, task);
-
-    const result = await executeAgentActivity({
-      taskId: task.taskId,
-      orgId: fixture.orgId,
-      correlationId: 'persist-1',
-      workflowRunId: task.workflowRunId,
-      attemptId: claim.attemptId,
-      executionRunId: claim.executionRunId,
-    });
+    const { result } = await authorisedRun(fixture, task, 'persist-1');
 
     expect(result.simulated).toBe(true);
     expect(result.artifacts.length).toBeGreaterThan(0);
 
-    const persisted = await persistResultActivity({
+    const persisted = await persistResult({
       taskId: task.taskId,
       orgId: fixture.orgId,
       result,
@@ -228,19 +302,10 @@ describe.skipIf(!enabled)('result persistence', () => {
     const fixture = await tenant('persist-lie');
     const task = await createTask(client, fixture, { title: 'Refuse a simulated lie' });
 
-    const claim = await reserveAndClaim(client, fixture, task);
-
-    const result = await executeAgentActivity({
-      taskId: task.taskId,
-      orgId: fixture.orgId,
-      correlationId: 'persist-lie',
-      workflowRunId: task.workflowRunId,
-      attemptId: claim.attemptId,
-      executionRunId: claim.executionRunId,
-    });
+    const { result } = await authorisedRun(fixture, task, 'persist-lie');
 
     await expect(
-      persistResultActivity({
+      persistResult({
         taskId: task.taskId,
         orgId: fixture.orgId,
         result: { ...result, simulated: false },
@@ -307,7 +372,7 @@ describe.skipIf(!enabled)('result persistence', () => {
       ],
     };
 
-    const persisted = await persistResultActivity({
+    const persisted = await persistResult({
       taskId: task.taskId,
       orgId: fixture.orgId,
       result,
@@ -371,7 +436,7 @@ describe.skipIf(!enabled)('result persistence', () => {
       })),
     };
 
-    const persisted = await persistResultActivity({
+    const persisted = await persistResult({
       taskId: task.taskId,
       orgId: fixture.orgId,
       result,

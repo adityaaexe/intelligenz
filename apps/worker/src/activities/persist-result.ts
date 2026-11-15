@@ -1,16 +1,10 @@
 import { Prisma } from '@intelligenz/database';
 import { LOCAL_SIMULATED_ID, type ExecutionResult } from '@intelligenz/agent-runtime';
 
-import type {
-  PersistResultActivityInput,
-  PersistResultActivityResult,
-} from '../shared/contracts';
+import type { PersistResultActivityInput, PersistResultActivityResult } from '../shared/contracts';
 import { RUN_STATUS } from './attempts';
-import {
-  agentRunIdFor,
-  artifactIdFor,
-  evidenceIdFor,
-} from './ids';
+import { executionIdentity, requireExecutionClaim } from './claim';
+import { agentRunIdFor, artifactIdFor, evidenceIdFor } from './ids';
 import { db, nonRetryable } from './support';
 
 /**
@@ -46,7 +40,35 @@ const SIMULATED_MODEL = 'simulated';
 /** Phase 3 cap. A run that calls more tools than this has its trace truncated, not lost. */
 const TOOL_INVOCATION_LIMIT = 200;
 
+/**
+ * The activity: **authority first, then the write** — Phase 6 re-review N4.
+ *
+ * `persistResultActivity` is a registered activity, so it is dispatched *by name* and any
+ * workflow on this worker's task queue can call it without ever calling validation. It
+ * used to read no claim: a Temporal caller could write an `AgentRun`, the attempt link and
+ * the terminal `WorkflowRun` state for a task that never executed, which is the same
+ * "dispatched by name" class as F1. It now requires the claim first, so a caller that holds
+ * none gets a refusal and zero writes.
+ *
+ * The split is deliberate: `persistResult` is the ~350-line persistence body and is tested
+ * directly as persistence; this wrapper is one guard and is tested as authority. Neither
+ * test has to pretend to be the other.
+ */
 export async function persistResultActivity(
+  input: PersistResultActivityInput,
+): Promise<PersistResultActivityResult> {
+  await requireExecutionClaim({
+    orgId: input.orgId,
+    taskId: input.taskId,
+    attemptId: input.attemptId,
+    executionRunId: executionIdentity(),
+  });
+
+  return persistResult(input);
+}
+
+/** The persistence itself, with no authority check. Exported for its own tests. */
+export async function persistResult(
   input: PersistResultActivityInput,
 ): Promise<PersistResultActivityResult> {
   const { taskId, orgId, result } = input;
@@ -152,7 +174,8 @@ export async function persistResultActivity(
         // The adapter's own report, not a default (ADR-006, Phase 3 §7).
         simulated: result.simulated,
         runtimeVersion: result.runtimeVersion ?? null,
-        providerMeta: providerMeta === undefined ? Prisma.JsonNull : (providerMeta as Prisma.InputJsonValue),
+        providerMeta:
+          providerMeta === undefined ? Prisma.JsonNull : (providerMeta as Prisma.InputJsonValue),
       },
       update: {
         status,
@@ -165,7 +188,8 @@ export async function persistResultActivity(
         workspaceId,
         simulated: result.simulated,
         runtimeVersion: result.runtimeVersion ?? null,
-        providerMeta: providerMeta === undefined ? Prisma.JsonNull : (providerMeta as Prisma.InputJsonValue),
+        providerMeta:
+          providerMeta === undefined ? Prisma.JsonNull : (providerMeta as Prisma.InputJsonValue),
       },
       select: { id: true },
     });

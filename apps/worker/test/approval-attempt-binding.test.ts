@@ -18,6 +18,10 @@ import { resetWorkerConfig } from '../src/config';
 import { resetAgentRuntime } from '../src/runtime';
 import type { RunTaskWorkflowResult } from '../src/shared/contracts';
 import {
+  createExecutionHarness,
+  type ExecutionHarness,
+} from './helpers/execution-harness';
+import {
   createTenant,
   dropTenant,
   testDatabaseUrl,
@@ -73,6 +77,7 @@ const temporalEnabled = databaseEnabled && temporalReachable;
 
 let tenant: TenantFixture | undefined;
 let client: PrismaClient | undefined;
+let harness: ExecutionHarness | undefined;
 
 const GOAL = 'Fix the failing test in src/sum.js and prove it passes.';
 
@@ -89,9 +94,13 @@ beforeAll(async () => {
   resetAgentRuntime();
 
   tenant = await createTenant(client, 'attempt-binding');
+
+  if (temporalReachable) harness = await createExecutionHarness();
 });
 
 afterAll(async () => {
+  await harness?.close();
+
   if (client !== undefined && tenant !== undefined) {
     await dropTenant(client, tenant);
     await client.$disconnect();
@@ -188,6 +197,17 @@ async function reservedTask(label: string): Promise<Reservation> {
   return { taskId: task.id, workflowRunId: run.id, attemptId: attempt.id };
 }
 
+/**
+ * A direct call to validation.
+ *
+ * Since AG-603 this shape reaches a **refusal that happens before the claim** only: the
+ * activity takes its execution identity from its own context and there is no input field
+ * that stands in for it any more. Every refusal below is decided by the approval gate,
+ * which runs first — that ordering is part of what these tests assert.
+ *
+ * The accepting case needs a real execution and is gated on a reachable server at the end
+ * of the suite.
+ */
 function validate(taskId: string, attemptId?: string): Promise<unknown> {
   const { tenant: owned } = fixture();
 
@@ -195,10 +215,6 @@ function validate(taskId: string, attemptId?: string): Promise<unknown> {
     taskId,
     orgId: owned.orgId,
     ...(attemptId === undefined ? {} : { attemptId }),
-    // Phase 6: no Temporal execution context in a direct call, so the execution identity
-    // is supplied explicitly. Derived from the attempt: these tests are about one
-    // execution of one reservation.
-    ...(attemptId === undefined ? {} : { workflowRunId: `test-execution-${attemptId}` }),
   });
 }
 
@@ -287,13 +303,6 @@ describe('decideAttemptBinding (pure)', () => {
 });
 
 describe.skipIf(!enabled)('validateTaskActivity attempt binding', () => {
-  it('accepts the reservation holder and lets it run', async () => {
-    const reservation = await reservedTask('holder');
-
-    await expect(validate(reservation.taskId, reservation.attemptId)).resolves.toMatchObject({
-      runnable: true,
-    });
-  });
 
   it('refuses attempt substitution with APPROVAL_ATTEMPT_MISMATCH and never runs the agent', async () => {
     const reservation = await reservedTask('substituted');
@@ -636,3 +645,48 @@ function probeTcp(address: string): Promise<{ ok: boolean; reason: string }> {
     );
   });
 }
+
+/**
+ * The accepting case, and only that.
+ *
+ * It needs an execution identity the server mints, so it is gated on a reachable server
+ * rather than being handed one: a supplied identity is the AG-603 defect. Skipping here is
+ * visible in the run summary; the refusals above are not gated on Temporal at all, because
+ * every one of them is decided before the claim.
+ */
+describe.skipIf(!temporalEnabled)('validateTaskActivity attempt binding — the accepting case', () => {
+  it('accepts the reservation holder, and the claim names that execution', async () => {
+    if (harness === undefined) throw new Error('suite not initialised');
+
+    const { tenant: owned } = fixture();
+    const reservation = await reservedTask('holder');
+    const session = await harness.session();
+
+    try {
+      const runnable = await session.call({
+        op: 'validate',
+        input: {
+          taskId: reservation.taskId,
+          orgId: owned.orgId,
+          attemptId: reservation.attemptId,
+          correlationId: randomUUID(),
+        },
+      });
+
+      expect(runnable).toMatchObject({ runnable: true });
+
+      // The claim names this execution — the run id the server minted for it. Nothing in
+      // the input could have named a different one, which is the property AG-603 restored.
+      const { prisma } = fixture();
+
+      const claimed = await prisma.executionAttempt.findUniqueOrThrow({
+        where: { id: reservation.attemptId },
+        select: { claimedByWorkflowRunId: true },
+      });
+
+      expect(claimed.claimedByWorkflowRunId).toBe(session.runId);
+    } finally {
+      await session.stop();
+    }
+  }, 60_000);
+});

@@ -57,17 +57,6 @@ export interface ValidateTaskActivityInput {
    * server-side id either way.
    */
   readonly correlationId?: string;
-  /**
-   * Phase 6. Temporal's run id — **only consulted when the activity has no execution
-   * context**, which is the direct-invocation case. Inside a worker the activity reads
-   * `Context.current().info.workflowExecution.runId`, because an input field is a
-   * parameter and a parameter can be forged by anything that can start a workflow,
-   * while the execution context is set by the server that dispatched the attempt.
-   *
-   * This is the same id `RecordStartActivityInput.workflowRunId` carries, and it is *not*
-   * `WorkflowRun.id`.
-   */
-  readonly workflowRunId?: string;
 }
 
 /** Everything the workflow needs to build an event envelope without touching the DB. */
@@ -123,14 +112,15 @@ export interface ExecuteAgentActivityInput {
   readonly orgId: string;
   readonly correlationId: string;
   /**
-   * Phase 3 addition, optional so a direct caller (a test, a replay script) keeps
-   * working: the database `WorkflowRun.id` this execution belongs to. Without it the
-   * activity falls back to the newest run for the task, which is the same row under
-   * the one-live-workflow-per-task rule. The workflow always passes it.
+   * Phase 3 addition, optional so a replay of an older execution keeps working: the
+   * database `WorkflowRun.id` this execution belongs to. Without it the activity falls
+   * back to the newest run for the task, which is the same row under the
+   * one-live-workflow-per-task rule. The workflow always passes it.
    *
-   * **Not** the claim identity. That is `executionRunId` below; the two are different id
-   * spaces and conflating them would let a database row id stand in for an orchestrator
-   * run id.
+   * **Not** the claim identity. That one is not an input at all: it is the Temporal run id
+   * the activity reads from its own execution context (`executionIdentity`), and the two
+   * are different id spaces — conflating them would let a database row id stand in for an
+   * orchestrator run id.
    */
   readonly workflowRunId?: string;
   /**
@@ -144,18 +134,6 @@ export interface ExecuteAgentActivityInput {
    * refused as a claim failure, not fail to deserialize.
    */
   readonly attemptId?: string;
-  /**
-   * Phase 6. Temporal's run id, consulted **only** when the activity has no execution
-   * context — a direct invocation from a test or an operational script. Inside a worker
-   * the id is read from `Context.current().info.workflowExecution.runId`, because an
-   * input field is a parameter, and a parameter can be forged by anything that can start
-   * a workflow.
-   *
-   * A direct call therefore proves only that the caller knows a run id; it cannot
-   * impersonate a different execution, because the claim it must satisfy was written
-   * under that same id.
-   */
-  readonly executionRunId?: string;
 }
 
 /** The normalised result, exactly as the port defines it. */
@@ -167,6 +145,17 @@ export interface PersistResultActivityInput {
   readonly taskId: string;
   readonly orgId: string;
   readonly result: ExecutionResult;
+  /**
+   * Phase 6 re-review N4. The attempt this execution holds. `persistResultActivity` is
+   * only ever reached **after** a run, so a claim necessarily exists and the activity
+   * requires it (`requireExecutionClaim`) before the first write: a `Temporal` caller that
+   * dispatches the activity by name can no longer write an `AgentRun` and terminal state
+   * for a task that never executed.
+   *
+   * Optional in the type, refused at runtime when absent, for the same replay reason as
+   * `RunTaskWorkflowInput.attemptId`.
+   */
+  readonly attemptId?: string;
 }
 
 export interface PersistResultActivityResult {
@@ -201,6 +190,21 @@ export interface CompleteTaskActivityInput {
    * needing a fabricated `AgentRun`.
    */
   readonly error?: { readonly code: string; readonly message: string };
+  /**
+   * Phase 6 re-review N4. The attempt this execution holds, passed whenever one was
+   * claimed. Present ⇒ `requireExecutionClaim` decides, and only the holder may write.
+   * Absent ⇒ the pre-dispatch arm of `requireCompletionAuthority` decides (this execution
+   * must be `task-<taskId>` and nothing else may hold the task), which is the state a
+   * refused-before-dispatch run is legitimately in. See `activities/claim.ts`.
+   */
+  readonly attemptId?: string;
+  /**
+   * Phase 6. The database `WorkflowRun.id` this execution believes it owns. When present
+   * it is cross-checked against the attempt's foreign key by `requireExecutionClaim`; the
+   * two ids live in different spaces and conflating them would let a database row id
+   * stand in for an orchestrator run id.
+   */
+  readonly workflowRunId?: string;
 }
 
 export interface CompleteTaskActivityResult {
@@ -210,4 +214,15 @@ export interface CompleteTaskActivityResult {
   readonly status: TaskStatus;
   /** Needed by the cancellation path, which must emit an event after the write. */
   readonly projectId: string;
+  /**
+   * Phase 6 re-review N4: which control authorised this terminal write.
+   *
+   * `execution-claim` — the named attempt was claimed by this execution.
+   * `pre-dispatch` — nothing was authorised yet (validation refused before claiming), and
+   * this execution is the task's own (`task-<taskId>`) with nothing else holding it.
+   *
+   * Reported rather than inferred so the difference is visible at the call site instead of
+   * having to be reconstructed from whether an attempt happened to carry a claim.
+   */
+  readonly authority: 'execution-claim' | 'pre-dispatch';
 }

@@ -99,12 +99,10 @@ export async function runTaskWorkflow(input: RunTaskWorkflowInput): Promise<RunT
       // make every approval-gated run unrefusable-by-omission.
       ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
       // Phase 6: the request the run belongs to, for the claim's audit rows. The claim's
-      // *identity* is not taken from here — the activity reads the workflow run id from
-      // its own execution context, which a caller cannot forge.
+      // *identity* is not an input: the activity reads the workflow run id from its own
+      // execution context, and (AG-603) there is no field that stands in for it. The
+      // `workflowRunId` this used to forward was that stand-in and is gone.
       correlationId,
-      // Consulted only if the activity has no execution context (a direct invocation);
-      // inside Temporal the context supplies the same value from the server side.
-      workflowRunId: runId,
     });
 
     if (!validation.runnable) {
@@ -172,7 +170,15 @@ export async function runTaskWorkflow(input: RunTaskWorkflowInput): Promise<RunT
       ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
     });
 
-    await taskActivities.persistResultActivity({ taskId, orgId, result });
+    await taskActivities.persistResultActivity({
+      taskId,
+      orgId,
+      result,
+      // Phase 6, N4: persistence requires the claim. `executeAgentActivity` above already
+      // proved this execution holds it; this activity proves it again for itself, because
+      // it is dispatched by name and the executor's check does not travel with the call.
+      ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
+    });
 
     const finalStatus = outcomeOf(result.status);
     const eventType = terminalEventType(finalStatus);
@@ -206,12 +212,19 @@ export async function runTaskWorkflow(input: RunTaskWorkflowInput): Promise<RunT
       }),
     });
 
-    await taskActivities.completeTaskActivity({ taskId, orgId, status: finalStatus });
+    await taskActivities.completeTaskActivity({
+      taskId,
+      orgId,
+      status: finalStatus,
+      // The execution that ran is the only one that may write the terminal state.
+      ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
+      workflowRunId: started.workflowRunId,
+    });
 
     return { status: finalStatus, summary: result.summary };
   } catch (error) {
     if (isCancellation(error)) {
-      await recordCancellation(taskId, orgId, correlationId, projectId);
+      await recordCancellation(taskId, orgId, correlationId, projectId, input.attemptId);
 
       // Contract §16: rethrow, so Temporal marks the execution cancelled instead of
       // reporting a successful workflow that happened to stop early.
@@ -246,12 +259,28 @@ async function failBeforeExecution(
   const code =
     validation.reason === 'approval_required' ? 'APPROVAL_REQUIRED' : 'TASK_NOT_RUNNABLE';
 
-  await taskActivities.completeTaskActivity({
-    taskId: input.taskId,
-    orgId: input.orgId,
-    status: 'failed',
-    error: { code, message: validation.detail },
-  });
+  // A refused **completion** must not cost the refusal its record. Since N4 the terminal
+  // write is authority-checked, and this execution may legitimately fail that check — a
+  // direct start under a non-standard workflow id, or a task another execution is holding.
+  // The audit event is the durable record either way, so it is emitted independently of
+  // whether the status write landed.
+  await taskActivities
+    .completeTaskActivity({
+      taskId: input.taskId,
+      orgId: input.orgId,
+      status: 'failed',
+      error: { code, message: validation.detail },
+      // No claim was written — this refusal happens *before* the claim deliberately — so
+      // the activity takes its pre-dispatch arm. The attempt id is still forwarded so that
+      // a refusal cannot be recorded for a task another execution is holding.
+      ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
+    })
+    .catch((error: unknown) => {
+      log.warn('a refused run could not write the terminal state; the event below is the record', {
+        taskId: input.taskId,
+        code: describeFailure(error).code,
+      });
+    });
 
   if (validation.projectId !== undefined) {
     await taskActivities.emitEventActivity({
@@ -287,6 +316,7 @@ async function recordCancellation(
   orgId: string,
   correlationId: string,
   knownProjectId: string | undefined,
+  attemptId: string | undefined,
 ): Promise<void> {
   try {
     await CancellationScope.nonCancellable(async () => {
@@ -294,6 +324,7 @@ async function recordCancellation(
         taskId,
         orgId,
         status: 'cancelled',
+        ...(attemptId === undefined ? {} : { attemptId }),
       });
 
       // `changed === false` means the task was already terminal — almost always
@@ -349,12 +380,24 @@ async function recordUnexpectedFailure(
 
   try {
     await CancellationScope.nonCancellable(async () => {
-      await taskActivities.completeTaskActivity({
-        taskId: input.taskId,
-        orgId: input.orgId,
-        status: 'failed',
-        error: detail,
-      });
+      // Same reasoning as `failBeforeExecution`: the terminal write is authority-checked and
+      // may be refused (this is the duplicate-execution case, where the attempt belongs to
+      // somebody else). The refusal still belongs on the record, so the event does not
+      // depend on the write.
+      await taskActivities
+        .completeTaskActivity({
+          taskId: input.taskId,
+          orgId: input.orgId,
+          status: 'failed',
+          error: detail,
+          ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
+        })
+        .catch((error: unknown) => {
+          log.warn('could not write the terminal state; the event below is the record', {
+            taskId: input.taskId,
+            code: describeFailure(error).code,
+          });
+        });
 
       if (projectId === undefined) return;
 

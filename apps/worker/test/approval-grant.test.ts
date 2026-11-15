@@ -10,6 +10,10 @@ import { computeTaskContentHash } from '../src/approvals/task-binding';
 import { resetWorkerConfig } from '../src/config';
 import { resetAgentRuntime } from '../src/runtime';
 import {
+  createExecutionHarness,
+  temporalReachable,
+} from './helpers/execution-harness';
+import {
   createTenant,
   dropTenant,
   testDatabaseUrl,
@@ -35,6 +39,12 @@ import {
 
 const databaseUrl = testDatabaseUrl();
 const enabled = databaseUrl !== undefined;
+
+/**
+ * A real server, because the two tests at the end of this file need an execution identity
+ * the server mints. Without it they **skip** — visibly — rather than being handed one.
+ */
+const temporalEnabled = enabled && (await temporalReachable());
 
 let tenant: TenantFixture | undefined;
 let client: PrismaClient | undefined;
@@ -157,6 +167,19 @@ async function createApproval(input: {
   });
 }
 
+/**
+ * A direct call to validation.
+ *
+ * Since AG-603 this shape can only reach a **refusal that happens before the claim**: the
+ * activity reads its execution identity from its own activity context and there is no
+ * longer an input field that stands in for it, so a call with no context is refused
+ * `EXECUTION_IDENTITY_UNAVAILABLE` at the claim. Every assertion below is about an approval
+ * refusal, which is decided earlier — and that the approval gate runs before the claim is
+ * part of what these tests assert.
+ *
+ * The **accepting** side of the gate needs a real execution, and lives in its own
+ * Temporal-gated block at the end of this file.
+ */
 function validate(taskId: string, attemptId?: string): Promise<unknown> {
   if (tenant === undefined) throw new Error('suite not initialised');
 
@@ -164,11 +187,40 @@ function validate(taskId: string, attemptId?: string): Promise<unknown> {
     taskId,
     orgId: tenant.orgId,
     ...(attemptId === undefined ? {} : { attemptId }),
-    // Phase 6: a direct activity call has no Temporal execution context, so the claim
-    // needs an explicit identity. Derived from the attempt so both calls in a test are
-    // the same execution — which is what the idempotency test depends on.
-    ...(attemptId === undefined ? {} : { workflowRunId: `test-execution-${attemptId}` }),
   });
+}
+
+/**
+ * One real execution, validating under the run id the server mints for it.
+ *
+ * The harness is created per call rather than shared: this file's suite is a module-level
+ * singleton tenant, and a worker held open across it would be one more thing whose lifetime
+ * has to be right. Two calls, two workers, ~2s.
+ */
+async function inRealExecution(
+  taskId: string,
+  attemptId: string,
+): Promise<{ readonly runnable: unknown; readonly runId: string }> {
+  if (tenant === undefined) throw new Error('suite not initialised');
+
+  const harness = await createExecutionHarness();
+
+  try {
+    const session = await harness.session();
+
+    try {
+      const runnable = await session.call({
+        op: 'validate',
+        input: { taskId, orgId: tenant.orgId, attemptId, correlationId: randomUUID() },
+      });
+
+      return { runnable, runId: session.runId };
+    } finally {
+      await session.stop();
+    }
+  } finally {
+    await harness.close();
+  }
 }
 
 describe.skipIf(!enabled)('validateTaskActivity approval gate', () => {
@@ -231,34 +283,60 @@ describe.skipIf(!enabled)('validateTaskActivity approval gate', () => {
     await expect(validate(taskId)).rejects.toMatchObject({ type: 'APPROVAL_STALE' });
   });
 
-  it('accepts a consumed, unrevoked, unexpired grant bound to the current content', async () => {
-    const { taskId, hash, attemptId } = await createHighTask('live grant');
-    await createApproval({ taskId, hash, consumedByAttemptId: attemptId });
-
-    const result = await validate(taskId, attemptId);
-
-    expect(result).toMatchObject({ runnable: true });
-  });
-
-  it('does not consume the approval: the worker must not be a second writer', async () => {
-    if (client === undefined || tenant === undefined) throw new Error('suite not initialised');
-
-    const { taskId, hash, attemptId } = await createHighTask('no double spend');
-    const consumedAt = new Date(Date.now() - 5_000);
-
-    await createApproval({ taskId, hash, consumedAt, consumedByAttemptId: attemptId });
-
-    await expect(validate(taskId, attemptId)).resolves.toMatchObject({ runnable: true });
-
-    const row = await client.approvalRequest.findFirstOrThrow({
-      where: { orgId: tenant.orgId, taskId },
-    });
-
-    // Still the API's timestamp, not a new one: `validateTaskActivity` checked the
-    // reservation, it did not take one.
-    expect(row.consumedAt?.getTime()).toBe(consumedAt.getTime());
-  });
 });
+
+/**
+ * The accepting side of the gate.
+ *
+ * A grant that passes every condition is only *accepted* if the activity can then claim the
+ * attempt, and since AG-603 the claim needs an identity the server mints. That is why these
+ * two run in a real workflow and are gated on a server being reachable: a green tick
+ * without one would have to come from a supplied identity, which is the defect.
+ */
+describe.skipIf(!temporalEnabled)(
+  'validateTaskActivity approval gate — the accepting side',
+  () => {
+    it('accepts a consumed, unrevoked, unexpired grant bound to the current content', async () => {
+      const { taskId, hash, attemptId } = await createHighTask('live grant');
+      await createApproval({ taskId, hash, consumedByAttemptId: attemptId });
+
+      const { runnable, runId } = await inRealExecution(taskId, attemptId);
+
+      expect(runnable).toMatchObject({ runnable: true });
+
+      // And the claim it wrote names that execution, not the attempt it substituted for.
+      if (client === undefined) throw new Error('suite not initialised');
+
+      const claimed = await client.executionAttempt.findUniqueOrThrow({
+        where: { id: attemptId },
+        select: { claimedByWorkflowRunId: true },
+      });
+
+      expect(claimed.claimedByWorkflowRunId).toBe(runId);
+    }, 60_000);
+
+    it('does not consume the approval: the worker must not be a second writer', async () => {
+      if (client === undefined || tenant === undefined) throw new Error('suite not initialised');
+
+      const { taskId, hash, attemptId } = await createHighTask('no double spend');
+      const consumedAt = new Date(Date.now() - 5_000);
+
+      await createApproval({ taskId, hash, consumedAt, consumedByAttemptId: attemptId });
+
+      const { runnable } = await inRealExecution(taskId, attemptId);
+
+      expect(runnable).toMatchObject({ runnable: true });
+
+      const row = await client.approvalRequest.findFirstOrThrow({
+        where: { orgId: tenant.orgId, taskId },
+      });
+
+      // Still the API's timestamp, not a new one: `validateTaskActivity` checked the
+      // reservation, it did not take one.
+      expect(row.consumedAt?.getTime()).toBe(consumedAt.getTime());
+    }, 60_000);
+  },
+);
 
 /**
  * Ordering, without a database.

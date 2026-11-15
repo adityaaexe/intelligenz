@@ -1,9 +1,7 @@
 import type { RunStatus } from '@intelligenz/database';
 
-import type {
-  CompleteTaskActivityInput,
-  CompleteTaskActivityResult,
-} from '../shared/contracts';
+import type { CompleteTaskActivityInput, CompleteTaskActivityResult } from '../shared/contracts';
+import { executionIdentity, requireCompletionAuthority } from './claim';
 import { db, nonRetryable } from './support';
 
 /** A terminal task status implies a terminal run status; the vocabularies differ only in name. */
@@ -33,6 +31,33 @@ const TERMINAL_RUN_STATUS: Record<CompleteTaskActivityInput['status'], RunStatus
 export async function completeTaskActivity(
   input: CompleteTaskActivityInput,
 ): Promise<CompleteTaskActivityResult> {
+  // ── Authority before the first read, let alone the first write — N4 ─────────
+  //
+  // Same class as F1 and the same answer: this activity is dispatched by name, so any
+  // workflow on the task queue could reach it. Two arms, because this activity has two
+  // legitimate shapes: an execution that ran (a claim exists and must be this one) and an
+  // execution that was refused before anything was authorised (no claim exists by
+  // construction, so the workflow-id and held-by-nobody checks decide). See
+  // `requireCompletionAuthority`.
+  const authority = await requireCompletionAuthority({
+    orgId: input.orgId,
+    taskId: input.taskId,
+    attemptId: input.attemptId,
+    executionRunId: executionIdentity(),
+    workflowRunId: input.workflowRunId,
+  });
+
+  // The arm that authorised the write goes back to the caller: "this execution held the
+  // claim" and "this execution was refused before any claim existed" are different facts
+  // about the same terminal state, and the workflow's own record should not have to infer
+  // which one it was.
+  return { ...(await completeTask(input)), authority: authority.authority };
+}
+
+/** The terminal write itself, with no authority check — reachable only through the guard. */
+async function completeTask(
+  input: CompleteTaskActivityInput,
+): Promise<Omit<CompleteTaskActivityResult, 'authority'>> {
   const prisma = db();
 
   const before = await prisma.task.findFirst({

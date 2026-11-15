@@ -1,4 +1,4 @@
-import { Client, Connection } from '@temporalio/client';
+import { Client, Connection, WorkflowNotFoundError } from '@temporalio/client';
 import { Prisma, type PrismaClient } from '@intelligenz/database';
 import {
   ContainmentError,
@@ -66,6 +66,51 @@ export interface WorkflowLivenessProbe {
 /** gRPC "not found": there is no execution, which is a definite answer, not an error. */
 const GRPC_NOT_FOUND = 5;
 
+/**
+ * What a failed liveness call means — Phase 6 re-review N2.
+ *
+ * `absent` is the answer the whole release path rests on, and until AG-603 it was
+ * **unreachable**. The probe classified only by `error.code === 5`, but `describe()` does
+ * not surface the raw gRPC error: `WorkflowClient._describeWorkflowHandler` converts
+ * `NOT_FOUND` into `WorkflowNotFoundError`, which carries `workflowId`/`runId` and
+ * neither `code` nor a coded `cause`. `grpcStatus()` therefore returned `undefined`, a
+ * genuinely missing execution became `unknown`, and the release pass could only ever fire
+ * for *terminal* runs. A claim whose run was deleted or aged out of retention was stranded
+ * for ever — the exact state F4 exists to prevent.
+ *
+ * Classification is now by the error's **identity** first, then by the gRPC code, so both
+ * shapes are recognised. Everything else stays `unknown`, and `unknown` still means skip:
+ * this function is allowed to miss an absence (a stranded claim costs availability) and is
+ * not allowed to invent one (a release of a live claim destroys work).
+ *
+ * The identity check is deliberately over-inclusive in one direction only: a subclass, a
+ * second copy of the SDK, and a re-serialized error all still answer `absent` through
+ * either `instanceof` (the SDK installs a `Symbol.hasInstance` that survives copies) or
+ * the marker symbol the SDK's decorator writes. It is not message-text matching.
+ */
+export function classifyProbeError(error: unknown): WorkflowLiveness {
+  for (const candidate of errorChain(error)) {
+    if (isWorkflowNotFound(candidate)) return 'absent';
+    if (grpcStatus(candidate) === GRPC_NOT_FOUND) return 'absent';
+  }
+
+  return 'unknown';
+}
+
+/** The marker `SymbolBasedInstanceOfError` writes, and the name it writes on the prototype. */
+const WORKFLOW_NOT_FOUND_MARKER = Symbol.for('__temporal_isWorkflowNotFoundError');
+
+function isWorkflowNotFound(error: unknown): boolean {
+  if (error instanceof WorkflowNotFoundError) return true;
+  if (typeof error !== 'object' || error === null) return false;
+
+  if ((error as { name?: unknown }).name === 'WorkflowNotFoundError') return true;
+
+  // Belt and braces for a copy of the SDK whose class identity is not shared: the marker
+  // is a `Symbol.for`, so it is global across realms and library instances.
+  return (error as Record<symbol, unknown>)[WORKFLOW_NOT_FOUND_MARKER] === true;
+}
+
 export function createTemporalProbe(options: {
   readonly address: string;
   readonly namespace: string;
@@ -97,11 +142,9 @@ export function createTemporalProbe(options: {
 
         return name === 'RUNNING' || name === 'CONTINUED_AS_NEW' ? 'active' : 'finished';
       } catch (error) {
-        if (grpcStatus(error) === GRPC_NOT_FOUND) return 'absent';
-
         // An unreachable server is not evidence that the workflow is gone. `unknown`
         // makes the caller skip, which is the whole point of having the value.
-        return 'unknown';
+        return classifyProbeError(error);
       }
     },
 
@@ -119,9 +162,7 @@ export function createTemporalProbe(options: {
 
         return name === 'RUNNING' || name === 'CONTINUED_AS_NEW' ? 'active' : 'finished';
       } catch (error) {
-        if (grpcStatus(error) === GRPC_NOT_FOUND) return 'absent';
-
-        return 'unknown';
+        return classifyProbeError(error);
       }
     },
 
@@ -131,6 +172,18 @@ export function createTemporalProbe(options: {
       client = undefined;
     },
   };
+}
+
+function errorChain(error: unknown, depth = 0): readonly unknown[] {
+  if (depth > 4) return [];
+
+  const chain: unknown[] = [error];
+  const cause =
+    typeof error === 'object' && error !== null ? (error as { cause?: unknown }).cause : undefined;
+
+  if (cause !== undefined && cause !== error) chain.push(...errorChain(cause, depth + 1));
+
+  return chain;
 }
 
 function grpcStatus(error: unknown, depth = 0): number | undefined {

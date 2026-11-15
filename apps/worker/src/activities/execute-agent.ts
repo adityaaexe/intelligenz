@@ -176,15 +176,14 @@ export async function executeAgentActivity(
   // existed, that path executed an unapproved HIGH-risk task with no claim written — the
   // gate one activity upstream was real, and irrelevant to the caller that skipped it.
   //
-  // The identity comes from the activity context, never from the input, except on the
-  // direct-invocation path where there is no context to read (`executionIdentity`).
+  // The identity comes from the activity context and nowhere else. A call with no
+  // execution identity — a standalone activity, or any invocation not dispatched by a
+  // workflow — is refused `EXECUTION_IDENTITY_UNAVAILABLE` here, before the first read.
   const claim = await requireExecutionClaim({
     orgId: input.orgId,
     taskId: input.taskId,
     attemptId: input.attemptId,
-    executionRunId: executionIdentity({
-      ...(input.executionRunId === undefined ? {} : { workflowRunId: input.executionRunId }),
-    }),
+    executionRunId: executionIdentity(),
     workflowRunId: input.workflowRunId,
   });
 

@@ -1,6 +1,11 @@
 import { assertTaskAuthorised } from '../approvals/authorisation';
 import type { ValidateTaskActivityInput, ValidateTaskActivityResult } from '../shared/contracts';
-import { EXECUTION_CLAIM_REFUSED, claimExecution, executionIdentity } from './claim';
+import {
+  EXECUTION_CLAIM_REFUSED,
+  EXECUTION_IDENTITY_UNAVAILABLE,
+  claimExecution,
+  executionIdentity,
+} from './claim';
 import { db, nonRetryableWithDetails } from './support';
 
 /**
@@ -209,28 +214,29 @@ export async function validateTaskActivity(
  * Claims the attempt this execution named, or throws the typed refusal.
  *
  * The identity resolution is the load-bearing part: `executionIdentity` reads Temporal's
- * run id from the activity context, so an execution cannot choose the name it claims
- * under. A caller that named an attempt but supplied no identity at all — the shape of a
- * direct invocation — is refused rather than allowed to proceed unclaimed.
+ * run id from the activity context **and from nowhere else**, so an execution cannot
+ * choose the name it claims under. A caller that named an attempt but has no execution
+ * identity at all — the shape of a direct or standalone invocation, which is how the
+ * Phase 6 re-review forged the launch-site gate — is refused
+ * (`EXECUTION_IDENTITY_UNAVAILABLE`) before any write.
  */
 async function claimForExecution(
   task: { readonly id: string; readonly orgId: string; readonly projectId: string },
   attemptId: string,
   input: ValidateTaskActivityInput,
 ): Promise<void> {
-  const workflowRunId = executionIdentity({
-    ...(input.workflowRunId === undefined ? {} : { workflowRunId: input.workflowRunId }),
-  });
+  const workflowRunId = executionIdentity();
 
   if (workflowRunId === undefined) {
     throw nonRetryableWithDetails(
-      EXECUTION_CLAIM_REFUSED,
-      `Task ${task.id} names attempt ${attemptId} but no execution identity; an attempt ` +
-        'can only be claimed by an execution that can be named, and this call has no ' +
-        'Temporal run id.',
+      EXECUTION_IDENTITY_UNAVAILABLE,
+      `Task ${task.id} names attempt ${attemptId} but this call has no execution ` +
+        'identity: an attempt can only be claimed by an execution the orchestrator can ' +
+        'name, and an activity invoked outside a workflow has no Temporal run id. There ' +
+        'is no input field that stands in for it.',
       {
-        reason: 'execution_claim',
-        code: EXECUTION_CLAIM_REFUSED,
+        reason: 'execution_identity',
+        code: EXECUTION_IDENTITY_UNAVAILABLE,
         taskId: task.id,
         projectId: task.projectId,
         attemptId,

@@ -1,6 +1,7 @@
 import { Context } from '@temporalio/activity';
 import type { Prisma } from '@intelligenz/database';
 
+import { WORKFLOW_ID_PREFIX } from '../config';
 import { workerLogger } from '../log';
 import { AGENT_ACTOR_ID } from '../shared/actors';
 import { db, nonRetryableWithDetails } from './support';
@@ -51,9 +52,20 @@ import { db, nonRetryableWithDetails } from './support';
  * numbers are none of those things: a retry runs in a new process, and the attempt number
  * *changes* on the retry it is supposed to recognise.
  *
- * The input's `workflowRunId` is consulted **only** when no activity context exists — a
- * direct invocation from a test or an operational script. In production the context is
- * always present, so the field is dead weight there and cannot lower the gate.
+ * **There is no fallback, and this is the Phase 6 re-review's N1.** Until AG-603 this
+ * function returned a caller-supplied `workflowRunId` when no activity context existed.
+ * That made the launch-site gate satisfiable by an *input field*: a standalone activity
+ * (`Client.activity` — no workflow execution, so no context run id) supplied a victim's
+ * run id and the gate accepted the claim written under that id. The reviewer ran it twice:
+ * with the victim already adopted it created attempt 2 under the victim's claim and ran
+ * concurrently; with the victim not yet adopted it spent attempt 1, so the legitimate
+ * execution was refused afterwards. Both values are readable from workflow history by
+ * anyone with Temporal access, which is the register's own stated O1 precondition.
+ *
+ * The fallback is gone. A call with no workflow execution has no identity to offer and is
+ * refused (`EXECUTION_IDENTITY_UNAVAILABLE`) before it can touch a row. The only things
+ * that can produce the value now are the Temporal server and the SDK's context, and
+ * neither reads it from the caller's input.
  *
  * ## Idempotency: a retry of the same execution is not a second execution
  *
@@ -97,6 +109,16 @@ export const EXECUTION_ALREADY_CLAIMED = 'EXECUTION_ALREADY_CLAIMED';
  */
 export const EXECUTION_CLAIM_REFUSED = 'EXECUTION_CLAIM_REFUSED';
 
+/**
+ * This call has no execution identity at all — it was not dispatched by a Temporal
+ * workflow. Non-retryable, and the reason it is a *separate* code from
+ * `EXECUTION_CLAIM_REFUSED` is that the two are different incidents: "an execution that
+ * holds no claim tried to act" (an authorisation decision) versus "there is no execution
+ * here" (a dispatch that should not have been possible). Conflating them would hide N1
+ * inside a normal refusal.
+ */
+export const EXECUTION_IDENTITY_UNAVAILABLE = 'EXECUTION_IDENTITY_UNAVAILABLE';
+
 export type ExecutionClaimRefusalCode =
   typeof EXECUTION_ALREADY_CLAIMED | typeof EXECUTION_CLAIM_REFUSED;
 
@@ -125,25 +147,61 @@ export interface ExecutionClaim {
 }
 
 /**
- * The stable execution identity, or `undefined` when there is none to be had.
+ * The execution identity, or `undefined` when this call has none.
  *
- * The activity context wins when it exists. `info.workflowExecution` is optional in the
- * SDK's type because an activity *can* be started outside a workflow; in this worker it
- * never is, and the fallback exists for the code paths that call activities directly.
+ * Takes **no arguments on purpose**. There is no parameter to pass because there is
+ * nothing a caller could legitimately contribute: the run id is created by the Temporal
+ * server when it starts the workflow and is re-stated by the server on every activity
+ * task. `Context.current()` throws when the process is not running an activity at all,
+ * and `info.workflowExecution` is absent for a **standalone activity** — an activity
+ * started by `Client.activity` with no parent workflow.
+ *
+ * Both of those are `undefined`, and `undefined` is a refusal everywhere it is consumed:
+ * `requireExecutionClaim` and `claimExecution`'s only caller (`validateTaskActivity`)
+ * turn it into `EXECUTION_IDENTITY_UNAVAILABLE`. Returning a caller-supplied value here
+ * instead is exactly the defect AG-603 removed — see the module header.
  */
-export function executionIdentity(input: { readonly workflowRunId?: string }): string | undefined {
+export function executionIdentity(): string | undefined {
   try {
     const runId = Context.current().info.workflowExecution?.runId;
 
-    if (runId !== undefined && runId.length > 0) return runId;
+    return runId !== undefined && runId.length > 0 ? runId : undefined;
   } catch {
-    // No activity context: a direct call. The caller's explicit id is the only identity
-    // available, and there is no server to ask.
+    // Not inside an activity: no context object exists to ask. There is no second source.
+    return undefined;
   }
+}
 
-  const supplied = input.workflowRunId?.trim();
+/**
+ * The workflow id the Temporal server dispatched this activity for, or `undefined`.
+ *
+ * Used by the pre-dispatch completion arm (`requireCompletionAuthority`), where there is
+ * no claim to check: the workflow id is derived from the task (`task-<taskId>`), so
+ * matching it proves the caller is *the* execution for this task rather than a workflow
+ * that borrowed the task id. It is read from the same server-set context as the run id
+ * and is therefore equally unforgeable from the activity's input.
+ */
+export function executionWorkflowId(): string | undefined {
+  try {
+    const workflowId = Context.current().info.workflowExecution?.workflowId;
 
-  return supplied !== undefined && supplied.length > 0 ? supplied : undefined;
+    return workflowId !== undefined && workflowId.length > 0 ? workflowId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The refusal every consumer uses when there is no identity. Non-retryable. */
+function identityUnavailable(taskId: string): Error {
+  return nonRetryableWithDetails(
+    EXECUTION_IDENTITY_UNAVAILABLE,
+    'This call has no execution identity: an activity invoked outside a Temporal ' +
+      'workflow execution (or as a standalone activity) has no run id, so it cannot be ' +
+      'the holder of an execution claim and cannot write execution state. Only an ' +
+      'orchestrated execution may do either. Used to be satisfiable by an input field; ' +
+      'that path was removed because the field is forgeable from workflow history.',
+    { reason: 'execution_identity', code: EXECUTION_IDENTITY_UNAVAILABLE, taskId },
+  );
 }
 
 /**
@@ -384,13 +442,11 @@ export async function requireExecutionClaim(input: {
   const attemptId = input.attemptId?.trim();
 
   if (input.executionRunId === undefined) {
-    throw nonRetryableWithDetails(
-      EXECUTION_CLAIM_REFUSED,
-      'This execution has no claimable identity: an activity invoked outside a Temporal ' +
-        'workflow has no run id, so it cannot be the holder of an execution claim. Only ' +
-        'an orchestrated execution may launch an agent.',
-      { reason: 'execution_claim', code: EXECUTION_CLAIM_REFUSED, taskId: input.taskId },
-    );
+    // Phase 6 re-review N1. `undefined` here is not "no claim" — it is "no execution",
+    // and it used to be the hole: the identity was read from the caller's input when no
+    // activity context existed, so a standalone activity could satisfy the claim below by
+    // naming its victim's run id. It is refused before the first read.
+    throw identityUnavailable(input.taskId);
   }
 
   if (attemptId === undefined || attemptId.length === 0) {
@@ -480,6 +536,148 @@ export async function requireExecutionClaim(input: {
 export interface HeldExecutionClaim {
   readonly attemptId: string;
   readonly executionRunId: string;
+}
+
+/**
+ * Which control authorised a terminal write. Recorded (in the activity's return value and
+ * its audit trail) so "this was written by the execution that held the claim" is never
+ * confused with "this was written by the execution that was refused before any claim
+ * existed".
+ */
+export type CompletionAuthority = 'execution-claim' | 'pre-dispatch';
+
+/**
+ * Authority to write a task's terminal state — Phase 6 re-review N4.
+ *
+ * ## Why `completeTaskActivity` needs this and `persistResultActivity` does not
+ *
+ * `persistResultActivity` is only ever reached *after* a run, so a claim must exist and
+ * it requires one unconditionally. `completeTaskActivity` is also reached **before**
+ * anything ran: `validateTaskActivity` refuses an unapproved or non-runnable task, and the
+ * workflow must record that the task is dead, or it stays `queued` for ever. In that state
+ * no claim exists *by construction* — the claim is deliberately the last thing validation
+ * writes, so a refusal never spends a reservation — and therefore no claim check can
+ * succeed. Requiring one unconditionally would convert "the approval gate refused this"
+ * into "the task is stuck".
+ *
+ * That is a genuine second case, not a loophole, so it gets its own control rather than a
+ * weaker version of the first:
+ *
+ * | Case | Control |
+ * |---|---|
+ * | the named attempt carries a claim | `requireExecutionClaim` — the holder, and only the holder |
+ * | no attempt carries a claim | the caller must be **the** execution for this task (`task-<taskId>`), and no attempt of this task may be running or claimed by anybody else |
+ *
+ * The pre-dispatch arm is not a relaxation of the claim check — there is nothing for it to
+ * relax. Before AG-603 this path had **no** check at all: any workflow on the worker's task
+ * queue could mark any task terminal by name. Both of its conditions are read from the
+ * server-set activity context, and neither is expressible as an activity input.
+ *
+ * ## Why the workflow id, and why it only applies here
+ *
+ * `WORKFLOW_ID_PREFIX + taskId` is derived, so matching it proves the caller is *this
+ * task's* execution rather than a workflow that merely knows the task id. Temporal's
+ * `REJECT_DUPLICATE` means a second execution cannot take that id while one is live. The
+ * check cannot be applied to the claim arm, and is not needed there: a claim is a stronger
+ * proof than a workflow id, and applying both would refuse a legitimate execution whose
+ * activity was replayed into a workflow started under a test or back-office id.
+ */
+export async function requireCompletionAuthority(input: {
+  readonly orgId: string;
+  readonly taskId: string;
+  readonly attemptId: string | undefined;
+  readonly executionRunId: string | undefined;
+  readonly workflowRunId?: string | undefined;
+}): Promise<{ readonly authority: CompletionAuthority; readonly executionRunId: string }> {
+  const { executionRunId } = input;
+
+  if (executionRunId === undefined) {
+    // Same refusal as the launch site: no identity, no write. This is the arm that makes
+    // a standalone `completeTaskActivity` (the reviewer's dispatch shape) inert.
+    throw identityUnavailable(input.taskId);
+  }
+
+  const attemptId = input.attemptId?.trim();
+  const named =
+    attemptId === undefined || attemptId.length === 0
+      ? null
+      : await db().executionAttempt.findFirst({
+          where: { id: attemptId, orgId: input.orgId, taskId: input.taskId },
+          select: { claimedByWorkflowRunId: true },
+        });
+
+  if (named !== null && named.claimedByWorkflowRunId !== null) {
+    // A claim exists, so the claim decides. `requireExecutionClaim` re-reads the row under
+    // the same tenant and task filters: the read above chooses the arm, it grants nothing.
+    const held = await requireExecutionClaim({
+      orgId: input.orgId,
+      taskId: input.taskId,
+      attemptId,
+      executionRunId,
+      ...(input.workflowRunId === undefined ? {} : { workflowRunId: input.workflowRunId }),
+    });
+
+    return { authority: 'execution-claim', executionRunId: held.executionRunId };
+  }
+
+  // ── The pre-dispatch arm ────────────────────────────────────────────────────
+  const workflowId = executionWorkflowId();
+  const expected = `${WORKFLOW_ID_PREFIX}${input.taskId}`;
+
+  if (workflowId !== expected) {
+    throw nonRetryableWithDetails(
+      EXECUTION_CLAIM_REFUSED,
+      `Task ${input.taskId} was asked to complete without a claim by an execution that is ` +
+        `not this task's own (workflow id ${workflowId ?? 'none'}, expected ${expected}). ` +
+        'A run that never claimed a reservation may only record a refusal for the task it ' +
+        'was started for.',
+      {
+        reason: 'execution_completion',
+        code: EXECUTION_CLAIM_REFUSED,
+        taskId: input.taskId,
+        workflowId: workflowId ?? null,
+      },
+    );
+  }
+
+  // Something may be executing under a claim even though the attempt named here has none:
+  // a retry, or a second reservation of the same task. Completing the task underneath it
+  // would end a run that is still working.
+  const attempts = await db().executionAttempt.findMany({
+    where: {
+      orgId: input.orgId,
+      taskId: input.taskId,
+      OR: [{ status: 'running' }, { claimedByWorkflowRunId: { not: null } }],
+    },
+    take: 50,
+    select: { id: true, status: true, claimedByWorkflowRunId: true },
+  });
+
+  const foreign = attempts.find((row) =>
+    row.status === 'running'
+      ? row.claimedByWorkflowRunId !== executionRunId
+      : row.claimedByWorkflowRunId !== null && row.claimedByWorkflowRunId !== executionRunId,
+  );
+
+  if (foreign !== undefined) {
+    throw nonRetryableWithDetails(
+      EXECUTION_ALREADY_CLAIMED,
+      `Task ${input.taskId} cannot be completed without a claim: attempt ${foreign.id} is ` +
+        `"${foreign.status}" under workflow run ${foreign.claimedByWorkflowRunId ?? 'no claim'}, ` +
+        'which is not this execution. A task with a live execution is completed by that execution.',
+      {
+        reason: 'execution_completion',
+        code: EXECUTION_ALREADY_CLAIMED,
+        taskId: input.taskId,
+        attemptId: foreign.id,
+        ...(foreign.claimedByWorkflowRunId === null
+          ? {}
+          : { claimedByWorkflowRunId: foreign.claimedByWorkflowRunId }),
+      },
+    );
+  }
+
+  return { authority: 'pre-dispatch', executionRunId };
 }
 
 /** The subset of the client an audit write needs — satisfied by the client and by a transaction. */

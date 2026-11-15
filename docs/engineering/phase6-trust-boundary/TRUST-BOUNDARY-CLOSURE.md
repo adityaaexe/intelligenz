@@ -26,14 +26,20 @@ execution actually starts, so the only path that honoured it was the one path th
 
 ### F1 — the claim is an entry condition of the launch site
 
-`apps/worker/src/activities/claim.ts:369` — `requireExecutionClaim()`. Called as the **first
-act** of `executeAgentActivity` (`apps/worker/src/activities/execute-agent.ts:167`), before
-`getWorkerConfig()`, before the runtime adapter is constructed, before the task read, before
-`startAttempt`, before the cgroup probe, before the workspace lease, before the broker and
-before `runtime.execute`. It resolves the activity's run id from the Temporal **context**
-(input only when there is no context), resolves the named attempt inside the tenant and
-task, and requires the row's `claimedByWorkflowRunId` to equal it. Anything else throws
+`apps/worker/src/activities/claim.ts:427` — `requireExecutionClaim()`. Called as the **first
+act** of `executeAgentActivity`, before `getWorkerConfig()`, before the runtime adapter is
+constructed, before the task read, before `startAttempt`, before the cgroup probe, before
+the workspace lease, before the broker and before `runtime.execute`. It resolves the
+activity's run id from the Temporal **context and nowhere else**, resolves the named attempt
+inside the tenant and task, and requires the row's `claimedByWorkflowRunId` to equal it.
+Anything else throws `EXECUTION_IDENTITY_UNAVAILABLE` (no context),
 `EXECUTION_CLAIM_REFUSED` or `EXECUTION_ALREADY_CLAIMED`, non-retryable, with zero writes.
+
+**Corrected by AG-603.** This section used to say the run id was read from the context
+"input only when there is no context". That fallback was the N1 defect: a standalone
+activity has no context, so it took the input, and the gate accepted whatever claim the
+input named. The fallback is gone and the input field with it — see
+`AG-603-IDENTITY-AND-AUTHORITY.md`.
 
 Immediately after it (`execute-agent.ts:223`), `assertTaskAuthorised({ altitude: 'launch' })` re-runs the approval
 gate — **the same function validation calls**, extracted to
