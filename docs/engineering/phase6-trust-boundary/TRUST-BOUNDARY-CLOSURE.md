@@ -95,6 +95,11 @@ workflow id derived from the task; see AG-604):
 | running / continued-as-new | skip |
 | unreachable / anything else | skip |
 
+`continued-as-new` is mapped to `active` at `reaper.ts:155` and `:177`. **No test names a
+continued-as-new execution**; that row is code inspection, not a measured decision. A test
+describing a `CONTINUED_AS_NEW` execution and asserting `skipped_live` is the trigger to state
+it as enforced. The other three rows have tests (§Verification).
+
 The release itself is one conditional `updateMany` (still `queued`, still claimed by *that*
 pair) inside a transaction with an `execution.claim_released.v1` audit row carrying the
 liveness evidence and both ids. The row becomes `failed` / `ATTEMPT_ABANDONED` /
@@ -117,7 +122,7 @@ quietly hand an execution the ability to release its own claim.
 | `pnpm -w test` | see the AG-602 report |
 | `pnpm --filter @intelligenz/api test:e2e` | unchanged by this commit; see the report |
 | `apps/worker/test/isolation-gate.test.ts` ×5 | see the report |
-| `apps/worker/test/execution-boundary.test.ts` | 17/17 — F1 (×4), F2 (×2), F3 (×3), legitimate path + retry (×2), F4 (×5), structural (×1) |
+| `apps/worker/test/execution-boundary.test.ts` | 17 tests in the file — F1 (×4), F2 (×2), F3 (×3), legitimate path + retry (×2), F4 (×5), structural (×1). The count is readable from the file; the pass result for the phase is in `TEST-RESULTS.md`, which is the measurement record. "17/17" was this row's old wording and asserted a run outcome this document did not produce |
 
 ---
 
@@ -136,10 +141,11 @@ quietly hand an execution the ability to release its own claim.
 3. **Two real-Temporal tests still do not run in CI.** `.github/workflows/ci.yml` has no
    Temporal service, so the F3-through-Temporal test and the pre-existing e2e claim test
    skip on every push (O8/T2 of the SEC-601 review).
-4. **The release pass kills nothing.** A stranded claim never provisioned a process, so
-   there is nothing to reap — but if the claim was committed and `startAttempt` succeeded
-   before the crash, the attempt is `running`, not `queued`, and the pre-existing reaper
-   path applies instead.
+4. **The release pass is not tested to kill nothing.** A stranded claim never provisioned a
+   process, so the claim release has nothing to reap — but that follows from claim-before-
+   provision read in the code, and **no test asserts that a release performs no kill**. If the
+   claim was committed and `startAttempt` succeeded before the crash, the attempt is `running`,
+   not `queued`, and the pre-existing reaper path applies instead.
 5. **A claim that records no workflow id is never released** (AG-604). Rows written before
    `claimedByWorkflowId` existed, and any claim written without workflow context, cannot be
    probed exactly: deriving `task-<taskId>` is what released a live claim (N7). They are

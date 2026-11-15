@@ -3,7 +3,9 @@
 **Commits under review:** `3aed33d` → `74207f0` → `a75f121` → `23db912` → `58476b0`
 **Branch:** `phase-6/trust-boundary-closure`
 **Final verdict for the gate:** **PASS** (granted at `23db912`; `58476b0` adds only
-the N12/N13 corrections, verified by targeted suites)
+the N12/N13 corrections, verified by targeted suites). The verification table in `AG-604` uses
+`a75f121` as its base — the lineage is consistent, the two documents just anchor at different
+commits.
 
 ## The mechanism
 
@@ -20,9 +22,15 @@ UPDATE "ExecutionAttempt"
 
 `count === 1` is the grant. The loser blocks on the row lock, re-evaluates against
 the committed row under READ COMMITTED and matches nothing. There is no
-read-then-write, and the grant's audit row commits **in the same transaction**, so
-an attempt cannot be claimed without a record saying so
-(`apps/worker/src/activities/claim.ts:230-247`).
+read-then-write (`execution-claim.test.ts:315` runs two concurrent claimants against real
+PostgreSQL and asserts exactly one grant; a read-then-write implementation fails it).
+
+The grant's audit row is written **in the same transaction** as the update
+(`claim.ts:307-332`). That part is **inspection, not a test**: no test forces the transaction
+to roll back after the update and asserts the absence of both the claim and the event. The
+one-winner test proves the compare-and-swap, not the audit atomicity. A rollback test is the
+trigger to state this as enforced. (The citation used to read `:230-247`, which no longer
+resolves to the transaction.)
 
 ## Identity
 
@@ -81,9 +89,10 @@ each time; the reviewer was right each time.
 | Legacy claims cannot starve | 5 NULL-id rows + 1 genuine, `batchSize 5` | candidate predicate removed |
 | The writer is tested | claim from shipped validation, `probe-<uuid>` id | `validate-task.ts:259` deleted |
 
-Every row above was verified by mutation — removing the control makes the test
-fail. That is the standard this phase applied to itself after N13 showed a
-control can look tested while being untested.
+The five controls recorded in `AG-604` §5 were verified by mutation, each with the failing test
+named. The remaining rows are backed by the tests cited, **not** by a recorded mutation. The
+previous sentence — "Every row above was verified by mutation" — was not true, and it is the
+kind of sentence that stops the next reviewer from checking.
 
 ## Residuals
 

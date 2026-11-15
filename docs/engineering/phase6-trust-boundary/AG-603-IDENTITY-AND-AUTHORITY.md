@@ -45,12 +45,17 @@ mint a grant.
 `WorkflowRun.id`, cross-checked against the attempt's foreign key. It buys nothing on its own
 — the claim still has to be held by the context's run id.
 
-### No production-reachable path can supply an identity
+### No activity input can supply an identity
 
-1. Nothing in `src/` reads an identity from a parameter. `executionIdentity()` has no
-   parameter to pass, and a structural test fails if that signature comes back.
-2. The only two readers are `requireExecutionClaim` and `validateTaskActivity`'s
-   `claimForExecution`, both of which consume `executionIdentity()` and nothing else.
+1. No activity input supplies an execution identity, and `executionIdentity()` has no
+   parameter to pass — a structural test fails if that signature comes back. This section used
+   to open with "nothing in `src/` reads an identity from a parameter", which was false:
+   `claimExecution(identity: ClaimIdentity)` reads `identity.workflowRunId`
+   (`claim.ts:303-320`). The accurate statement is narrower and is the one that matters.
+2. Every writer that needs an execution identity calls `executionIdentity()`; none receives one
+   from an activity input. The call sites are `execute-agent.ts:197`, `validate-task.ts:229`,
+   `persist-result.ts:71`, `complete-task.ts:102`, `emit-event.ts:78` and
+   `record-start.ts:38`, each passing it into the guard that authorises the write.
 3. The value comes from `Context.current()`, which the Temporal SDK populates from the
    server's activity task. A standalone activity has no `workflowExecution` and therefore no
    identity; a workflow-dispatched activity cannot override it.
@@ -59,6 +64,8 @@ mint a grant.
    seam that supplies one. The one place a test passes an identity is
    `claimExecution(...)`'s own argument — an internal writer that is *given* an identity by
    its caller, with a single production caller that derives it from the context.
+5. Nothing in the **activity-input** surface carries an identity:
+   `execution-identity.test.ts:614` asserts no identity field on the inputs.
 
 ### Proof
 
@@ -163,7 +170,7 @@ other.
 | Case | Control |
 |---|---|
 | the named attempt carries a claim | `requireExecutionClaim` — the holder, and only the holder |
-| no attempt carries a claim | the caller must be **this task's own execution** (`WorkflowRun`/workflow id `task-<taskId>`, read from the activity context) **and** no attempt of this task may be running or claimed by anybody else |
+| no attempt carries a claim | the caller must be **this task's own execution** (`WorkflowRun`/workflow id `task-<taskId>`, read from the activity context) **and** no attempt of this task may be running or claimed by anybody else. The identity half is tested (`execution-boundary.test.ts:984`, `:1018`); the foreign-attempt conjunct (`claim.ts:765-777`) is **code-only** — no test seeds a running foreign attempt against an otherwise-authorised pre-dispatch call. That test is the trigger to state the conjunct as enforced |
 
 The second arm is not a relaxed claim check — there is nothing for it to relax. A claim does
 not exist on that path *by construction*: the claim is deliberately the last thing validation
@@ -213,11 +220,13 @@ above still pass.
 ### Deliberate consequence: the workflow id in the pre-dispatch arm
 
 A run started under a workflow id other than `task-<taskId>` can no longer write a task's
-terminal state before a claim exists. The API always starts `task-<taskId>`, so nothing in
-production is affected; a hand-started workflow under a suffixed id now leaves the task
-non-terminal and must be cancelled through `POST /cancel`. This is the control doing its job,
-not a regression, and the F3 "two direct starts of one task" test still passes because it
-asserts the workflows end `failed` with nothing executed, not that they wrote the status.
+terminal state before a claim exists. The API starts `task-<taskId>` on both start paths
+(`tasks.service.ts:792`, `orchestrator/orchestrator.service.ts:145`); **that is code
+inspection — no test asserts the workflow id the API starts**, so "always" is not available
+here. A hand-started workflow under a suffixed id now leaves the task non-terminal and must be
+cancelled through `POST /cancel`. This is the control doing its job, not a regression, and the
+F3 "two direct starts of one task" test still passes because it asserts the workflows end
+`failed` with nothing executed, not that they wrote the status.
 
 ### CI coverage that moved behind a real server
 

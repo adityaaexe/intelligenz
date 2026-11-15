@@ -1,7 +1,13 @@
 # Artifact integrity — adversarial tests
 
 **Gate:** G · **Suites:** `packages/workspace-manager/test/{change-manifest,hostile-repository,snapshot}.test.ts`, `apps/worker/test/evidence-{capture-order,capture-points,provenance}.test.ts`
-**Result at time of writing:** 40 focused tests passing; three measured attacks closed; independent review outstanding.
+**Result recorded:** `TEST-RESULTS.md`. The independent review exists and returns **FAIL** for
+Gate G; counts are not restated here.
+
+**Corrected under D-602.** The traversal table below used to read as a list of exercised
+behaviours. Three of its rows were code paths with no test, and one named a check that does not
+detect what the row claimed. The table now has an *Exercised by* column: a row that no test
+covers says so.
 
 ## Why these tests exist
 
@@ -66,15 +72,21 @@ negative assertion meaningful.
 
 ## Traversal and consistency
 
-| Attack | Test | Behaviour |
-|---|---|---|
-| symlink to `/etc/passwd` | `hostile-repository.test.ts:133` | recorded as `symlink` + target string; target never opened |
-| path escape `..` / absolute | `snapshot.ts:495` `isContained` throw | `SNAPSHOT_PATH_ESCAPE`, walk aborts |
-| symlinked root | `snapshot.ts:666` | rejected |
-| directory vanishes mid-walk | `walk` `ENOENT` branch | `stopReason: 'unreadable'`, not ignored |
-| file changes during read | size-vs-bytes check `:205` | inconsistent entry detected |
-| awkward names (spaces, unicode, newline) | `hostile-repository.test.ts:133` | carried, byte-sorted |
-| empty directory | `change-manifest.test.ts:215` | covered by the status contract |
+| Attack | Where | Behaviour | Exercised by |
+|---|---|---|---|
+| symlink to `/etc/passwd` | `hostile-repository.test.ts:133` | recorded as `symlink` + target string; target never opened; `/etc/passwd`'s digest absent from body and manifest | `hostile-repository.test.ts:133` |
+| path escape `..` / absolute | `isContained` throw | `SNAPSHOT_PATH_ESCAPE`, walk aborts | **No test.** The walk's own name filter (`.`/`..`/separator) makes the throw defensive; nothing reaches it |
+| symlinked root | `snapshot.ts:912` | rejected | `snapshot.test.ts:264` (file and symlink root) |
+| directory vanishes mid-walk | `walk`, `ENOENT` branch | `stopReason: 'unreadable'`, not ignored | **No test deletes a queued directory.** Code path only |
+| file changes during read | `hashRegularFile` (`snapshot.ts:301` at `cfc1f26`) | `size` + `mtimeMs` re-read after hashing; a size change or an `mtime`-moving rewrite makes the entry `unstable`. A same-size rewrite with `mtime` restored is **not** detected at `cfc1f26`; the working tree adds `ctimeMs` (uncommitted) | `snapshot-race.test.ts:54` (stale `lstat`/swap), `:89` (size change), positive control `:74`; `:140`, `:175` for `ctimeMs` (uncommitted) |
+| a name that is not valid UTF-8 | `walk`, `lstat` `ENOENT` | walk stops, `stopReason: 'unreadable'`, the entry is absent, and every later manifest of that workspace is incomplete | **No test.** Measured by the reviewer (`FINAL-INDEPENDENT-REVIEW.md:2614-2623`) |
+| awkward names (spaces, unicode, newline) | `hostile-repository.test.ts:133` | carried, byte-sorted | `hostile-repository.test.ts:133`; ordering at `snapshot.test.ts:160` |
+| empty directory | `change-manifest.test.ts:215` | covered by the status contract | `change-manifest.test.ts:215` |
+
+This table used to name a "size-vs-bytes check" as the detector of a file changing during the
+read. That check (`snapshot.ts:347` at `cfc1f26`) detects a **short read** — fewer bytes hashed
+than the descriptor claims — not a content mutation. It is row 4 of "Consistency during
+capture" in `TRUSTED-SNAPSHOT-DESIGN.md`, and no test produces a short read either.
 
 ## Bounded work is not authority
 
@@ -82,10 +94,15 @@ negative assertion meaningful.
 |---|---|
 | `change-manifest.test.ts:304` | hitting the change cap sets `complete: false` with a stop reason |
 | `change-manifest.test.ts:330` | either snapshot bounded ⇒ manifest `complete: false` |
-| `persist-result.ts:354` | `authoritative = evidence.authoritative && workspaceId !== null` |
+| `evidence-provenance.test.ts:667` | a **bound** workspace with an incomplete walk ⇒ `Artifact.authoritative === false` |
+| `evidence-provenance.test.ts:437` | an envelope claiming `authoritative: true` over an incomplete body is refused |
+| `persist-result.ts:365` | `authoritative = evidence.authoritative && workspaceId !== null` |
 
-A truncated manifest is written and is **never** authoritative. The failure direction is
-"labelled incomplete", not "silently whole".
+A truncated manifest is written and is **never** authoritative. The first two rows prove
+`complete: false`; the authority claim itself is proven by the two `evidence-provenance` rows.
+This section used to cite only `change-manifest.test.ts:304,330` and `persist-result.ts:354` for
+the authority property: those tests would stay green if the authority gate were deleted, and
+`:354` no longer resolves to the gate.
 
 ## Determinism
 
@@ -105,14 +122,18 @@ workspace reuse safe.
 
 ## Honest gaps in this suite
 
-1. **The Git/Index/Mount attacks are not attempted.** No test creates a mount crossing.
+1. **Mount crossings are not attempted.** No test creates a mount inside the workspace, so
+   the "walked as directories and files" policy is unexercised.
 2. **Hard links** are hashed per path; no test asserts the inode double-count behaviour.
 3. **A file modified after the final snapshot but before persistence** is not covered — the
    manifest is an instant, and its hash is verified against the stored body
    (`verifyManifestFile`), not re-derived from the tree.
-4. **`providerMeta`-supplied workspace provenance** was an open defect found during the
+4. **A parent directory swapped for a link** between its `readdir` and a child's `lstat` is
+   not detected at `cfc1f26`, and no test attempts it. Measured by the reviewer; named
+   limitation 9 in `TRUSTED-SNAPSHOT-DESIGN.md`.
+5. **`providerMeta`-supplied workspace provenance** was an open defect found during the
    Gate G audit; the correction and its test are recorded separately in the final report.
-5. **No signing.** A hash proves the bytes have not changed since the host wrote them. It
+6. **No signing.** A hash proves the bytes have not changed since the host wrote them. It
    does not prove who wrote them; there is no key and no signature.
 
 ## How to run

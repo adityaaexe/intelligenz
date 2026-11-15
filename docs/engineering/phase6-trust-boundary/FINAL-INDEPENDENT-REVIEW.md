@@ -2159,3 +2159,630 @@ fixes.
 Verification status: **verified** for every command and probe result quoted here. The one
 finding marked race-dependent (F-G5) is explicitly reasoned from `snapshot.ts:213,504,556`
 and was not reproduced; F-G9 is reasoned from `persist-result.ts:120-166`.
+
+# Addendum — SEC-606 Gate G re-review of `cfc1f26`
+
+**Commit reviewed:** `cfc1f26cd4600a96fd2aa7722f128e4988a7cecf`
+**Parent:** `9461d2773a2902dee91d0f36a22977356548c01e`
+**Branch:** `phase-6/trust-boundary-closure`
+**Reviewer:** Security Architect (independent; did not author this commit)
+**Date:** 2026-11-15
+**Method:** re-ran every attack from SEC-605 against the new tree, then attacked the fixes
+themselves; ran the full suite, the API e2e suite, typecheck and lint; ran eleven probes
+outside the repository (`/home/ubuntu/.cache/sec606/probes/`, scratch trees under
+`/home/ubuntu/.cache/sec606/scratch-*`); and ran a seven-mutation study on a scratch copy
+of the tree (`/home/ubuntu/.cache/sec606/mut`, built with `git archive HEAD` + copied
+`node_modules`) to measure whether the new tests fail when each fix is reverted. The
+repository was not modified except for this file; `git status --porcelain` is empty before
+and after.
+
+## Verdict
+
+**FAIL — narrower than round 1, and for a different reason.**
+
+Both Highs are genuinely closed, and I could not reopen either. `.git/hooks -> /etc` now
+records the link and reads nothing from `/etc` (0 entries, no `/etc` digest anywhere in the
+snapshot or the manifest, with a real-hooks positive control producing the exact hook
+digest). `chmod 000` now fails the attempt with `EVIDENCE_MISSING`, writes an
+`attempt.evidence_failed.v1` bound to the attempt, creates no authoritative artifact, and
+the task ends `failed`; a complete run still succeeds, and a runtime with no workspace still
+legitimately produces nothing. F-G3's measured failure is fixed: the reaper now keeps
+`evidence/` beside the artifact copy and the URI stays readable.
+
+The verdict is still FAIL because:
+
+1. **A High the commit does not touch: `.git` is excluded at every depth, but only the root
+   `.git` is described.** `sub/.git/` is walked past — not in `entries`, not in
+   `git`, not in the manifest — and I measured an agent write into it producing
+   `changeCount: 0`, `complete: true`, `authoritative: true`, with the digest identical to
+   the baseline. That is a silent, deterministic, persistent place to put arbitrary content
+   that the evidence never describes. It defeats the gate's product for that content
+   without a race, a forgery, or a broken assumption. The design doc says the opposite
+   (`.git` "at any depth … recorded as metadata instead"), which is true only at the root.
+2. **The one residual they chose to document instead of fix has a false bound.** The doc says
+   the same-size rewrite "cannot make a changed file look unchanged *relative to the
+   baseline*". I measured exactly that: a same-size in-place write into an already-read
+   region, with `mtime` restored at nanosecond precision, produced `complete: true`, a final
+   digest **equal to the baseline digest**, `changeCount: 0`, and an authoritative manifest
+   — while the file on disk differed. `ctime` changes and is available in the same `Stats`;
+   it is not compared.
+3. **Two more documented statements are false** (parent-swap detection, nested `.git`
+   metadata), which is what G-14 exists to catch, and I failed `9461d27` partly on exactly
+   this ground. A gate whose deliverable is an honest evidence claim cannot ship a
+   guarantee it does not provide.
+4. **The agent can still choose whether its evidence is authoritative and still succeed.**
+   One `truncate` to 9 GiB (`final-incomplete`) or one file whose name is not valid UTF-8
+   (`unreadable`) makes the manifest non-authoritative, records no failure, and leaves the
+   task `succeeded`. F-G2 closed *absence*; it did not close *uselessness*. The difference
+   from F-G2 is one boolean that no consumer refuses on.
+
+| Question | Answer |
+|---|---|
+| Is `.git/hooks -> /etc` closed? | **Yes.** 0 hook entries, target recorded, no `/etc` digest in snapshot or manifest; real-hooks control passes. |
+| Can any `.git` metadata path still produce a foreign hash? | **No.** `.git` link, `.git` gitfile, `.git` gitfile → `/etc/passwd`, `.git/HEAD`, `config`, `index`, a symlinked hook entry: all recorded as `symlink:`/pointer text, none read through. |
+| Is `chmod 000` closed? | **Yes.** attempt `failed`, `EVIDENCE_MISSING`, event bound to the attempt, 0 authoritative artifacts, task `failed`; complete-run and no-workspace controls pass. |
+| Is the reaper's evidence deletion closed? | **Yes for the measured path.** Evidence survives, URI readable, row stays authoritative; out-of-band loss is demoted with an event. The guard is not an invariant (F-G16). |
+| Can the agent hide a change? | **Yes**, three ways: nested `.git` (silent), non-UTF-8 filename (labelled incomplete), and a live writer during capture (the documented residual). |
+| Is the walk contained? | **For persistent structures, yes.** The parent-swap window the doc admits is real and I reproduced it; it is not detected by the identity check, contrary to the doc's sentence. |
+| Does `verifyManifestFile` bind the change list? | **No, as the implementer says.** It binds the two snapshot digests to `ExecutionWorkspace`; a forged change list with genuine anchors is accepted. |
+| Are the six git attacks still closed? | **Yes**, each re-measured with a firing control. |
+| Is the new test suite sensitive? | **Yes**, seven for seven: reverting each fix makes its test fail, and the controls stay green. |
+| Is Phase 3–6 regressed? | **No.** 899/15/84, 97 e2e, 72 claim/boundary/identity, 23 phase-5, lint 0, typecheck 0. |
+
+## 1. F-G1 — the escape is closed; the record is not surfaced
+
+Re-run on a scratch repository, `takeWorkspaceSnapshot` + `buildChangeManifest`:
+
+| Probe | Result |
+|---|---|
+| **A** `.git/hooks -> /etc` | `hooks: []`, `hooksDirectoryLinkTarget: "/etc"`, `complete: true`, `oversize: []`; `/etc/passwd` SHA-256 in snapshot **false**, in manifest **false**; no `root:x:0:0`; manifest body `complete: true` |
+| **B** positive control, real hooks dir + `pre-commit` | 15 entries; `pre-commit.sha256` equals the file's SHA-256 exactly; `hooksDirectoryLinkTarget: null` |
+| **C** `.git -> <outside git dir>` | `kind: "file"`, `head/config/index: null`, `gitfileSha256 = sha256("symlink:<target>")`, marker content absent |
+| **D** `.git` as a gitfile `gitdir: /etc/passwd` | pointer text hashed, target not opened, `/etc/passwd` digest absent |
+| **D2** `.git` as a 1 MiB non-pointer | `gitfileSha256: null`, `oversize: [".git"]`, `complete: false`, `stopReason: "unreadable"` |
+| **E** `.git -> /etc/passwd` (link to a file) | recorded as `symlink:`, no digest, no `root:` prefix |
+| **F** `.git/HEAD`, `config`, `index` each `-> /etc/passwd` | `head: null`; `config`/`index` = `sha256("symlink:/etc/passwd")`; no `/etc` digest, no `root:x:0:0` |
+| **G** hook entry `passwd -> /etc/passwd` inside a real hooks dir | `{name:"passwd", kind:"symlink", sha256: sha256("symlink:/etc/passwd")}` — recorded, not read |
+| **H** hook entry that is a directory / a FIFO | silently absent from `hooks` (no `special`/`dir` record) — cosmetic |
+| **L/M** entry symlink and directory symlink in the content tree | recorded with `symlinkTarget`, never followed, `/etc` digest absent |
+
+**The fix is the right shape.** Every enumeration now goes through `listDirectory`, which
+`lstat`s before `readdir`; `.git` itself and `.git/HEAD` are read with `O_NOFOLLOW`; the
+gitfile is capped. No `.git` metadata path I tried produced a foreign hash.
+
+**Judgement on "record, don't throw".** The reasoning is sound: a throw would delete the
+whole snapshot, and an attacker who can choose between "evidence that mentions me" and "no
+evidence" will choose the latter. Recording keeps every other byte described and puts the
+anomaly inside the digest, so it is *attributable* to the attempt (`ExecutionWorkspace` is
+per attempt and its `initialManifestDigest` covers the field). But "visible" is only true
+for someone who opens `evidence/*.json`: `EvidenceSummary` has no field for it, the artifact
+summary exposes only `kind/uri/checksum/size/evidenceSource/authoritative/manifestDigest`
+(`complete`/`counts` live in the manifest file, not in the row), no audit event is written,
+and no log line mentions the link. The row a reviewer reads says `authoritative: true,
+changeCount: 0` — indistinguishable from a clean run. That is a surfacing gap, not an escape
+(F-G14).
+
+**Residual, not fixed: `.git` metadata is outside the byte ceiling.** A 40 MiB hook left
+`snapshot.totalBytes` at 2 and completed. `GIT_METADATA_MAX_BYTES` is per-file; `MAX_HOOKS`
+is per-name. The bound on this is Gate D (the volume), not the snapshot; informational.
+
+**F-G7 is unchanged.** A mid-run swap of `.git/hooks` from a real directory to `/etc`
+produces `digestsDiffer: true`, `changeCount: 0`, `changes: []`, `complete: true` and
+`hooksDirectoryLinkTarget: "/etc"` on the final side. The anomaly is in the digest and the
+manifest body, and the change list still explains nothing; a reviewer comparing digests sees
+a difference with no row. Now that the link target is canonical, the cheapest fix is a
+`git_changed` row (or the `gitAnomalies` field from F-G14) rather than a new comparison.
+
+## 2. F-G2 — absence is closed; usefulness is not
+
+Real PostgreSQL, real Temporal, the production activity registry, the run's terminal write
+composed exactly as `run-task.ts` composes it (`outcomeOf(result.status)`):
+
+| Scenario | `result.status` | error | attempt | event bound | authoritative artifacts | task |
+|---|---|---|---|---|---|---|
+| agent `chmod 000` a directory it wrote | `failed` | `EVIDENCE_MISSING`, `retryable: false` | `failed` | **yes** (`code: SNAPSHOT_CAPTURE_FAILED`, `phase: final`) | **0** | **failed** |
+| control: complete run | `succeeded` | — | `succeeded` | no event | **1**, `authoritative: true`, URI readable | `succeeded` |
+| control: runtime with no workspace | `succeeded` | — | `succeeded` | no event | 0 (no workspace row) | `succeeded` |
+| one `truncate` to 9 GiB (sparse) | `succeeded` | — | `succeeded` | no event | **0**; manifest written, `authoritative: false`, `complete: false`, `stopReason: final-incomplete`, URI readable | `succeeded` |
+
+The first row is the finding closed, measured end to end, and the two controls are the
+reason it is a measurement rather than a habit. The fourth row is new: `evidenceGap()`
+returns `finalEvidenceFailure`, which is set only when the capture *throws*; a bounded walk
+is not a throw, so it succeeds with `authoritative: false`. The doc calls this the correct
+failure direction ("a partial answer that is labelled partial is useful"), and it is honest
+— but the task still reports plain `succeeded`, and nothing refuses on the label. The
+agent's cheapest attack changed from `chmod 000` (which now fails the run) to one
+`truncate` (which does not). F-G13.
+
+**"The second hole" — the propagation is fixed, the terminal write is not.** Measured:
+the activity now returns `status: "failed"` while the adapter returned `succeeded`, which is
+the hole the implementer describes. One layer down, `completeTaskActivity` still accepts
+`status: "succeeded"` for an attempt recorded `failed` with `EVIDENCE_MISSING`: I set up
+exactly that row, called `complete` with `succeeded`, it was **accepted**, and the task
+became `succeeded`. So the only thing preventing a lying terminal state is that the workflow
+passes `result.status`; the write itself does not cross-check the attempt it names. Low
+today (one caller), but it is the same class as N4/N15 and it is the last line of defence
+this finding was about. F-G18.
+
+**The initial capture is still silent.** `captureInitialEvidence` returning `null` writes a
+warning log and nothing else: no audit event, no column, no `evidence_failed` record. The
+final absence is now durable; the baseline's absence is not. I could not make it
+agent-reachable in this deployment (the baseline runs before `runtime.execute`, and a clone
+cannot produce a `000` directory), so this is Low. F-G19.
+
+## 3. F-G3 — the measured path is closed; the guard is not an invariant
+
+Six reaper scenarios through the real `runReaperPass` against real rows:
+
+| Scenario | `outcome` | `authorityRevoked` | artifact | bytes |
+|---|---|---|---|---|
+| artifacts preserved, evidence present | `reaped` | 0 | `authoritative: true` | **readable**; `repo/` gone, `artifacts/` gone, `evidence/` kept |
+| evidence removed out of band before the pass | `reaped` | **1** | `authoritative: false` | event `artifact.authority_revoked.v1` written |
+| workspace already `cleaned` (any pre-fix pass) | **not selected** | — | **`authoritative: true`** | **unreadable** |
+| reclaim refuses (recorded `rootPath` mismatch) | `quarantined` | 0 | **`authoritative: true`** | **unreadable** |
+| artifact URI outside the recorded `rootPath` | `reaped` | 0 | **`authoritative: true`** | unreadable (hypothetical: production URIs are built from `rootPath`) |
+| evidence present, `final-snapshot.json` deleted | `reaped` | 0 | `authoritative: true` | manifest readable, snapshot gone (the manifest is self-contained) |
+
+So: **yes, I can construct authority rows that survive with unreadable bytes** — three ways.
+The honest statement of the mechanism is "on the pass that reclaims a workspace in a
+non-terminal state, rows whose URI is under the recorded `rootPath` and is not readable are
+demoted". The code comment says "a guard demotes **any** authority row whose bytes are
+gone", and the commit says the guard addresses "bytes … removed by a pass that ran before
+this fix" — but a workspace reaped before this commit is `cleaned`, which is terminal,
+which `runReaperPass` excludes. The one case the comment names is precisely the case the
+query cannot reach. F-G16, and a documentation defect.
+
+Two consequences of retaining evidence in place that the commit does not state: the
+evidence directory now lives for ever under `<workspaceRoot>` with no retention policy
+(Gate Q is OPEN), and its survival depends on a directory nothing owns — which is why the
+demotion exists at all.
+
+## 4. F-G4 — documented, and the documented bound is false
+
+Two measurements, both with the window held open by a 2 GiB file (the technique the shipped
+F-G5 test uses: hold the window, do not race it):
+
+| Write during the hash | `complete` | `stopReason` | recorded digest |
+|---|---|---|---|
+| same size, in place, `mtime` moves | false | **`unstable`** | none |
+| same size, in place, `mtime` restored through the JS seconds API (δ ≈ 0.47 µs) | false | **`unstable`** | none |
+| same size, in place, `mtime` restored exactly (`utimensat`, δ = 0 ns) | **true** | null | the **pre-write** content |
+
+The after-check works, and it is a real improvement: the ordinary same-size rewrite is now
+contested instead of silently hashed. The adversarial one is not, and the consequence is
+worse than the doc says. Reproduced on a 1 GiB file whose first 4 KiB were rewritten to
+`0x42` during the final walk, with `mtime` restored exactly:
+
+```
+baselineDigest == finalDigest     9b0a8ffd…  (identical)
+complete: true   stopReason: null   changeCount: 0   no row for payload.bin
+manifest.complete: true  →  Artifact.authoritative: true
+on-disk first 8 bytes: [66,66,66,66,66,66,66,66]
+mtime restored exactly, size unchanged, ctime changed (not compared)
+```
+
+The doc's bounding sentence — "It cannot make a changed file look unchanged *relative to
+the baseline*" — is therefore **false**, and I have to correct my own record too: the SEC-605
+addendum repeated that bound under F-G4's Impact. It was wrong then and it is wrong now.
+
+Is it acceptable? Not as written. The mechanism is confined to a live writer during
+capture, which the design excludes by assumption (G-06), not by code. But (a) `ctime` is in
+the same `Stats` and an attacker cannot set it, so a one-line comparison closes it; (b) the
+gate's only stated bound on the residual is the sentence I just falsified. Answer to the
+question asked: **it reopens G-08** — not as "the walk may be inconsistent", which is now
+admitted, but as "an inconsistency can be steered into a false negative", which is a
+different and worse property.
+
+## 5. F-G5 — the final component is closed; the FIFO and the parent are not
+
+| Attempt | Result |
+|---|---|
+| symlink swap after `lstat` | `UnstableEntryError` (`ELOOP` from `O_NOFOLLOW`) — **closed** |
+| hard link to a **different** inode, same size | `UnstableEntryError`: "inode 66305:7599761 is not the 66305:7599760 that was classified" — **closed** |
+| same inode, same size, rewritten **before** the open | hashes the new bytes (a truthful digest of the moment) — not a defect |
+| **swap to a FIFO** after `lstat` | `open()` **did not settle in 3 s**; POSIX says it blocks until a writer exists — the walk hangs, and with it the activity (F-G17) |
+| **swap a parent directory** to a symlink after its `readdir` | measured escape, below |
+
+The parent swap, made deterministic (2 GiB holder file; swap after the descriptor was
+observed in `/proc/self/fd`):
+
+```
+entries: aaa-evil/aaa-big, aaa-evil/group, aaa-evil/hostname, aaa-evil/hosts,
+         aaa-evil/os-release, aaa-evil/passwd
+aaa-evil/passwd.sha256 == sha256(/etc/passwd)   true
+complete: true   stopReason: null
+```
+
+A **complete, authoritative** snapshot carrying `/etc/passwd`'s, `/etc/group`'s and
+`/etc/hostname`'s digests. The design doc admits the window exists, so the existence is not
+a new finding — but its compensating sentence is wrong: "The identity check makes the swap
+*detected* whenever the target is a different inode, which is every case except a
+same-inode/same-size substitution." In a parent swap the `lstat` happens **after** the swap,
+so it describes whatever the link points at and the identity check agrees by construction.
+The only cases the check detects are swaps of the final component. F-G12 (documentation) and
+the G-04/G-05 caveat.
+
+## 6. F-G6 — bound to the record, not to the truth of the change list: confirmed
+
+Constructed a real initial/final pair (2 changes), captured a genuine summary, verified it,
+then rewrote the manifest body keeping both genuine snapshot digests:
+
+| Presentation | `verifyManifestFile` |
+|---|---|
+| genuine summary + genuine body, correct `expected` | `null` (verified) |
+| body: `changes: []`, `changeCount: 0`, **both genuine digests kept**, envelope made consistent (digest, checksum, size, count) | **`null` (accepted)** |
+| body: one **fabricated** change row added, genuine digests kept, envelope consistent | **`null` (accepted)** |
+| envelope `complete: false` against a body `complete: true` | refused — "body is complete=true but the summary says complete=false" |
+| `expected.initialManifestDigest` wrong | refused — "the workspace recorded initial aaaa…, not 27c4…" |
+| `expected: null` | accepted (no anchor) |
+
+So the fix does what it claims: the body is parsed, the digest is re-derived with the same
+canonical writer, `complete`/`authoritative` cannot contradict, and both digests are bound
+to the row written before the agent existed. The change list is not re-derived from the
+snapshots — nothing holds the snapshots at persist time — so a writer who controls the
+manifest file can still assert any change list with genuine anchors.
+
+**Does it matter?** Only for a writer who can write `evidence/`. The sandbox binds
+`repoPath` to `/workspace` and nothing else (`sandbox.ts:312`), so `evidence/` is a sibling
+the agent's mount table does not contain; the reviewer's original conclusion stands — this is
+hardening against a same-UID/worker compromise (Gate A, OPEN), not an agent path. Keep it as
+Informational, with one addition: `workspaceEvidenceBinding` returns `null` when the row is
+missing, so a result whose workspace row was deleted is verified with no anchor at all — the
+caller treats "cannot contradict" as "verified". Not reachable today (the reaper keeps rows),
+worth a comment.
+
+### F-G7…F-G10 — carried forward, none fixed and none claimed fixed
+
+| ID | Status | Note |
+|---|---|---|
+| **F-G7** | **Open, Low** | `.git` changes still produce no change row (measured, case K above). Now that the link target is inside the digest this is a reporting gap, not a detection gap. |
+| **F-G8** | **Superseded by F-G12** | The `child_process` sentence was corrected and is now accurate ("an allowlist over the spawn boundary, not a package-wide ban"). The containment table row still reads "lexical containment … on every directory **and** every entry", which is true of path strings and silent about parent components; the prose below the table now says the opposite, honestly. |
+| **F-G9** | **Open, Informational** | `persistResult` and `workspaceEvidenceBinding` still resolve the newest run → newest attempt → derived workspace, not the execution in context; `workspaceEvidenceBinding` uses the same rule, so the check and the write agree with each other but can both describe the wrong attempt under overlapping runs. |
+| **F-G10** | **Open, Informational** | `artifactIdFor`/`evidenceIdFor` still omit `orgId`; the upsert matches on `id`. Unreachable while `Task.id` is a server UUID. |
+
+## 7. The six git attacks — re-measured, still closed
+
+Each attack is run twice: once through the command the old collector used (the control) and
+once through the snapshot pair (the measurement).
+
+| Attack | Control | Manifest |
+|---|---|---|
+| staging (`git add -A`) | `git diff` **0 bytes** | `modified`, `after.sha256` = on-disk bytes, `changeCount: 1` |
+| clean filter | `git diff` 0 bytes, **filter ran** (marker) | `modified`, on-disk bytes |
+| commit | `git status` empty, `git diff` 0 bytes | `modified`, `changeCount: 1` |
+| textconv | `git diff` 115 bytes, **textconv ran** | `modified`, on-disk bytes |
+| external diff (`GIT_EXTERNAL_DIFF`) | **ran** (marker) | `modified` |
+| hooks (`pre-commit`) | **ran** on `git commit` | `modified`, `changeCount: 1` |
+
+No regression. The commit's only change in this area is `hashRegularFile` and the git
+metadata reader, and neither is on the git-command path.
+
+## 8. Phase 3–6 regression — none found
+
+`git diff 9461d27 cfc1f26` touches six source files, all evidence/claim/workspace/docs:
+`execute-agent.ts`'s changes are `let finalStatus/finalError`, the `gap` correction and the
+status propagation; no condition, threshold or ordering in the cgroup, budget, volume,
+isolation or termination path changed. `persist-result.ts` adds one read
+(`workspaceEvidenceBinding`) before the existing verification. `reaper.ts` adds
+`keepEvidence: true` and the demotion; `reclaim.ts` splits one flag into two. No
+`cgroup.ts`, `termination.ts`, `sandbox.ts` or volume file is touched.
+
+Measured: `execution-{boundary,claim,identity}` **72 passed**; `isolation-gate` **4/4
+passed** including "refuses a vm profile, ends the attempt failed, and launches nothing",
+"ignores forged environment claims" and "cannot be downgraded by a forged activity input
+field"; `cpu-budget`/`volumes`/`io-limits` **19 passed, 4 skipped** (the pre-existing
+host-limited set). The claim at the launch site, context-only identity, release semantics,
+write authority, isolation, volume ownership, output cap, CPU budget and VM fail-closed all
+still hold.
+
+## 9. Test integrity — no weakening, and the new tests are sensitive
+
+`git diff --numstat` over the test files: 477/0, 150/**1**, 157/**1**, 65/**1**, 225/0,
+92/0. The three deleted lines are import rewrites (`createWorkspaceManager, evidencePath`,
+`workspacePath, WorkspaceState`, `mkdir, mkdtemp, readdir, symlink, writeFile`). No `.only`,
+no `it.fails`, no retry, no sleep, and the only `skipIf` is on the new F-G2 suite (no
+existing assertion was made conditional). My SEC-605 addendum recorded "0 deleted lines"
+for `9461d27`; this commit's diff deletes three, all import rewrites.
+
+A test that cannot fail is not evidence, so each fix was reverted on a scratch copy of
+`HEAD` and its test re-run:
+
+| Mutation | Test file | Result |
+|---|---|---|
+| M1 enumerate `.git/hooks` by path again (`readdir` follows the link) | `snapshot-escape` | **1 failed / 7 passed** — the F-G1 negative |
+| M2 drop `O_NOFOLLOW` + all identity checks | `snapshot-race` | **2 failed / 1 passed** — inode swap and size change |
+| M3 `evidenceGap()` always `null` (pre-F-G2 behaviour) | `evidence-capture-failure` | **1 failed / 2 passed** — the failed-run test |
+| M4 keep the gap, return the adapter's status unchanged | `evidence-capture-failure` | **1 failed / 2 passed** — `result.status` was `succeeded` |
+| M5 `keepEvidence: !artifactsPreserved` (pre-F-G3) | `reaper` | **1 failed / 18 passed** — evidence-kept test |
+| M6 stop `verifyManifestFile` after the hash check | `evidence-provenance` | **2 failed / 9 passed** — anchor and completeness refusals |
+| M7 remove `revokeUnbackedAuthority` | `reaper` | **1 failed / 18 passed** — the demotion test |
+
+Seven for seven, and in each mutant the controls stayed green, which is what makes the
+failure the finding rather than a broken fixture.
+
+One adequacy gap: `evidence-capture-failure.test.ts` is `skipIf(!temporalEnabled)`, so on a
+host without Temporal all three F-G2 tests skip and nothing asserts `EVIDENCE_MISSING`.
+Also, its final `complete` step composes `result.status === 'succeeded' ? 'succeeded' :
+'failed'` in the test rather than calling the real workflow, so the production mapping
+(`outcomeOf`) is still not exercised end to end — mild, and the same shape as N13.
+
+## 10. The nine residuals
+
+The only enumerated residual list in the artifacts is `TRUSTED-SNAPSHOT-DESIGN.md`'s eight
+numbered limitations plus the parent-swap paragraph, which is nine. I evaluate that list;
+if the implementer's list differs, the per-item reasoning below still applies to the same
+properties.
+
+| # | Residual | Accurate? | Acceptable for a gate claiming evidence authority? |
+|---|---|---|---|
+| 1 | Endpoints, not history | **Yes** — two snapshots, no interval | **Yes.** Stated; a reverted change is invisible by construction. |
+| 2 | No content pre-image | **Yes** | **Yes.** Hashes identify, they do not reconstruct. |
+| 3 | Hard links hashed twice | **Yes** — measured: a hard link to a different inode is refused by dev/ino; two names to one inode are both described | **Yes.** Paths, not inodes, is the right model here. |
+| 4 | Mount crossings walked | **Yes.** The agent cannot create a mount (no `CAP_SYS_ADMIN`, no `--dev-bind` of a host path), so it is a host-configuration risk, not an agent one | **Yes**, with Gate D as the bound. |
+| 5 | No rename detection | **Yes** | **Yes.** Add+delete is the honest answer. |
+| 6 | Non-UTF-8 names "represented lossily rather than rejected" | **No.** Measured: one such name makes the snapshot `complete: false`, `stopReason: "unreadable"`, and the entry is absent entirely — the walk stops | **No.** The file is hidden and the whole manifest is downgraded by one `writeFile`. F-G15. |
+| 7 | Same-size rewrite with `mtime` restored | Mechanism **yes**; the bound ("cannot make a changed file look unchanged relative to the baseline") **no** — measured `changeCount: 0` with the file changed | **No, as written.** Fix is one line (`ctime`), or the bound must be struck. F-G12. |
+| 8 | This is not isolation / same-UID open | **Yes** | **Yes.** Stated plainly, and Gate A is OPEN in the matrix. |
+| 9 | A parent directory swapped between `readdir` and `open` is not closed | Existence **yes**; the compensating claim ("detected whenever the target is a different inode") **no** — the `lstat` follows the swap, so identity agrees | **Yes as a residual**, **no as stated.** The window is only reachable with a live writer, which G-06 excludes by assumption; say so. F-G12. |
+
+## New findings
+
+### F-G11 — High — `.git` at any depth is excluded from the walk and described nowhere, so an agent can write arbitrary content the manifest never sees
+
+`packages/workspace-manager/src/snapshot.ts:732` (`name === GIT_DIRECTORY` skipped at every
+depth), `readGitMetadata` (`:487`) which only reads `<root>/.git`,
+`TRUSTED-SNAPSHOT-DESIGN.md:41` ("`.git` excluded at any depth | skipped in the walk,
+recorded as metadata instead").
+
+Measured with a pre-existing `sub/.git` (the shape a nested repo or submodule has, and one
+an agent can create on its first line of work):
+
+```
+baseline: a.txt, sub/.git/seed.txt        (sub/.git invisible)
+agent writes sub/.git/payload.bin
+final:  entries [a.txt, sub]              (payload invisible)
+        changeCount 0, changes [], complete true, stopReason null
+        before.digest === after.digest    (true)
+        git metadata mentions "sub"       (false)
+→ manifest complete:true → Artifact.authoritative:true
+```
+
+And from a clean baseline where the agent creates the directory itself, the change list is
+`[sub added]` and nothing about what `sub` contains; `.git` inside it is not even listed as
+a directory.
+
+Impact: the workspace tree is the evidence; a directory the agent fully controls, at any
+depth, is not described by `entries`, not covered by `git`, and produces no change row. The
+agent can put arbitrary bytes there (bounded only by Gate D) and an authoritative manifest
+will report no change. No race, no forgery, no assumption violated, and the API shows
+`authoritative: true, complete: true`.
+
+The exclusion itself is defensible (walking every nested `.git` object store is expensive
+and usually noise). The defect is that the exclusion is **invisible and undocumented**. Fix
+one of: skip `.git` only at the root and walk nested ones like any directory; or emit a
+`dir` entry for every nested `.git` plus a metadata record (count, total bytes, and a digest
+of its files) so "content exists here and was not described" is a fact in the snapshot; or,
+at minimum, add the nested paths to `git.oversize`/a new `excluded` list so
+`complete: false`. Add the test: a write under `sub/.git` must change the digest or the
+manifest.
+
+### F-G12 — Medium — three statements the gate relies on are false
+
+1. `TRUSTED-SNAPSHOT-DESIGN.md:80` (Limitations 7): "It cannot make a changed file look
+   unchanged *relative to the baseline*." Measured false (§4 above: identical digests,
+   `changeCount: 0`, file changed, `complete: true`).
+2. §"What 'never descend through a link' covers": "The identity check makes the swap
+   *detected* whenever the target is a different inode". False for a parent swap — the
+   `lstat` follows the swapped parent, so identity agrees by construction (§5 above).
+3. `snapshot.ts:732` / design table (`:41`): nested `.git` is "recorded as metadata instead". It is
+   recorded nowhere (F-G11).
+
+Remediation: (1) compare `ctimeMs`/`ctimeNs` in the after-check — an attacker cannot set
+`ctime`, and my attack is detected by it for free; (2)/(3) reword to what the code does, or
+make the code do what the words say.
+
+### F-G13 — Medium — the agent can deterministically make its own evidence non-authoritative and still succeed
+
+`execute-agent.ts:1092-1110`; `evidence.ts:391-441`. `evidenceGap()` is non-null only when
+the final capture *throws*. A bounded walk is not a throw:
+
+- one `truncate` to 9 GiB (sparse, one syscall) → `complete: false`,
+  `stopReason: final-incomplete`, `authoritative: false`, **task `succeeded`**;
+- one file with a non-UTF-8 name → `complete: false`, `stopReason: unreadable`, the file
+  absent from `entries`, **task `succeeded`** (F-G15);
+- 50 001 files → `max-entries`, same shape.
+
+F-G2's invariant is now "if a baseline exists, a *missing* final manifest fails the
+attempt". The agent's cheapest way to make the evidence unusable is no longer to remove it
+(the run fails) but to bound it (the run succeeds). Nothing consumes `authoritative`, so the
+practical difference from F-G2 for a reviewer who reads task status is nil. Either fail the
+attempt when a *leased* workspace's final manifest is non-authoritative for a
+content-reachable reason, or have `completeTaskActivity` refuse `succeeded` when the newest
+attempt has a baseline and no authoritative manifest. Decide it explicitly; today it is an
+undocumented product decision that reads as a hole.
+
+### F-G14 — Medium — the F-G1 anomaly is in the digest and nowhere a reviewer looks
+
+`evidence.ts:426` (the summary is built from the manifest), `apps/api/src/artifacts/artifact-summary.ts:16-37`. The link target is
+in the canonical body (good), but `EvidenceSummary` has no field for it, no audit event is
+written, no log mentions it, and the artifact summary exposes only `authoritative`,
+`evidenceSource`, `manifestDigest`, checksum and size. An authoritative manifest with `hooksDirectoryLinkTarget:
+"/etc"` is rendered as `authoritative: true, changeCount: 0`. Add a `gitAnomalies`/`excluded`
+field to `EvidenceSummary` and surface it; do not downgrade completeness (that would hand
+back the switch).
+
+### F-G15 — Medium — a single non-UTF-8 filename stops the walk and hides the file
+
+`snapshot.ts` uses `readdir` with the default string encoding, then `statOrUndefined` on the
+joined string. Measured: one file named `<0xff><0xfe>.txt` → `complete: false`,
+`stopReason: "unreadable"`, entry absent. Two consequences: the file is invisible to the
+manifest, and one `writeFile` downgrades every subsequent manifest of that workspace. The
+doc says "represented lossily rather than rejected", which is neither what happens nor the
+right behaviour. `readdir(..., { encoding: 'buffer' })` and carrying the name as bytes (or
+recording it as `undecodable` with its digest) is the honest fix; until then, the doc must
+say the entry stops the walk.
+
+### F-G16 — Medium — the demotion guard is not an invariant; terminal rows are never revisited
+
+`reaper.ts:266,286-288` (the candidate query excludes `TERMINAL_STATES`), `:533` (the guard
+runs only after a successful reclaim), `:595-613` (the comment claims "any authority row").
+
+Constructed: a `cleaned` workspace whose evidence was removed out of band keeps
+`authoritative: true` and an unreadable URI forever; a `quarantined` workspace (reclaim
+refused, or `rm` failed after removing `evidence/`) is likewise never revisited. The commit
+names "a pass that ran before this fix" as the case it repairs; those rows are exactly the
+ones the query cannot select. Either add a repair sweep over `Artifact.authoritative = true`
+whose URI is unreadable (scoped by org, batched), or state the invariant as "at reclaim
+time".
+
+### F-G17 — Low (DoS, race-dependent) — a swapped-to-FIFO entry blocks the walk
+
+`snapshot.ts:301-310`. `O_NOFOLLOW` refuses a symlink but not a FIFO; `open(O_RDONLY)` on a
+FIFO blocks until a writer appears. Measured: `hashRegularFile(fifo, staleRegularStat)` did
+not settle within 3 s. A live writer can hang a snapshot (and the activity) indefinitely.
+`O_NONBLOCK` plus the existing `fstat` (which already rejects non-regular files via the size
+and identity checks) closes it; the FIFO classification already exists for the non-race
+case.
+
+### F-G18 — Low — `completeTaskActivity` accepts `succeeded` for a failed attempt
+
+`apps/worker/src/activities/complete-task.ts:42-84`. Measured: an attempt recorded `failed`
+with `EVIDENCE_MISSING`, then `complete` with `succeeded` → accepted, task `succeeded`. The
+workflow's propagation fix is the only thing standing between the two. A cheap guard: when
+`attemptId` is named and the attempt is terminal, refuse a status that disagrees with
+`RUN_STATUS[attempt.status]`.
+
+### F-G19 — Low — a failed baseline is still silent
+
+`execute-agent.ts:701-710`; `evidence.ts:331-357`. A `null` baseline is a warning log: no
+audit event, no column, no record. The final absence now has `attempt.evidence_failed.v1`;
+the initial one has nothing. Not agent-reachable in this deployment (the baseline precedes
+the process, and a clone cannot produce a `000` directory), so the severity is about
+honesty, not exploitability.
+
+### F-G20 — Low (documentation) — stale records and one orphaned comment
+
+- `PHASE6-GATE-MATRIX.md`, `TEST-RESULTS.md`, `EVIDENCE-INDEX.md`, `REMEDIATION-REGISTER.md`
+  all still say "Commit: 9461d27" and the register still says "IN FIX" for F-G1…F-G6; the
+  tree they describe is `cfc1f26`. Honest as a record of the reviewed commit, but they were
+  added/edited *in this commit*, so the artifact set now contradicts itself.
+- `TRUSTED-SNAPSHOT-DESIGN.md:3` says "full suite 875/15 skipped"; it is 899/15/84.
+- `EVIDENCE-INDEX.md` says "15 models"; the gate matrix says 16.
+- `persist-result.ts:494-501`: the `resolveWorkspaceId` doc comment is now stacked above
+  `workspaceEvidenceBinding`'s own comment, so it documents the wrong function.
+
+## G-01…G-20 matrix (old → new; unchanged rows carry their prior verdict)
+
+(Only the rows whose verdict changed are argued; the rest are re-stated so the matrix is
+read as a whole.)
+
+| # | Question | Round 1 | **Now** | Evidence |
+|---|---|---|---|---|
+| **G-01** | Git staging cannot shape authority | PASS | **PASS** | re-measured: `git diff` 0 B, manifest `modified`, on-disk sha (§7) |
+| **G-02** | Clean/smudge filter cannot execute during snapshotting | PASS | **PASS** | re-measured: filter ran for the control, not for the snapshot; disk bytes hashed |
+| **G-03** | Hooks, external diff, textconv cannot execute during snapshotting | PASS | **PASS** | re-measured: all three fired for the controls, none for the pair |
+| **G-04** | A symlink or path replacement cannot escape the workspace | **FAIL** | **PARTIAL** | Persistent escapes closed (hooks dir, `.git`, HEAD, config, index, hook entry) — nothing from `/etc` in any field. Parent swap measured: `complete: true` with `/etc/passwd`'s digest. Nested `.git` is a coverage hole, not an escape (F-G11). |
+| **G-05** | A file cannot change during capture without detection | **FAIL** | **PARTIAL** | Ordinary same-size rewrite now `unstable`; `mtime`-restored rewrite undetected and measured to hide a change (F-G12). |
+| **G-06** | The final snapshot cannot occur while an agent process is active | PASS (caveat) | **PASS** (caveat, now load-bearing) | `:844` after `runtime.execute` (`:1149` on the thrown path); the guarantee is `--unshare-pid`/`--die-with-parent`, not the evidence code. G-04/G-05's residuals are exactly the cases a live writer enables. |
+| **G-07** | Evidence cannot be persisted before the initial snapshot exists | PASS | **PASS** | unchanged: `initial === null` ⇒ no summary ⇒ no artifact |
+| **G-08** | Cleanup cannot happen before final evidence is durable | **PARTIAL** | **PASS** | Reaper keeps `evidence/` beside the artifact copy; URI readable after `reaped`; `repo/` and `artifacts/` gone. Guard scope: F-G16. |
+| **G-09** | A client or the agent cannot mark its own artifact authoritative | PASS | **PASS** | unchanged: only `persist-result.ts:382` writes the column; adapter cannot set `evidence` |
+| **G-10** | An artifact cannot be replayed across tenants, tasks or attempts | PARTIAL | **PARTIAL** | unchanged (IDs omit `orgId`; replay binding is newest attempt/run) |
+| **G-11** | A malformed or truncated manifest cannot pass verification | **PARTIAL** | **PASS** | body parsed, digest re-derived, complete/authoritative consistency enforced, both digests bound to `ExecutionWorkspace`; wrong anchor refused. The change list is still unbound (F-G6, informational). |
+| **G-12** | Legacy artifacts cannot be mistaken for authoritative | PASS | **PASS** | unchanged |
+| **G-13** | A failure path cannot silently produce a successful task state | **FAIL** | **PASS** | `chmod 000` ⇒ `failed` + `EVIDENCE_MISSING` + event + 0 authority + task `failed`; two controls. The downgrade path is F-G13, a different row's question. |
+| **G-14** | The trust boundary is not overstated | PASS (one comment) | **FAIL** | three false statements (F-G12) and a fourth in `snapshot.ts` (nested `.git`) |
+| **G-15** | Phase 3–6 findings still hold | PASS | **PASS** | 72 + 23 phase-5 + 4/4 isolation-gate; diff touches no resource/isolation file |
+| **G-16** | The staging test fails on the pre-fix behaviour | PASS | **PASS** | §7 controls; §9 M1 |
+| **G-17** | The provenance test fails on the pre-fix code | PASS (reasoned) | **PASS (measured)** | M6: reverting the body/anchor binding fails 2 tests |
+| **G-18** | No assertion weakened, no test skipped-as-passed, no retry added | PASS | **PASS** | 3 deleted lines, all imports; M1–M7 (§9); no `.only`/`fails`/sleep |
+| **G-19** | Suites, types and lint are green | PASS | **PASS** | 899/15/84; 97 e2e; lint 0; typecheck 0 |
+| **G-20** | The gate's own claim: the agent no longer authors the evidence used to judge it | **FAIL** | **FAIL** | Content: unshaped for git, unreadable outside the tree, undeletable without failure. But the agent chooses *coverage* (nested `.git`, silently) and *authority* (bounded walk, labelled) and the task still succeeds. |
+
+**Gate G is not PASS (its own status stays PARTIAL); this review's verdict is FAIL.**
+F-G1/F-G2/F-G3 closed; F-G11 High open; G-14 FAIL.
+
+## What the gate still does not establish
+
+1. **Completeness.** `.git` at any depth is undescribed (F-G11), a non-UTF-8 name hides its
+   file and truncates the walk (F-G15), and a bounded walk is a success (F-G13).
+2. **Authenticity.** Still no signature; same-UID compromise open (Gate A).
+3. **Containment under a live writer.** Parent swap and `mtime`-restored rewrite are real
+   (§4, §5) and the identity check does not see either.
+4. **That evidence survives indefinitely.** It is retained in place with no retention
+   policy; the demotion guard only runs at reclaim time (F-G16).
+5. **That `authoritative` means anything to a consumer.** Nothing refuses on it; it is
+   descriptive.
+6. **That a failed attempt cannot be written as a succeeded task.** The workflow's
+   propagation prevents it; the terminal write does not (F-G18).
+7. **History, pre-image, mounted filesystems, renames** — unchanged and labelled.
+8. **That a non-sandboxed adapter would be safe.** G-06 is the load-bearing assumption for
+   §4 and §5, and it lives outside the evidence code.
+
+## What I would refuse to ship
+
+1. **The nested-`.git` exclusion as it stands** (F-G11). An authoritative manifest that says
+   "no changes" while the agent writes arbitrary content into `sub/.git/` is the exact
+   inversion this gate exists to remove, and it needs no adversary beyond the agent.
+2. **The sentence "It cannot make a changed file look unchanged relative to the baseline"**
+   (F-G12 #1) while it is false. Either compare `ctime` (one line) or strike the bound and
+   say "a live writer during capture can hide its own change".
+3. **"The identity check makes the swap detected whenever the target is a different inode"**
+   (F-G12 #2) while the parent swap is measured and undetected.
+4. **A task status of `succeeded` with `authoritative: false` and no failure event**
+   (F-G13), unless the product decision is written down where the next reviewer will read it.
+5. **A reaper guard described as "any authority row"** when it runs on one pass and never
+   returns (F-G16).
+
+I would **not** refuse the commit for F-G14…F-G20: none of them makes a gate statement
+untrue that is not already in (1)–(5), and each has a cheap fix.
+
+## What I tried and could not do
+
+- Get any foreign hash through `.git` metadata: link, gitfile, gitfile pointing at
+  `/etc/passwd`, HEAD, config, index, a symlinked hook entry. All refused or recorded as a
+  target string.
+- Reopen the `chmod 000` hole: the attempt fails, the event is bound, the artifact count is
+  zero, the task is `failed`. The two controls pass, so this is not "everything fails".
+- Make the reaper drop evidence on its measured path, or keep an authority row alive after
+  the reaper removed its bytes on that path.
+- Defeat the identity check with a hard link to a different inode or a symlink swap.
+- Forge a manifest that contradicts `ExecutionWorkspace` and have it persisted.
+- Find a persistent (race-free) path out of the tree.
+- Weaken an assertion, delete a test, add `.only`/`fails`/a retry, or make a new test pass
+  on reverted behaviour (seven mutations, seven failures).
+- Regress Phase 3–6: 72 claim/boundary/identity, 4/4 isolation-gate including VM
+  fail-closed, 23 phase-5 targeted, 899 full, 97 e2e, lint 0, typecheck 0.
+
+What I could do is in F-G11…F-G20. **F-G11** (High) and **F-G12** (which makes G-14 FAIL) are
+the reason the verdict is FAIL; **F-G13** is why G-20 stays failing.
+
+## Test and probe evidence gathered during this addendum
+
+| Item | Command / artefact | Result |
+|---|---|---|
+| full suite | `npx vitest run` | **899 passed, 15 skipped, 84 files** |
+| API e2e | `apps/api`: `npx vitest run --dir test` | **97 passed, 7 files** |
+| workspace-manager | `npx vitest run packages/workspace-manager/test` | **144 passed, 13 files** |
+| worker | `npx vitest run apps/worker/test` | **274 passed, 12 skipped, 26 files** |
+| boundary/claim/identity | `execution-{boundary,claim,identity}.test.ts` | **72 passed** |
+| isolation-gate | verbose | **4/4 passed**, including VM refusal and forged-input refusal |
+| phase-5 targeted | `isolation-gate`, `cpu-budget`, `volumes`, `io-limits` | **23 passed, 4 skipped** |
+| typecheck | `tsc -p packages/workspace-manager`, `tsc -p apps/worker` | **0** / **0** |
+| lint | `eslint` on all 12 changed source/test files | **0** |
+| P1 F-G1 matrix | `.cache/sec606/probes/p1-fg1.mts` | 14 cases; §1 table |
+| P2 parent swap | `p2-parent-swap.mts` | `complete: true`, `/etc/passwd` digest recorded |
+| P3 F-G2 + controls | `p3-fg2.mts` (real DB + Temporal) | 4 scenarios; §2 table |
+| P4 F-G3 | `p4-fg3.mts` (real `runReaperPass`) | 6 scenarios; §3 table |
+| P5 F-G6 | `p5-fg6.mts` | forged change list accepted; anchors refused when wrong |
+| P6 six git attacks | `p6-git.mts` | 6/6 controls fired, 6/6 manifests correct |
+| P7/P8 F-G4 | `p7-fg4.mts`, `p8-fg4-manifest.mts` | identical digests, `changeCount: 0`, file changed |
+| P9 F-G5 | `p9-fg5.mts` | hard link refused, symlink refused, FIFO hung |
+| P11 nested `.git` | `p11-nested-git.mts` | `changeCount: 0`, digest unchanged, payload invisible |
+| mutations M1–M7 | `/home/ubuntu/.cache/sec606/mutate.sh` | 7/7 fixes fail when reverted |
+
+Verification status: **verified** for every command and probe result quoted above. F-G11,
+F-G13, F-G15, F-G16 and the F-G4 consequence are **measured**, not reasoned. The only
+reasoned items are the reachability qualifiers on G-04/G-05 (they need a live writer during
+capture, which G-06 excludes by assumption, not by code) and F-G19 (not agent-reachable in
+this deployment).

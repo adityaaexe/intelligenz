@@ -146,8 +146,13 @@ Such a row can be neither claimed (`classifyLostClaim`: `running` requires a cla
 not have), nor adopted (`adoptReservedAttempt` requires `queued`), nor completed (the
 completion arm's `foreign` predicate is `null !== executionRunId` → true for **everyone**,
 including its own execution), nor reaped (`claim-release.ts` selects `status: 'queued'`
-only). Its task never reaches a terminal state, and the refused completion is swallowed with
-a log line while its `task.failed.v1` is still emitted — task and audit trail disagree.
+only). **The workflow cannot advance its task**: completion is refused for everyone, including
+its own execution. An operator can still cancel it through `POST /cancel`, which accepts a
+`queued` or `running` task and writes `cancelled` (`tasks.service.ts:1037`, `:1064`); what is
+true is that the workflow cannot finish it, not that nothing can. The refused completion is
+swallowed with a log line while its `task.failed.v1` is still emitted — task and audit trail
+disagree. This paragraph used to say the task "never reaches a terminal state", which ignored
+the operator path.
 
 **Fail-closed and migration-window-only.** The predicate is deliberately not relaxed:
 treating an unclaimed `running` attempt as belonging to whoever asks would hand every
