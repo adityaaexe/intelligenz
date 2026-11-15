@@ -245,7 +245,16 @@ describe.skipIf(!enabled)('isolation tier gate', () => {
 
   it('proceeds under restricted-shared-kernel and records the effective tier', async () => {
     const fixture = await tenant('isolation-restricted');
-    const task = await createTask(client, fixture, { title: 'Ordinary restricted run' });
+    // `[simulate:ok]` is the documented goal marker (`local-simulated.ts`, "Forcing the
+    // failure bucket"), not a retry or a weakened assertion. Without it this fixture is a
+    // coin flip: the simulated adapter fails `hash(taskId + goal) % 1000 < 150`, and the
+    // task id is a fresh UUID, so ~15% of runs land in the failure bucket and the
+    // `succeeded` assertion below fails for a reason that has nothing to do with the
+    // isolation tier. The marker makes the outcome a property of the fixture instead.
+    const task = await createTask(client, fixture, {
+      title: 'Ordinary restricted run',
+      goal: 'Fix the failing test in src/sum.js and prove it passes. [simulate:ok]',
+    });
 
     const result = await withResourceProfile(undefined, () =>
       executeAgentActivity({

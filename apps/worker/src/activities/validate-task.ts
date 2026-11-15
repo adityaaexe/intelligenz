@@ -5,6 +5,11 @@ import type {
   ValidateTaskActivityResult,
 } from '../shared/contracts';
 import { computeTaskContentHash, readTaskBinding, resolveBinding } from '../approvals/task-binding';
+import {
+  EXECUTION_CLAIM_REFUSED,
+  claimExecution,
+  executionIdentity,
+} from './claim';
 import { db, nonRetryableWithDetails } from './support';
 
 /**
@@ -69,6 +74,20 @@ import { db, nonRetryableWithDetails } from './support';
  * `code`. `APPROVAL_REQUIRED` alone would tell an operator nothing; `APPROVAL_NOT_RESERVED`
  * says "this run did not come through the API", `APPROVAL_STALE` says "the task changed
  * after it was approved", and those are different incidents.
+ *
+ * ## Phase 6: conditions 1–6 were a read, and a read cannot arbitrate a race
+ *
+ * Every condition above is a `SELECT`. Two executions holding the same genuine
+ * `attemptId` could therefore both observe `queued` and both pass — the window between
+ * the read and anything that spends it was the TOCTOU, and Temporal's workflow-id dedupe
+ * was the only thing preventing two agents. The claim (`./claim`) is the write that
+ * closes it: one conditional `UPDATE … WHERE status = 'queued' AND claimedByWorkflowRunId
+ * IS NULL`, executed last so a refusal never spends the claim, and before any activity
+ * that could provision a workspace, create a cgroup, open a broker connection or call
+ * `runtime.execute`.
+ *
+ * The claim's identity is the Temporal run id read from the **activity context**, not
+ * from this activity's input: an input field can be set by whoever starts the workflow.
  *
  * ## Residual
  *
@@ -191,7 +210,73 @@ export async function validateTaskActivity(
     if (bindingRefusal !== null) throw refusalFailure(bindingRefusal, task);
   }
 
+  // ── Phase 6: the one-shot claim — the last thing that happens here ────────────
+  //
+  // Deliberately last. Everything above is a gate whose failure must not spend the
+  // claim: a run refused for a stale approval, a bad binding or a forged attempt must
+  // leave the reservation available to the execution that is entitled to it. And
+  // deliberately here rather than in a later activity: this is the first activity the
+  // workflow calls, and `executeAgentActivity` is a *separate* activity, so there is no
+  // ordering in which provisioning, a cgroup, a broker call or `runtime.execute` can
+  // happen before a claim exists.
+  //
+  // It runs for every execution that names an attempt, not only approval-gated ones. An
+  // attempt is the API's reservation of one execution whatever the task's risk class,
+  // and the duplicate-execution hole was never approval-specific: `validateTaskActivity`
+  // used to read the attempt and check its status only when an approval was involved,
+  // so two starts of a LOW task with the same attempt id both passed.
+  const attemptId = input.attemptId?.trim();
+
+  if (attemptId !== undefined && attemptId.length > 0) {
+    await claimForExecution(task, attemptId, input);
+  }
+
   return { runnable: true, task };
+}
+
+/**
+ * Claims the attempt this execution named, or throws the typed refusal.
+ *
+ * The identity resolution is the load-bearing part: `executionIdentity` reads Temporal's
+ * run id from the activity context, so an execution cannot choose the name it claims
+ * under. A caller that named an attempt but supplied no identity at all — the shape of a
+ * direct invocation — is refused rather than allowed to proceed unclaimed.
+ */
+async function claimForExecution(
+  task: { readonly id: string; readonly orgId: string; readonly projectId: string },
+  attemptId: string,
+  input: ValidateTaskActivityInput,
+): Promise<void> {
+  const workflowRunId = executionIdentity({
+    ...(input.workflowRunId === undefined ? {} : { workflowRunId: input.workflowRunId }),
+  });
+
+  if (workflowRunId === undefined) {
+    throw nonRetryableWithDetails(
+      EXECUTION_CLAIM_REFUSED,
+      `Task ${task.id} names attempt ${attemptId} but no execution identity; an attempt ` +
+        'can only be claimed by an execution that can be named, and this call has no ' +
+        'Temporal run id.',
+      {
+        reason: 'execution_claim',
+        code: EXECUTION_CLAIM_REFUSED,
+        taskId: task.id,
+        projectId: task.projectId,
+        attemptId,
+      },
+    );
+  }
+
+  await claimExecution({
+    orgId: task.orgId,
+    taskId: task.id,
+    projectId: task.projectId,
+    attemptId,
+    workflowRunId,
+    // The request correlation when there is one; otherwise the execution itself, which
+    // is a server-side id and the thing a claim is actually about.
+    correlationId: input.correlationId ?? workflowRunId,
+  });
 }
 
 /**

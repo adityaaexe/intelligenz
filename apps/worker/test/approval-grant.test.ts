@@ -167,6 +167,10 @@ function validate(taskId: string, attemptId?: string): Promise<unknown> {
     taskId,
     orgId: tenant.orgId,
     ...(attemptId === undefined ? {} : { attemptId }),
+    // Phase 6: a direct activity call has no Temporal execution context, so the claim
+    // needs an explicit identity. Derived from the attempt so both calls in a test are
+    // the same execution — which is what the idempotency test depends on.
+    ...(attemptId === undefined ? {} : { workflowRunId: `test-execution-${attemptId}` }),
   });
 }
 

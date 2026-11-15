@@ -48,6 +48,24 @@ export interface ValidateTaskActivityInput {
    * spent.
    */
   readonly attemptId?: string;
+  /**
+   * Phase 6. The request this run belongs to, used as the correlation id on the execution
+   * claim's audit rows. Optional because a direct invocation (a test, an operational
+   * script) has no request; the claim falls back to the execution identity, which is a
+   * server-side id either way.
+   */
+  readonly correlationId?: string;
+  /**
+   * Phase 6. Temporal's run id — **only consulted when the activity has no execution
+   * context**, which is the direct-invocation case. Inside a worker the activity reads
+   * `Context.current().info.workflowExecution.runId`, because an input field is a
+   * parameter and a parameter can be forged by anything that can start a workflow,
+   * while the execution context is set by the server that dispatched the attempt.
+   *
+   * This is the same id `RecordStartActivityInput.workflowRunId` carries, and it is *not*
+   * `WorkflowRun.id`.
+   */
+  readonly workflowRunId?: string;
 }
 
 /** Everything the workflow needs to build an event envelope without touching the DB. */

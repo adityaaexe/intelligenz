@@ -623,6 +623,26 @@ model ExecutionAttempt {
   /// succeed and still leave bytes behind.
   cleanupState      String?
 
+  // ─── Phase 6: the one-shot execution claim ───────────────────────────────
+  /// The **Temporal** run id (`workflowInfo().runId` in the workflow;
+  /// `Context.current().info.workflowExecution.runId` in the activity) of the one
+  /// execution that claimed this attempt for execution. NULL means unclaimed.
+  ///
+  /// Not the same id space as `workflowRunId` above: that column is a foreign key to
+  /// `WorkflowRun.id`, which the API writes *before* the workflow exists. This column
+  /// holds the orchestrator's per-execution id, which is what distinguishes two
+  /// executions from one execution retrying an activity. The name follows the phase
+  /// contract; the comment exists because the collision is otherwise a trap.
+  ///
+  /// Write-once. The only writer is a conditional UPDATE whose predicate requires
+  /// `status = 'queued'` and this column NULL, so a second claimant gets count 0
+  /// instead of a second grant.
+  claimedByWorkflowRunId String?
+  /// When the claim was granted. NULL means never claimed — never back-filled, because
+  /// a fabricated timestamp would make an unclaimed row indistinguishable from a
+  /// claimed one.
+  claimedAt              DateTime?
+
   // Restrict: attempt history is the audit trail for "how many times did we try".
   organization Organization @relation(fields: [orgId], references: [id], onDelete: Restrict)
   task         Task         @relation(fields: [taskId], references: [id], onDelete: Cascade)
@@ -642,6 +662,11 @@ model ExecutionAttempt {
   @@index([orgId, createdAt])
   // Foreign-key maintenance for the SetNull above, not a read path.
   @@index([agentRunId])
+  // The claim read path: "which attempt did this execution claim", and the operator
+  // question "what did run X claim". Not unique: one execution may legitimately hold
+  // several attempts (a retry after a crash is a new attempt), so uniqueness is per
+  // (attempt), enforced by the conditional UPDATE, not per claim holder.
+  @@index([claimedByWorkflowRunId])
 }
 
 /// Ordered, redacted record of what an agent did during a run.

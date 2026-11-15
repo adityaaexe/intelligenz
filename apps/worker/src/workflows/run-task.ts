@@ -9,6 +9,7 @@ import {
 } from '@temporalio/workflow';
 
 import type * as activitiesModule from '../activities';
+import { AGENT_ACTOR_ID } from '../shared/actors';
 import type {
   RunTaskWorkflowInput,
   RunTaskWorkflowResult,
@@ -80,13 +81,6 @@ const executorActivities = proxyActivities<typeof activitiesModule.activities>({
   },
 });
 
-/**
- * A stable id for the worker as an audit actor. Not a user row: `actorType` is `agent`,
- * and inventing a user id would misattribute every run to a person. A fixed v5-shaped
- * UUID keeps it greppable and valid for `EventEnvelope.actor.id`.
- */
-const AGENT_ACTOR_ID = '00000000-0000-5000-8000-000000000001';
-
 export async function runTaskWorkflow(
   input: RunTaskWorkflowInput,
 ): Promise<RunTaskWorkflowResult> {
@@ -106,6 +100,13 @@ export async function runTaskWorkflow(
       // against the grant's `consumedByAttemptId` — but a workflow that dropped it would
       // make every approval-gated run unrefusable-by-omission.
       ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
+      // Phase 6: the request the run belongs to, for the claim's audit rows. The claim's
+      // *identity* is not taken from here — the activity reads the workflow run id from
+      // its own execution context, which a caller cannot forge.
+      correlationId,
+      // Consulted only if the activity has no execution context (a direct invocation);
+      // inside Temporal the context supplies the same value from the server side.
+      workflowRunId: runId,
     });
 
     if (!validation.runnable) {

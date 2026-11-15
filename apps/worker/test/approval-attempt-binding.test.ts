@@ -193,6 +193,10 @@ function validate(taskId: string, attemptId?: string): Promise<unknown> {
     taskId,
     orgId: owned.orgId,
     ...(attemptId === undefined ? {} : { attemptId }),
+    // Phase 6: no Temporal execution context in a direct call, so the execution identity
+    // is supplied explicitly. Derived from the attempt: these tests are about one
+    // execution of one reservation.
+    ...(attemptId === undefined ? {} : { workflowRunId: `test-execution-${attemptId}` }),
   });
 }
 
