@@ -72,6 +72,9 @@ describe('F-G1 — a symlinked .git/hooks is recorded, never enumerated', () => 
     // The link is described the way every other link in this module is described: by its
     // target. That is a fact about the tree, so it belongs in the evidence.
     expect(snapshot.git.hooksDirectoryLinkTarget).toBe('/etc');
+    // …and it is also on the anomaly list, so the worker can write it somewhere a
+    // reviewer looks without parsing digests (F-G14).
+    expect(snapshot.git.anomalies).toContain('hooks-directory-link:/etc');
 
     // Nothing from /etc was enumerated, so nothing from /etc can be in the digest.
     expect(snapshot.git.hooks).toEqual([]);
@@ -104,6 +107,9 @@ describe('F-G1 — a symlinked .git/hooks is recorded, never enumerated', () => 
     // If this fails while the test above passes, the negative proves nothing: it would be
     // passing because hooks are never read at all.
     expect(snapshot.git.hooksDirectoryLinkTarget).toBeNull();
+    // The positive control for F-G14 too: a real hooks directory is not an anomaly, so the
+    // durable record the worker writes for one cannot fire on every normal repository.
+    expect(snapshot.git.anomalies).toEqual([]);
     expect(hook).toMatchObject({
       name: 'pre-commit',
       kind: 'file',
@@ -164,6 +170,9 @@ describe('F-G1 — .git itself, as a link and as a gitfile', () => {
       hooksDirectoryLinkTarget: null,
     });
     expect(snapshot.git.gitfileSha256).toBe(sha256(`symlink:${outside}`));
+    // A `.git` that is a link is not a checkout layout; the anomaly list says so in words
+    // as well as in the digest (F-G14).
+    expect(snapshot.git.anomalies).toContain(`git-link:${outside}`);
     expect(JSON.stringify(snapshot)).not.toContain(sha256(marker));
   });
 

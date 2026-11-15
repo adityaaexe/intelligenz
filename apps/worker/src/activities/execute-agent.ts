@@ -63,9 +63,12 @@ import { classifyTermination, type TerminationReason } from '../termination';
 import { materializeArtifacts } from './artifacts';
 import {
   captureFinalEvidenceOutcome,
-  captureInitialEvidence,
+  captureInitialEvidenceOutcome,
+  EVIDENCE_ERROR_CODES,
+  evidenceFailureMessage,
   type EvidenceCaptureFailure,
   type EvidenceSummary,
+  type InitialEvidence,
 } from './evidence';
 import {
   RUN_STATUS,
@@ -436,7 +439,9 @@ export async function executeAgentActivity(
   // to attach what it measured. `null` means "no manifest", which is a different and
   // honest statement from "an empty manifest": the agent never gets to make the absence
   // look like a clean bill of health.
-  let initialEvidence: Awaited<ReturnType<typeof captureInitialEvidence>> = null;
+  let initialEvidence: InitialEvidence | null = null;
+  /** Why the baseline could not be taken. `null` when it was. */
+  let initialEvidenceFailure: EvidenceCaptureFailure | null = null;
   let finalEvidence: EvidenceSummary | null = null;
   /**
    * Why the final manifest is missing, when a baseline existed.
@@ -513,16 +518,23 @@ export async function executeAgentActivity(
   }
 
   /**
-   * The evidence gap for this attempt, or `null` when there is none.
+   * The evidence failures for this attempt, in the order they were discovered.
    *
-   * The `initialEvidence === null` arm is not a convenience. A runtime that leases no
-   * workspace never takes a baseline, so it owes no manifest; treating that absence as a
-   * failure would fail every simulated run for a report it was never asked to produce.
+   * Two things are checked and they are different facts:
+   *
+   * - the **baseline** could not be taken (F-G19): the attempt never had a tree to compare,
+   *   so it cannot be reviewed and must not succeed;
+   * - the **final** manifest is missing (F-G2) or present but not authoritative (F-G13):
+   *   a baseline existed, so a manifest was owed, and either it is absent or it stopped
+   *   early.
+   *
+   * A run that leases no workspace never takes a baseline and owes no manifest, so both
+   * lists stay empty for it.
    */
-  function evidenceGap(): EvidenceCaptureFailure | null {
-    if (initialEvidence === null) return null;
-
-    return finalEvidenceFailure;
+  function evidenceGaps(): readonly EvidenceCaptureFailure[] {
+    return [initialEvidenceFailure, finalEvidenceFailure].filter(
+      (gap): gap is EvidenceCaptureFailure => gap !== null,
+    );
   }
 
   /**
@@ -546,7 +558,7 @@ export async function executeAgentActivity(
     try {
       await db().auditEvent.create({
         data: {
-          id: deterministicId(`attempt-evidence-failed:${attemptRow.id}:final`),
+          id: deterministicId(`attempt-evidence-failed:${attemptRow.id}:${gap.phase}`),
           orgId: activityInput.orgId,
           actorType: 'system',
           actorId: `worker:${workerIdentity()}`,
@@ -555,20 +567,31 @@ export async function executeAgentActivity(
           aggregateId: attemptRow.id,
           eventType: 'attempt.evidence_failed.v1',
           correlationId: activityInput.correlationId,
-          idempotencyKey: `attempt.evidence_failed.v1:${attemptRow.id}:final`,
+          idempotencyKey: `attempt.evidence_failed.v1:${attemptRow.id}:${gap.phase}`,
           payload: {
             taskId: activityInput.taskId,
             attemptId: attemptRow.id,
             attemptNumber: attemptRow.attemptNumber,
             workflowRunId: workflowRun.id,
             workspaceId,
-            phase: 'final',
+            // Which capture failed: a baseline and a final walk are different incidents,
+            // and the F-G19 invariant is about the first.
+            phase: gap.phase,
             code: gap.code,
             reason: gap.reason,
             // The digest of the tree the attempt *was* measured against. Without it,
             // "no manifest" is a fact with no anchor; with it, the baseline it failed to
             // compare against is named.
             initialManifestDigest: initialEvidence?.digest ?? null,
+            // F-G13: an incomplete manifest is not a reason to leave the record vague.
+            // `stopReason` is the manifest's own reason; `snapshotStopReason` is the walk's
+            // (`max-entries`, `max-total-bytes`, `unreadable`, `unstable`), and the counts
+            // are what the bounded walk reached before it stopped.
+            stopReason: gap.stopReason,
+            snapshotStopReason: gap.snapshotStopReason,
+            entryCount: gap.entryCount,
+            totalBytes: gap.totalBytes,
+            changeCount: gap.changeCount,
             recordedAt: new Date().toISOString(),
             worker: workerIdentity(),
           },
@@ -582,6 +605,68 @@ export async function executeAgentActivity(
       workerLogger().error(
         { attemptId: attemptRow.id, err: error instanceof Error ? error.message : String(error) },
         'attempt.evidence_failed.v1 could not be written; the failure is only in the log',
+      );
+    }
+  }
+
+  /**
+   * Record `.git` metadata anomalies durably — F-G14.
+   *
+   * The anomaly is inside the digest already, which is what makes it comparable, but a
+   * reviewer reads an artifact summary, not a canonical body. `authoritative: true,
+   * changeCount: 0` therefore used to be able to hide a symlinked `.git/hooks` completely.
+   * One event per attempt, naming both endpoints so an anomaly that *disappeared* between
+   * baseline and final is visible too.
+   *
+   * Never throws: an audit write is not allowed to replace the run's outcome.
+   */
+  async function recordEvidenceAnomalies(
+    activityInput: ExecuteAgentActivityInput,
+    attemptRow: { readonly id: string; readonly attemptNumber: number },
+    workspaceId: string | null,
+  ): Promise<void> {
+    const initialAnomalies = initialEvidence?.snapshot.git.anomalies ?? [];
+    const finalAnomalies = finalEvidence?.gitAnomalies ?? [];
+
+    if (initialAnomalies.length === 0 && finalAnomalies.length === 0) return;
+
+    try {
+      await db().auditEvent.create({
+        data: {
+          id: deterministicId(`attempt-evidence-anomaly:${attemptRow.id}`),
+          orgId: activityInput.orgId,
+          actorType: 'system',
+          actorId: `worker:${workerIdentity()}`,
+          action: 'attempt.evidence_anomaly',
+          aggregateType: 'ExecutionAttempt',
+          aggregateId: attemptRow.id,
+          eventType: 'attempt.evidence_anomaly.v1',
+          correlationId: activityInput.correlationId,
+          idempotencyKey: `attempt.evidence_anomaly.v1:${attemptRow.id}`,
+          payload: {
+            taskId: activityInput.taskId,
+            attemptId: attemptRow.id,
+            attemptNumber: attemptRow.attemptNumber,
+            workflowRunId: workflowRun.id,
+            workspaceId,
+            initialAnomalies,
+            finalAnomalies,
+            // Not a downgrade: the anomaly stays out of `authoritative` on purpose, because
+            // turning it into one would hand the agent a switch that disables evidence.
+            // The record is what makes it visible instead.
+            recordedAt: new Date().toISOString(),
+            worker: workerIdentity(),
+          },
+          occurredAt: new Date(),
+        },
+        select: { id: true },
+      });
+    } catch (error) {
+      if ((error as { code?: string }).code === 'P2002') return;
+
+      workerLogger().error(
+        { attemptId: attemptRow.id, err: error instanceof Error ? error.message : String(error) },
+        'attempt.evidence_anomaly.v1 could not be written; the anomaly is only in the digest',
       );
     }
   }
@@ -698,12 +783,19 @@ export async function executeAgentActivity(
       // so a previous attempt's committed mess appears as pre-existing state — which is
       // exactly what the next approver needs to know before reading a manifest that says
       // "only these paths changed".
-      initialEvidence = await captureInitialEvidence(lease.handle);
+      const baseline = await captureInitialEvidenceOutcome(lease.handle);
+
+      initialEvidence = baseline.evidence;
+      initialEvidenceFailure = baseline.failure;
 
       if (initialEvidence === null) {
         workerLogger().warn(
-          { taskId: input.taskId, workspaceId: lease.id },
-          'No initial workspace snapshot: this attempt can produce no change manifest',
+          {
+            taskId: input.taskId,
+            workspaceId: lease.id,
+            reason: initialEvidenceFailure?.reason ?? 'unknown',
+          },
+          'No initial workspace snapshot: this attempt can produce no change manifest and will be failed',
         );
       } else {
         await recordInitialSnapshot({
@@ -873,6 +965,10 @@ export async function executeAgentActivity(
           'Host change manifest captured',
         );
       }
+
+      // F-G14: an anomaly is in the digest, but a reviewer reads the summary. The record
+      // is written for the final state and the baseline state, so it cannot be silent.
+      await recordEvidenceAnomalies(input, attempt, lease.id);
     }
 
     const parsed = ExecutionResult.safeParse(raw);
@@ -1074,33 +1170,42 @@ export async function executeAgentActivity(
 
     // ── No evidence, no success ────────────────────────────────────────────────
     //
-    // The invariant: **if an initial snapshot exists for this attempt, a missing final
-    // manifest is a failure of the attempt.** The baseline is a promise that the run will
-    // be describable; a run that then removes the ability to describe it — `chmod 000` on
-    // one directory is enough — has not succeeded, whatever its adapter returned.
+    // The invariant: **if this attempt took a baseline, a final manifest that is missing
+    // or not authoritative is a failure of the attempt.** The baseline is a promise that
+    // the run will be describable; a run that then removes the ability to describe it —
+    // `chmod 000` on one directory is enough — has not succeeded, whatever its adapter
+    // returned. F-G13 extends the same invariant to a manifest that exists but stopped
+    // early: a bounded walk is not a truthful answer either, and the flag that says so was
+    // consumed by nothing.
     //
-    // Before this, the failure was silent in the worst way: `captureFinalEvidence` returned
-    // `null`, nothing was attached, the attempt was finalised `succeeded`, and "no
-    // manifest" was indistinguishable from "the agent changed nothing".
+    // F-G19 extends it in the other direction: a baseline that could not be taken is not
+    // silence either. The attempt has no manifest from the start, so it cannot be reviewed
+    // and must not report success.
+    //
+    // Before this, both failures were silent in the worst way: `captureFinalEvidence`
+    // returned `null`, nothing was attached, the attempt was finalised `succeeded`, and
+    // "no manifest" was indistinguishable from "the agent changed nothing".
     //
     // The status vocabulary is unchanged — this is `failed`, with the reason in `error`.
     // `terminationReason` stays `completed` because the *process* did complete; conflating
     // "how the tree stopped" with "whether the claim holds" is what the two columns are for.
     //
-    // A run with no baseline (a runtime that leases no workspace) never had a manifest to
-    // lose, so `evidenceGap()` is `null` and this branch is unreachable for it.
-    const gap = evidenceGap();
+    // A run that leases no workspace never takes a baseline and owes no manifest, so
+    // `evidenceGaps()` is empty and this branch is unreachable for it.
+    const gaps = evidenceGaps();
 
-    if (gap !== null) {
-      await recordEvidenceFailure(gap, input, attempt, lease === undefined ? null : lease.id);
+    if (gaps.length > 0) {
+      for (const gap of gaps) {
+        await recordEvidenceFailure(gap, input, attempt, lease === undefined ? null : lease.id);
+      }
 
       if (finalStatus === 'succeeded') {
+        const primary = gaps[0] as EvidenceCaptureFailure;
+
         finalStatus = 'failed';
         finalError = {
-          code: 'EVIDENCE_MISSING',
-          message:
-            'The final workspace snapshot could not be taken, so this attempt has no change ' +
-            `manifest and cannot be reviewed: ${gap.reason}`,
+          code: EVIDENCE_ERROR_CODES[primary.code],
+          message: evidenceFailureMessage(primary),
           retryable: false,
         };
       }
@@ -1161,6 +1266,10 @@ export async function executeAgentActivity(
           digest: finalEvidence.finalManifestDigest,
         });
       }
+
+      // F-G14 on the failure path too: an anomaly that is present while the run crashed is
+      // still an anomaly a reviewer must be able to find.
+      await recordEvidenceAnomalies(input, attempt, lease.id);
     }
 
     // A throw can also be a resource kill: the adapter reports a non-zero exit as a
@@ -1228,13 +1337,10 @@ export async function executeAgentActivity(
 
     // The thrown path already reaches `failed`, so this cannot change the outcome — but the
     // *record* is still owed: "this attempt's evidence is missing" must be findable without
-    // reading a log line, on every path that can produce it.
-    {
-      const gap = evidenceGap();
-
-      if (gap !== null) {
-        await recordEvidenceFailure(gap, input, attempt, lease === undefined ? null : lease.id);
-      }
+    // reading a log line, on every path that can produce it. Same list as the success path,
+    // so a baseline that could not be taken is recorded here too (F-G19).
+    for (const gap of evidenceGaps()) {
+      await recordEvidenceFailure(gap, input, attempt, lease === undefined ? null : lease.id);
     }
 
     // A budget kill is terminal on purpose. `retryable` is the adapter's opinion of its

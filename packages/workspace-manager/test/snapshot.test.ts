@@ -231,6 +231,11 @@ describe('takeWorkspaceSnapshot — the digest', () => {
 
     expect(second.digest).toBe(first.digest);
     expect(second.capturedAt).not.toBe('');
+    // The negative control for F-G4's ctime check: reading a tree twice must not turn
+    // every entry into a false positive.
+    expect(first.complete).toBe(true);
+    expect(second.complete).toBe(true);
+    expect(second.stopReason).toBeNull();
     // The timestamp is outside the digested body on purpose: "the tree is the same" must
     // be a fact, not an inference from two equal-looking timestamps.
     expect(second.digest).toBe(snapshotDigest(first));

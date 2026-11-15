@@ -522,14 +522,44 @@ async function reapOne(deps: ReaperDeps, candidate: Candidate): Promise<ReaperAc
     });
   }
 
-  // ── No authority row without readable bytes ─────────────────────────────────
+  // ── Demote authority this reclaim left pointing at nothing ──────────────────
   //
-  // The retention above is the fix, and this is the guard that makes it an invariant
-  // rather than a convention. Bytes can still be gone: deleted out-of-band, lost with a
-  // volume, or removed by a pass that ran before this fix. When that is true, an
-  // `authoritative: true` row is a claim pointing at nothing, so it is demoted with the
-  // reason recorded **in the same transaction** — the demotion and the explanation cannot
-  // disagree, and a retry cannot demote twice without also finding the first record.
+  // The retention above is the fix for F-G3; this is the repair for rows that fix cannot
+  // reach — bytes deleted out-of-band, lost with a volume, or removed by a pass that ran
+  // before it. When that is true, an `authoritative: true` row is a claim pointing at
+  // nothing, so it is demoted with the reason recorded **in the same transaction** — the
+  // demotion and the explanation cannot disagree, and a retry cannot demote twice without
+  // also finding the first record.
+  //
+  // This is **not** a universal invariant, and an earlier version of this comment said it
+  // was (D-07). It covers two dimensions, both narrower than "any authority row":
+  //
+  //   1. **The workspace being reclaimed.** `cleaned`, `quarantined` and `cleanup_failed`
+  //      rows are excluded from the candidate query above, and the orphan sweep selects
+  //      `completed`/`failed` rows with `cleanedAt: null` — so a row that has reached
+  //      `cleaned` or `quarantined` is never revisited by either. Its bytes can disappear
+  //      afterwards and it keeps `authoritative: true`. A `quarantined` row is not demoted
+  //      on purpose: quarantine is a hold for investigation, and silently rewriting the
+  //      authority of a workspace someone is examining is worse than a claim that is
+  //      explicitly historical.
+  //   2. **URIs under this workspace's recorded `rootPath`.** `revokeUnbackedAuthority`
+  //      skips any row whose URI does not start with that prefix, because a `stat` taken
+  //      from the wrong base would demote rows whose bytes are fine — an artifact-store URI,
+  //      or a path resolved elsewhere, is out of this reclaim's reach by design.
+  //
+  // What keeps the residual honest is the read path, not this column: a download of a gone
+  // file is `410 ARTIFACT_GONE`, and the artifact summary reports `integrity: 'unknown'`
+  // computed from the bytes on every request, never from the stored claim
+  // (`apps/api/src/artifacts/`). The column is a historical statement — "a host process
+  // measured these bytes at this time" — and it is not a liveness check.
+  //
+  // Proof, and its boundary: `apps/worker/test/reaper.test.ts:448` ("demotes an
+  // authoritative row whose bytes were removed, with the reason recorded") is the only test
+  // of the demotion. No test covers a `cleaned` row losing its bytes afterwards, or a URI
+  // outside `rootPath`; those are the two cases named above, not gaps that were overlooked.
+  // The decision, the residual and the trigger for a batched repair sweep are written in
+  // `docs/engineering/phase6-trust-boundary/EVIDENCE-INDEX.md`
+  // §"Artifact authority after the bytes are gone".
   const authorityRevoked = await revokeUnbackedAuthority(deps, candidate, {
     reason: 'evidence bytes are not readable for an authoritative artifact row',
   });

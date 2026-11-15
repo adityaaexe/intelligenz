@@ -63,7 +63,11 @@ describe('the baseline precedes every agent-reachable side effect', () => {
 
     const positions = {
       leaseAcquired: source.indexOf('lease = leased.lease;'),
-      baseline: source.indexOf('captureInitialEvidence(lease.handle)'),
+      // The call site that takes the baseline. It was renamed from `captureInitialEvidence`
+      // to `captureInitialEvidenceOutcome` when the failure began travelling beside the
+      // evidence (F-G19); the ordering invariant is the same one, so this anchor moves with
+      // it rather than being pinned to a name the production path no longer calls.
+      baseline: source.indexOf('captureInitialEvidenceOutcome(lease.handle)'),
       cgroup: source.indexOf('createCgroup(config.resources.cgroupRoot, workspaceId)'),
       markExecuting: source.indexOf('await markExecuting(lease, input.orgId)'),
       execute: source.indexOf('await runtime.execute(request, controller.signal)'),

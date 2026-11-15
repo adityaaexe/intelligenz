@@ -2,7 +2,7 @@ import type { RunStatus } from '@intelligenz/database';
 
 import type { CompleteTaskActivityInput, CompleteTaskActivityResult } from '../shared/contracts';
 import { executionIdentity, requireCompletionAuthority } from './claim';
-import { db, nonRetryable } from './support';
+import { db, nonRetryable, nonRetryableWithDetails } from './support';
 
 /** A terminal task status implies a terminal run status; the vocabularies differ only in name. */
 const TERMINAL_RUN_STATUS: Record<CompleteTaskActivityInput['status'], RunStatus> = {
@@ -10,6 +10,62 @@ const TERMINAL_RUN_STATUS: Record<CompleteTaskActivityInput['status'], RunStatus
   failed: 'failed',
   cancelled: 'cancelled',
 };
+
+/**
+ * A task cannot be `succeeded` when the attempt it names did not succeed — F-G18.
+ *
+ * Authority answers "may this execution write the terminal state"; it does not answer "is
+ * the state true". Before this, the second question had no owner: an attempt recorded
+ * `failed` with `EVIDENCE_MISSING` could be completed as `succeeded` — measured, accepted,
+ * task `succeeded` — because the only thing preventing it was the workflow propagating
+ * `result.status` faithfully. A guard that lives in one caller is not an invariant, and the
+ * task status is the row an operator reads.
+ *
+ * Only `succeeded` is checked, and only against **terminal** attempt statuses, because the
+ * other direction is legitimate: a task cancelled by the API while an attempt was failing
+ * records `cancelled` on a `failed` attempt, and refusing that would turn a real
+ * cancellation into a stuck task. "Nothing failed while the task passed" is the direction
+ * that cannot be true under any reading.
+ *
+ * The read is scoped by tenant and task, like every other read of this row: an attempt id
+ * from another task cannot be used to change this decision.
+ */
+async function refuseContradictorySuccess(input: CompleteTaskActivityInput): Promise<void> {
+  if (input.status !== 'succeeded' || input.attemptId === undefined) return;
+
+  const attempt = await db().executionAttempt.findFirst({
+    where: { id: input.attemptId, orgId: input.orgId, taskId: input.taskId },
+    select: { status: true },
+  });
+
+  // No row: the claim arm already decided this execution may write, and an absent attempt
+  // is not a contradiction — the pre-dispatch path has no attempt by construction.
+  if (attempt === null) return;
+
+  // Still in flight, or succeeded: nothing to refuse. `queued`/`running` are not terminal,
+  // and the terminal write itself is guarded by the status predicate in `completeTask`.
+  if (attempt.status === 'succeeded' || attempt.status === 'queued' || attempt.status === 'running') {
+    return;
+  }
+
+  throw nonRetryableWithDetails(
+    'COMPLETION_CONTRADICTS_ATTEMPT',
+    `Task ${input.taskId} was asked to record "succeeded" for attempt ${input.attemptId}, ` +
+      `which is "${attempt.status}". An attempt that did not succeed cannot produce a ` +
+      'successful task: the task row is what an operator reads, and a status that outlives ' +
+      'the record contradicting it is the failure this gate exists to prevent. The terminal ' +
+      'status is derived from the attempt result; a caller that disagrees with it has ' +
+      'already lost the run.',
+    {
+      reason: 'completion',
+      code: 'COMPLETION_CONTRADICTS_ATTEMPT',
+      taskId: input.taskId,
+      attemptId: input.attemptId,
+      attemptStatus: attempt.status,
+      requestedStatus: input.status,
+    },
+  );
+}
 
 /**
  * `completeTaskActivity` — contract §16.
@@ -49,6 +105,12 @@ export async function completeTaskActivity(
     // statuses a refusal path legitimately writes; `succeeded` without a claim is refused.
     status: input.status,
   });
+
+  // F-G18: authority answers "may this execution write"; this answers "is the write true".
+  // Runs before the write and after the authority check, so a caller who is not allowed to
+  // write at all learns that first — and the contradiction is still refused before any row
+  // changes.
+  await refuseContradictorySuccess(input);
 
   // The arm that authorised the write goes back to the caller: "this execution held the
   // claim" and "this execution was refused before any claim existed" are different facts

@@ -19,6 +19,7 @@ import {
   CHANGE_MANIFEST_KIND,
   CHANGE_MANIFEST_MEDIA_TYPE,
   EVIDENCE_SOURCE_HOST_SNAPSHOT,
+  type EvidenceCaptureFailure,
   type EvidenceSummary,
   type InitialEvidence,
 } from '../shared/evidence';
@@ -317,21 +318,35 @@ async function writeSnapshotFile(
  * Take the baseline.
  *
  * Returns `null` if the tree cannot be described (a missing checkout, a permission refusal).
- * The attempt continues: a baseline that could not be taken means this attempt has no
- * manifest from the start, and failing every run whose checkout contains one unreadable
- * directory would make the evidence path an availability risk before the agent has done
- * anything.
  *
- * The consequence is stated rather than hidden, because it is a real limit of the F-G2
- * invariant: the invariant is "**if** a baseline exists, a missing final manifest fails the
- * attempt". When the baseline itself could not be taken, there is nothing to compare and
- * the run is not failed. `captureInitialEvidence` therefore returns a `null` that means
- * "never measured", and the caller logs it — it does not mean "measured and unchanged".
+ * The attempt does **not** continue silently any more: `captureInitialEvidenceOutcome`
+ * reports the failure beside the evidence, and `executeAgentActivity` fails the attempt
+ * with `EVIDENCE_BASELINE_FAILED` and writes a durable record (F-G19). This wrapper is kept
+ * for callers that only need the evidence — a test that arranged a readable tree — and its
+ * `null` means "the baseline could not be taken", never "measured and unchanged".
  */
 export async function captureInitialEvidence(
   handle: WorkspaceHandle,
   options: { readonly maxEntries?: number; readonly maxTotalBytes?: number } = {},
 ): Promise<InitialEvidence | null> {
+  return (await captureInitialEvidenceOutcome(handle, options)).evidence;
+}
+
+/**
+ * The baseline, or the reason it could not be taken.
+ *
+ * `evidence === null` and `failure === null` cannot both happen: a capture that returns no
+ * evidence always carries the reason. They are separate fields because the caller records
+ * the evidence on `ExecutionWorkspace` and the failure in the audit trail, and one value
+ * could not do both without making "absent" ambiguous again.
+ */
+export async function captureInitialEvidenceOutcome(
+  handle: WorkspaceHandle,
+  options: { readonly maxEntries?: number; readonly maxTotalBytes?: number } = {},
+): Promise<{
+  readonly evidence: InitialEvidence | null;
+  readonly failure: EvidenceCaptureFailure | null;
+}> {
   try {
     const snapshot = await takeWorkspaceSnapshot(handle.repoPath, {
       ...(options.maxEntries === undefined ? {} : { maxEntries: options.maxEntries }),
@@ -341,30 +356,47 @@ export async function captureInitialEvidence(
     const directory = await ensureEvidenceDirectory(handle);
     await writeSnapshotFile(directory, INITIAL_SNAPSHOT_FILE, snapshot);
 
-    return { snapshot, digest: snapshot.digest, capturedAt: snapshot.capturedAt };
+    return {
+      evidence: { snapshot, digest: snapshot.digest, capturedAt: snapshot.capturedAt },
+      failure: null,
+    };
   } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+
     workerLogger().warn(
-      {
-        workspaceId: handle.id,
-        reason: error instanceof Error ? error.message : String(error),
-      },
-      'Initial workspace snapshot failed; this attempt will have no change manifest',
+      { workspaceId: handle.id, reason },
+      'Initial workspace snapshot failed; this attempt has no change manifest',
     );
 
-    return null;
+    return {
+      evidence: null,
+      // F-G19: this used to be silence. A run whose baseline could not be taken has no
+      // manifest, so it cannot be reviewed — and it is not an infrastructure retry, it is
+      // an attempt that must not report success.
+      failure: {
+        code: 'BASELINE_CAPTURE_FAILED',
+        phase: 'initial',
+        reason,
+        stopReason: null,
+        snapshotStopReason: null,
+        entryCount: null,
+        totalBytes: null,
+        changeCount: null,
+      },
+    };
   }
 }
 
 /**
- * Why a final manifest could not be produced.
+ * Why a manifest could not be produced, or was produced without authority — F-G13, F-G19.
  *
- * A reason, not an exception: the attempt's outcome is decided elsewhere, and an evidence
- * failure changes that outcome rather than replacing it with an infrastructure error.
+ * The vocabulary and the attempt-level codes live in `shared/evidence.ts` because they are
+ * the worker's evidence language, not this module's implementation: a value here would sit
+ * behind a `node:fs` import for every reader that only needs to name a failure. Re-exported
+ * so the capture sites and the executor import one module.
  */
-export interface EvidenceCaptureFailure {
-  readonly code: 'SNAPSHOT_CAPTURE_FAILED';
-  readonly reason: string;
-}
+export type { EvidenceCaptureFailure, EvidenceFailureCode } from '../shared/evidence';
+export { EVIDENCE_ERROR_CODES, evidenceFailureMessage } from '../shared/evidence';
 
 /**
  * The result of trying to capture the final evidence.
@@ -416,6 +448,29 @@ export async function captureFinalEvidenceOutcome(input: {
 
     await writeFile(uri, body, { mode: 0o600 });
 
+    // ── An incomplete manifest is written, and is a failure of the attempt ───────
+    //
+    // The file is still written: what was seen is evidence, and deleting it would throw
+    // away the bounded answer. But `complete: false` is not authority, and before F-G13
+    // nothing consumed the flag — one `truncate` to 9 GiB made the manifest
+    // non-authoritative and the task still reported `succeeded`. The failure travels with
+    // the summary so the caller fails the attempt and records why, with the counts the
+    // walk actually reached.
+    const failure: EvidenceCaptureFailure | null = manifest.complete
+      ? null
+      : {
+          code: 'SNAPSHOT_INCOMPLETE',
+          phase: 'final',
+          reason:
+            `the final walk stopped early (${finalSnapshot.stopReason ?? 'unknown'}), so the ` +
+            `change manifest is incomplete: ${manifest.stopReason ?? 'unknown'}`,
+          stopReason: manifest.stopReason,
+          snapshotStopReason: finalSnapshot.stopReason,
+          entryCount: finalSnapshot.entryCount,
+          totalBytes: finalSnapshot.totalBytes,
+          changeCount: manifest.changeCount,
+        };
+
     return {
       summary: {
         kind: CHANGE_MANIFEST_KIND,
@@ -428,6 +483,7 @@ export async function captureFinalEvidenceOutcome(input: {
         stopReason: manifest.stopReason,
         changeCount: manifest.changeCount,
         counts: manifestCounts(manifest),
+        gitAnomalies: finalSnapshot.git.anomalies,
         artifact: {
           kind: CHANGE_MANIFEST_KIND,
           uri,
@@ -437,7 +493,7 @@ export async function captureFinalEvidenceOutcome(input: {
           mediaType: CHANGE_MANIFEST_MEDIA_TYPE,
         },
       },
-      failure: null,
+      failure,
     };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
@@ -457,7 +513,18 @@ export async function captureFinalEvidenceOutcome(input: {
       // repository is not an infrastructure fault — it is a choice not to be measured, and
       // it must be visible as a failure of this attempt rather than as silence.
       failure:
-        input.initial === null ? null : { code: 'SNAPSHOT_CAPTURE_FAILED', reason },
+        input.initial === null
+          ? null
+          : {
+              code: 'SNAPSHOT_CAPTURE_FAILED',
+              phase: 'final',
+              reason,
+              stopReason: null,
+              snapshotStopReason: null,
+              entryCount: null,
+              totalBytes: null,
+              changeCount: null,
+            },
     };
   }
 }

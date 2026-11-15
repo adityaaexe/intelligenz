@@ -40,6 +40,93 @@ export interface InitialEvidence {
 }
 
 /**
+ * Why a manifest could not be produced, or was produced without authority.
+ *
+ * A reason, not an exception: the attempt's outcome is decided elsewhere, and an evidence
+ * failure changes that outcome rather than replacing it with an infrastructure error.
+ *
+ * Three codes, because the three facts are different and an operator filters on them:
+ *
+ * - `SNAPSHOT_CAPTURE_FAILED` — the final walk threw; the attempt has **no** manifest.
+ * - `SNAPSHOT_INCOMPLETE` — the final walk finished but stopped early (`maxEntries`,
+ *   `maxTotalBytes`, an unreadable entry), so the manifest exists and is not authority.
+ * - `BASELINE_CAPTURE_FAILED` — the baseline walk threw, so this attempt never had a tree
+ *   to compare against.
+ */
+export type EvidenceFailureCode =
+  | 'SNAPSHOT_CAPTURE_FAILED'
+  | 'SNAPSHOT_INCOMPLETE'
+  | 'BASELINE_CAPTURE_FAILED';
+
+export interface EvidenceCaptureFailure {
+  readonly code: EvidenceFailureCode;
+  /** Which capture failed. A durable record names the phase it belongs to. */
+  readonly phase: 'initial' | 'final';
+  readonly reason: string;
+  /** The manifest's stop reason (`final-incomplete`, `max-changes`) when there is one. */
+  readonly stopReason: string | null;
+  /** The final walk's own stop reason (`max-entries`, `max-total-bytes`, …). */
+  readonly snapshotStopReason: string | null;
+  /** Counts the bounded walk actually reached; `null` when the walk threw. */
+  readonly entryCount: number | null;
+  readonly totalBytes: number | null;
+  readonly changeCount: number | null;
+}
+
+/**
+ * The attempt-level error code for each failure.
+ *
+ * Distinct on purpose — F-G13. `EVIDENCE_MISSING` means "there is no manifest";
+ * `EVIDENCE_INCOMPLETE` means "there is one, it says it stopped early, and it is not
+ * authority"; `EVIDENCE_BASELINE_FAILED` means "there was never a tree to compare". An
+ * operator filtering on `EVIDENCE_MISSING` to find runs with no report must not also get
+ * runs that have a bounded report, and a reviewer reading a `failed` attempt must be able
+ * to tell which of the three happened without parsing prose. Overloading one code with
+ * two facts is how "no evidence" became indistinguishable from "nothing changed" in the
+ * first place.
+ */
+export const EVIDENCE_ERROR_CODES: Readonly<Record<EvidenceFailureCode, string>> = {
+  SNAPSHOT_CAPTURE_FAILED: 'EVIDENCE_MISSING',
+  SNAPSHOT_INCOMPLETE: 'EVIDENCE_INCOMPLETE',
+  BASELINE_CAPTURE_FAILED: 'EVIDENCE_BASELINE_FAILED',
+};
+
+/** The `ExecutionResult.error.message` for a failure, naming the fact that happened. */
+export function evidenceFailureMessage(failure: EvidenceCaptureFailure): string {
+  if (failure.code === 'SNAPSHOT_INCOMPLETE') {
+    // The counts are in the message because an incomplete manifest's whole value is the
+    // bound it reached: "stopped at 8 GiB after 12,004 entries" is actionable, "incomplete"
+    // is not.
+    const reached = [
+      failure.entryCount === null ? null : `${String(failure.entryCount)} entries`,
+      failure.totalBytes === null ? null : `${String(failure.totalBytes)} bytes`,
+      failure.changeCount === null ? null : `${String(failure.changeCount)} changes`,
+    ]
+      .filter((part): part is string => part !== null)
+      .join(', ');
+
+    return (
+      `The final workspace snapshot stopped early (${failure.snapshotStopReason ?? 'unknown'}), ` +
+      `so this attempt's change manifest is incomplete` +
+      `${reached.length > 0 ? ` (${reached} reached)` : ''} and cannot be reviewed: ` +
+      failure.reason
+    );
+  }
+
+  if (failure.code === 'BASELINE_CAPTURE_FAILED') {
+    return (
+      'The baseline workspace snapshot could not be taken, so this attempt has no tree to ' +
+      `compare against and cannot be reviewed: ${failure.reason}`
+    );
+  }
+
+  return (
+    'The final workspace snapshot could not be taken, so this attempt has no change ' +
+    `manifest and cannot be reviewed: ${failure.reason}`
+  );
+}
+
+/**
  * What `executeAgentActivity` tells persistence about the evidence it captured.
  *
  * Every field is written by the worker. Nothing here is copied from the adapter's result,
@@ -64,6 +151,17 @@ export interface EvidenceSummary {
   readonly stopReason: string | null;
   readonly changeCount: number;
   readonly counts: Readonly<Record<ChangeStatus, number>>;
+  /**
+   * `.git` metadata that was recorded but could not be described normally — a symlinked
+   * hooks directory, an unreadable gitfile, an oversize `config`, or a `.git` directory
+   * below the root (a nested repository, which is content — F-G11).
+   *
+   * These are inside the manifest digest already. They are carried here so the worker can
+   * write a durable record for them (F-G14): an `authoritative: true, changeCount: 0`
+   * artifact must not be able to hide an anomaly that is only visible to someone who
+   * parses the body.
+   */
+  readonly gitAnomalies: readonly string[];
   /** The file to persist, described by the worker that wrote it. */
   readonly artifact: {
     readonly kind: typeof CHANGE_MANIFEST_KIND;

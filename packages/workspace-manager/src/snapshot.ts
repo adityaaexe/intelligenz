@@ -50,23 +50,53 @@ import { SnapshotError } from './errors';
  * 2. **Special files are classified, never opened.** Opening a FIFO blocks until a writer
  *    appears, and reading a character device can block or stream forever. A snapshot of a
  *    repository containing a FIFO must not hang, so `fifo`/`socket`/`device` become
- *    `kind: 'special'` with no digest.
+ *    `kind: 'special'` with no digest. A regular file that is *swapped* for a special one
+ *    between `lstat` and `open` is refused for the same reason: descriptors are opened
+ *    `O_NONBLOCK` and only a regular `fstat` is hashed (F-G17).
  * 3. **An incomplete snapshot says so.** `maxEntries` and `maxTotalBytes` bound the walk.
  *    Exceeding either stops it and sets `complete: false` with the counts actually
  *    reached. A partial manifest that looks whole is the same failure as the empty
  *    `git diff`: a confident wrong answer.
+ * 4. **Everything visible is described.** The only exclusion is the workspace root's
+ *    `.git`, which is the repository's own metadata and is captured in
+ *    `SnapshotGitMetadata`. A `.git` at any other depth is not the root repository's
+ *    metadata, so it is walked as content like every other directory: an agent write
+ *    inside `sub/.git` changes `entries`, and therefore the digest and the manifest. It
+ *    was previously skipped at every depth and described nowhere, which made it a silent
+ *    write area (F-G11). Its presence is also recorded as a `nested-git:` anomaly, because
+ *    "this workspace holds a nested repository" is a fact a reviewer should not have to
+ *    derive from a digest (F-G14).
+ * 5. **A directory is re-checked after its children (F-G20, partial).** Each queued
+ *    directory carries the `lstat` that classified it; after its children are read, the
+ *    path is `lstat`ed again and `dev`/`ino`/`ctimeMs` are compared. A parent swapped for a
+ *    symbolic link between `readdir` and a child's `lstat` resolves the child through the
+ *    link, and the entry-level check agrees with itself because both halves were resolved
+ *    through the same link — the parent's identity does not. A mismatch sets
+ *    `parent-replaced` (identity moved) or `unstable` (`ctime` only) and **withdraws the
+ *    subtree's entries**, because a path resolved through a substituted parent can produce
+ *    a digest of a file outside the workspace. This is a **detection, not a prevention**:
+ *    without `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` every open here is
+ *    path-based, so a digest can still be computed from a momentarily-substituted path
+ *    before the re-check runs. The window is bounded by one directory's children, the
+ *    snapshot is `complete: false`, and the attempt fails (F-G13); see
+ *    `TRUSTED-SNAPSHOT-DESIGN.md` §"Parent-swap residual" for the exact claim.
  *
- * A fourth property is narrower and stated precisely because an earlier version of this
- * comment overstated it: **a file is hashed through a descriptor whose identity was
- * checked.** `open` uses `O_NOFOLLOW`, the descriptor is `fstat`ed, and `dev`/`ino`/`size`
- * are compared with the `lstat` that classified the entry. A path swapped for a different
- * inode fails the entry as `unstable` instead of hashing the replacement. A same-size
- * in-place rewrite that keeps the inode and the mtime is still not detectable by one pass;
- * see `TRUSTED-SNAPSHOT-DESIGN.md`.
+ * A sixth property is narrower and stated precisely because earlier versions of this
+ * comment overstated it: **a file is hashed through a descriptor whose identity and
+ * timestamps were checked.** `open` uses `O_NOFOLLOW`, the descriptor is `fstat`ed, and
+ * `dev`/`ino`/`size`/`ctimeMs` are compared with the `lstat` that classified the entry. A
+ * path swapped for a different inode, or rewritten in place, fails the entry as
+ * `unstable` instead of hashing the replacement. `ctimeMs` is compared again after the
+ * read; an unprivileged process can restore `mtime` but not `ctime`, which is what makes
+ * a same-size rewrite during capture detectable (F-G4).
  */
 
-/** Bumped when the canonical form changes. A digest is only comparable at its version. */
-export const SNAPSHOT_VERSION = 2;
+/**
+ * Bumped when the canonical form changes. A digest is only comparable at its version.
+ *
+ * 3 — `git.anomalies` (F-G14).
+ */
+export const SNAPSHOT_VERSION = 3;
 
 /** 50,000 entries is ~4× a large monorepo; beyond it, evidence stops being readable. */
 export const DEFAULT_MAX_ENTRIES = 50_000;
@@ -90,7 +120,14 @@ const GITFILE_MAX_BYTES = 4 * 1024;
 /** A hooks directory with more entries than this is not a hooks directory. */
 const MAX_HOOKS = 1_024;
 
-/** The directory excluded from the content manifest at every depth. */
+/**
+ * The directory excluded from the content manifest **at the workspace root only**.
+ *
+ * The root's `.git` is the repository's own metadata: expensive to walk, not the agent's
+ * work, and captured structurally by `SnapshotGitMetadata`. A `.git` at any other depth
+ * belongs to a nested repository or a submodule and is not the root repository's control
+ * surface, so it is content — see `walk`.
+ */
 export const GIT_DIRECTORY = '.git';
 
 export type SnapshotEntryKind = 'file' | 'dir' | 'symlink' | 'special';
@@ -127,7 +164,19 @@ export type SnapshotStopReason =
   | 'max-entries'
   | 'max-total-bytes'
   | 'unreadable'
+  /**
+   * The tree changed under the walk: an entry vanished, a file grew, or a directory gained
+   * or lost a child while it was being described (F-G20). The snapshot describes no single
+   * instant.
+   */
   | 'unstable'
+  /**
+   * A directory is no longer the directory that was classified — its `dev`/`ino` moved, or
+   * it became a link (F-G20). Distinguished from `unstable` because it is a different fact:
+   * the walk may have resolved children through a path that now points somewhere else, so
+   * the subtree's entries were withdrawn rather than merely marked as a moving target.
+   */
+  | 'parent-replaced'
   | null;
 
 export interface SnapshotHook {
@@ -147,8 +196,11 @@ export interface SnapshotHook {
  */
 export interface SnapshotGitMetadata {
   readonly present: boolean;
-  /** `directory` for a normal checkout, `file` for a worktree's `gitdir:` pointer. */
-  readonly kind: 'directory' | 'file' | null;
+  /**
+   * `directory` for a normal checkout, `file` for a worktree's `gitdir:` pointer,
+   * `special` for anything else (a FIFO or device at `/.git`), `null` when absent.
+   */
+  readonly kind: 'directory' | 'file' | 'special' | null;
   /** Resolved branch ref or commit id as written. `null` when absent or a gitfile. */
   readonly head: string | null;
   readonly configSha256: string | null;
@@ -173,6 +225,17 @@ export interface SnapshotGitMetadata {
   readonly oversize: readonly string[];
   /** True when the hooks directory held more than `MAX_HOOKS` entries. */
   readonly hooksTruncated: boolean;
+  /**
+   * Metadata that could not be described as a normal file, one line each.
+   *
+   * These are the same facts the fields above carry structurally — a link target, an
+   * oversize name — restated as a list so they can travel somewhere a reviewer looks
+   * without parsing digests (F-G14). They are inside the canonical body, so two
+   * snapshots whose *only* difference is an anomaly still have different digests; and
+   * the worker writes them to a durable audit record, so `authoritative: true,
+   * changeCount: 0` cannot hide one.
+   */
+  readonly anomalies: readonly string[];
 }
 
 export interface WorkspaceSnapshot {
@@ -208,6 +271,16 @@ export interface TakeSnapshotOptions {
   readonly maxTotalBytes?: number;
   /** Injected in tests so a canonical body is reproducible. */
   readonly now?: () => Date;
+  /**
+   * Called after a directory has been listed and before its children are classified.
+   *
+   * Exists for the parent-swap suite (F-G20) and for nothing else: the window between
+   * `readdir` and a child's `lstat` cannot be held open from outside the walk without a
+   * seam, in the same way `hashRegularFile` had to be exported to test the entry-level
+   * race. Production callers pass nothing, and a caller that did pass something could only
+   * make its own snapshot *more* likely to be reported incomplete.
+   */
+  readonly afterDirectoryListed?: (relativePath: string) => Promise<void> | void;
 }
 
 /**
@@ -224,6 +297,11 @@ function comparePathBytes(left: string, right: string): number {
 
 function sha256Bytes(bytes: Buffer | string): string {
   return createHash('sha256').update(bytes).digest('hex');
+}
+
+/** One deterministic order for the metadata anomaly list, so the digest is stable. */
+function normaliseAnomalies(anomalies: readonly string[]): readonly string[] {
+  return [...new Set(anomalies)].sort(comparePathBytes);
 }
 
 /**
@@ -277,23 +355,30 @@ function digestHandle(handle: FileHandle): Promise<{ sha256: string; sizeBytes: 
 }
 
 /**
- * Hash a regular file through a descriptor, refusing to follow a link or a swap.
+ * Hash a regular file through a descriptor, refusing to follow a link, a swap, or a
+ * rewrite.
  *
- * `expected` is the `lstat` that decided this path was a regular file. Four things are
+ * `expected` is the `lstat` that decided this path was a regular file. Five things are
  * checked, and each closes a different hole:
  *
  *   1. `O_NOFOLLOW` — if the final component became a symlink, `open` fails with `ELOOP`
  *      instead of reading the target. This is the `lstat` → `open` race: `lstat` says
  *      "file", the agent replaces it with `.git/… -> /etc/passwd`, and a plain
  *      `createReadStream` would have hashed the target.
- *   2. `dev`/`ino` — the descriptor must be the very inode `lstat` described. A path
- *      swapped for a different (possibly same-size) file fails here.
- *   3. `size` — the descriptor's size must be the size the budget was checked against, so
+ *   2. `O_NONBLOCK` plus `isFile()` — if the final component became a FIFO, `open` would
+ *      block until a writer appeared, hanging the walk (F-G17). Non-blocking `open`
+ *      returns immediately and the descriptor is refused unless it is a regular file.
+ *   3. `dev`/`ino`/`ctimeMs` — the descriptor must be the very inode `lstat` described,
+ *      and it must not have been written since. A path swapped for a different
+ *      (possibly same-size) file fails the identity check; a same-size in-place rewrite
+ *      fails the `ctimeMs` check, because `ctime` is not settable by an unprivileged
+ *      process (F-G4).
+ *   4. `size` — the descriptor's size must be the size the budget was checked against, so
  *      a file that grew after `lstat` cannot exceed `maxTotalBytes` unannounced.
- *   4. `size` and `mtimeMs` again after hashing — a writer that appended or rewrote while
- *      the stream was open is detected. A same-size rewrite that also restores `mtimeMs`
- *      is **not** detected; one pass cannot see it, and pretending otherwise is the
- *      overstatement this check replaced.
+ *   5. `size`, `mtimeMs` and `ctimeMs` again after hashing — a writer that appended,
+ *      rewrote or truncated while the stream was open is detected. A same-size rewrite
+ *      that also restores `mtimeMs` is caught by `ctimeMs`; the previous version of this
+ *      check said it was not, and the design document's corresponding bound was false.
  *
  * Exported for the escape suite: the identity comparison is the subject of a test and
  * cannot be triggered deterministically without holding a stale `lstat`.
@@ -302,26 +387,46 @@ export async function hashRegularFile(
   absolute: string,
   expected: Stats,
 ): Promise<{ sha256: string; sizeBytes: number }> {
-  const handle = await open(absolute, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW).catch(
-    (error: NodeJS.ErrnoException) => {
-      // `O_NOFOLLOW` turns "the final component became a symlink" into an error rather
-      // than a read of the target. `ELOOP` is exactly that swap, so it is contested (the
-      // entry is not what `lstat` described) rather than unreadable.
-      if (error.code === 'ELOOP' || error.code === 'EMLINK') {
-        throw new UnstableEntryError(absolute, 'became a symbolic link after classification');
-      }
+  const handle = await open(
+    absolute,
+    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+  ).catch((error: NodeJS.ErrnoException) => {
+    // `O_NOFOLLOW` turns "the final component became a symlink" into an error rather
+    // than a read of the target. `ELOOP` is exactly that swap, so it is contested (the
+    // entry is not what `lstat` described) rather than unreadable.
+    if (error.code === 'ELOOP' || error.code === 'EMLINK') {
+      throw new UnstableEntryError(absolute, 'became a symbolic link after classification');
+    }
 
-      throw error;
-    },
-  );
+    throw error;
+  });
 
   try {
     const opened = await handle.stat();
+
+    // A FIFO, socket, device or directory opened without blocking is still not the
+    // regular file `lstat` described. Reject before any read: `createReadStream` on a
+    // FIFO would wait for a writer, which is the hang `O_NONBLOCK` exists to avoid.
+    if (!opened.isFile()) {
+      throw new UnstableEntryError(
+        absolute,
+        'is no longer a regular file (opened a special file or directory)',
+      );
+    }
 
     if (opened.dev !== expected.dev || opened.ino !== expected.ino) {
       throw new UnstableEntryError(
         absolute,
         `inode ${String(opened.dev)}:${String(opened.ino)} is not the ${String(expected.dev)}:${String(expected.ino)} that was classified`,
+      );
+    }
+
+    // `ctime` is the timestamp a writer cannot set. `mtime` is under `utimes`' control,
+    // which is why the same-size-rewrite detection cannot rest on it alone.
+    if (opened.ctimeMs !== expected.ctimeMs) {
+      throw new UnstableEntryError(
+        absolute,
+        `ctime moved from ${String(expected.ctimeMs)} to ${String(opened.ctimeMs)} before the read`,
       );
     }
 
@@ -335,10 +440,14 @@ export async function hashRegularFile(
     const digest = await digestHandle(handle);
     const after = await handle.stat();
 
-    if (after.size !== opened.size || after.mtimeMs !== opened.mtimeMs) {
+    if (
+      after.size !== opened.size ||
+      after.mtimeMs !== opened.mtimeMs ||
+      after.ctimeMs !== opened.ctimeMs
+    ) {
       throw new UnstableEntryError(
         absolute,
-        `written during capture (${String(opened.size)}→${String(after.size)} bytes, mtime ${String(opened.mtimeMs)}→${String(after.mtimeMs)})`,
+        `written during capture (${String(opened.size)}→${String(after.size)} bytes, mtime ${String(opened.mtimeMs)}→${String(after.mtimeMs)}, ctime ${String(opened.ctimeMs)}→${String(after.ctimeMs)})`,
       );
     }
 
@@ -437,7 +546,12 @@ async function readSmallFileNoFollow(
   let handle: FileHandle;
 
   try {
-    handle = await open(absolute, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    // `O_NONBLOCK` matters here too: this helper is called only for a path `lstat`
+    // classified as a regular file, but a swap can turn it into a FIFO before the open.
+    handle = await open(
+      absolute,
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+    );
   } catch {
     return null;
   }
@@ -479,6 +593,9 @@ async function readHead(absolute: string): Promise<string | null> {
 /**
  * Read the git metadata the content manifest deliberately excludes.
  *
+ * Only the **workspace root's** `.git` is read here. A nested `.git` is content — see
+ * `walk` — because it is not the root repository's metadata and the agent can write it.
+ *
  * Never follows the `.git` pointer: a worktree's `.git` is a *file* containing
  * `gitdir: /somewhere`, and following it would leave the tree this snapshot claims to
  * describe. For a worktree the pointer's hash is recorded and the remaining fields are
@@ -496,6 +613,7 @@ async function readGitMetadata(root: string): Promise<SnapshotGitMetadata> {
     hooksDirectoryLinkTarget: null,
     oversize: [],
     hooksTruncated: false,
+    anomalies: [],
   };
 
   const gitPath = join(root, GIT_DIRECTORY);
@@ -520,6 +638,7 @@ async function readGitMetadata(root: string): Promise<SnapshotGitMetadata> {
       // `.git` *file* containing exactly this path string and a `.git` *link* to it are
       // different facts, and an unprefixed hash would represent both as one value.
       gitfileSha256: sha256Bytes(`symlink:${target ?? ''}`),
+      anomalies: normaliseAnomalies([`git-link:${target ?? ''}`]),
     };
   }
 
@@ -537,14 +656,21 @@ async function readGitMetadata(root: string): Promise<SnapshotGitMetadata> {
       kind: 'file',
       gitfileSha256: bytes === null ? null : sha256Bytes(bytes),
       oversize: bytes === null ? [GIT_DIRECTORY] : [],
+      anomalies: bytes === null ? normaliseAnomalies(['gitfile-unreadable']) : [],
     };
   }
 
   if (!stat.isDirectory()) {
-    return { ...empty, present: true, kind: 'file' };
+    return {
+      ...empty,
+      present: true,
+      kind: 'special',
+      anomalies: normaliseAnomalies(['git-special']),
+    };
   }
 
   const oversize: string[] = [];
+  const anomalies: string[] = [];
 
   const digestMetadata = async (name: string): Promise<string | null> => {
     const absolute = join(gitPath, name);
@@ -556,6 +682,8 @@ async function readGitMetadata(root: string): Promise<SnapshotGitMetadata> {
     if (candidate === undefined) return null;
 
     if (candidate.isSymbolicLink()) {
+      anomalies.push(`metadata-link:${name}`);
+
       try {
         return sha256Bytes(`symlink:${await readlink(absolute)}`);
       } catch {
@@ -567,6 +695,7 @@ async function readGitMetadata(root: string): Promise<SnapshotGitMetadata> {
 
     if (candidate.size > GIT_METADATA_MAX_BYTES) {
       oversize.push(name);
+      anomalies.push(`metadata-not-hashed:${name}`);
       return null;
     }
 
@@ -576,6 +705,7 @@ async function readGitMetadata(root: string): Promise<SnapshotGitMetadata> {
       // Oversize, contested, or unreadable: all three leave the same gap, and the gap is
       // what has to be visible rather than a digest of something else.
       oversize.push(name);
+      anomalies.push(`metadata-not-hashed:${name}`);
       return null;
     }
   };
@@ -586,6 +716,11 @@ async function readGitMetadata(root: string): Promise<SnapshotGitMetadata> {
   ]);
 
   const head = await readHead(join(gitPath, 'HEAD'));
+
+  // A HEAD that could not be read — a link, an oversize file, an I/O error — is a gap in
+  // the repository's control surface, not an empty answer. `readHead` returns `null` for
+  // all of them, so the gap itself is recorded here.
+  if (head === null) anomalies.push('head-not-read');
 
   const hooks: SnapshotHook[] = [];
   let hooksTruncated = false;
@@ -601,10 +736,12 @@ async function readGitMetadata(root: string): Promise<SnapshotGitMetadata> {
 
   if (hooksListing.kind === 'symlink') {
     hooksDirectoryLinkTarget = hooksListing.target;
+    anomalies.push(`hooks-directory-link:${hooksListing.target ?? ''}`);
   } else if (hooksListing.kind === 'listed') {
     for (const name of hooksListing.names) {
       if (hooks.length >= MAX_HOOKS) {
         hooksTruncated = true;
+        anomalies.push('hooks-truncated');
         break;
       }
 
@@ -625,6 +762,7 @@ async function readGitMetadata(root: string): Promise<SnapshotGitMetadata> {
         const candidateSize = hookStat.size;
         if (candidateSize > GIT_METADATA_MAX_BYTES) {
           oversize.push(join(GIT_DIRECTORY, 'hooks', name));
+          anomalies.push(`hook-not-hashed:${name}`);
           hooks.push({ name, kind, sha256: null });
           continue;
         }
@@ -633,6 +771,7 @@ async function readGitMetadata(root: string): Promise<SnapshotGitMetadata> {
           hooks.push({ name, kind, sha256: (await hashRegularFile(absolute, hookStat)).sha256 });
         } catch {
           oversize.push(join(GIT_DIRECTORY, 'hooks', name));
+          anomalies.push(`hook-not-hashed:${name}`);
           hooks.push({ name, kind, sha256: null });
         }
 
@@ -660,6 +799,7 @@ async function readGitMetadata(root: string): Promise<SnapshotGitMetadata> {
     hooksDirectoryLinkTarget,
     oversize,
     hooksTruncated,
+    anomalies: normaliseAnomalies(anomalies),
   };
 }
 
@@ -679,6 +819,49 @@ interface WalkResult {
   readonly entries: readonly SnapshotEntry[];
   readonly totalBytes: number;
   readonly stopReason: SnapshotStopReason;
+  /**
+   * The directories below the root that are called `.git`, which the walk treats as content
+   * (F-G11) and which the caller records as metadata anomalies (F-G14).
+   */
+  readonly nestedGitDirectories: readonly string[];
+}
+
+/** A directory queued for walking, with the `lstat` that classified it. */
+interface PendingDirectory {
+  readonly relativePath: string;
+  /** The classification this path must still answer to after its children were read. */
+  readonly stat: Stats;
+}
+
+/**
+ * Is the directory we just walked still the directory we classified? — F-G20.
+ *
+ * Returns the stop reason, or `null` when the identity held. Two answers, because there are
+ * two facts: `parent-replaced` when `dev`/`ino` moved or the path became a link (the name
+ * resolves somewhere else, so the children may have been read through it), and `unstable`
+ * when only `ctime` moved (the directory is the same one, but a child was created or removed
+ * while it was being described).
+ *
+ * `ctime` is compared because an unprivileged process cannot set it — the same argument as
+ * the file-level check in `hashRegularFile`. It is a best-effort signal: a filesystem with
+ * one-second granularity can hide a change inside one tick.
+ */
+function directoryIdentityVerdict(
+  classified: Stats,
+  after: Stats | undefined,
+): SnapshotStopReason {
+  if (
+    after === undefined ||
+    after.isSymbolicLink() ||
+    after.dev !== classified.dev ||
+    after.ino !== classified.ino
+  ) {
+    return 'parent-replaced';
+  }
+
+  if (after.ctimeMs !== classified.ctimeMs) return 'unstable';
+
+  return null;
 }
 
 /**
@@ -689,16 +872,37 @@ interface WalkResult {
  * detail. Breadth-first because it keeps the stack proportional to the number of
  * directories rather than the depth of the tree, and because a truncated snapshot of a
  * deep tree is more useful when it includes every top-level entry.
+ *
+ * ## The parent is re-checked after its children (F-G20)
+ *
+ * Every queue entry carries the `lstat` that classified it. After the directory's children
+ * have been read, the same path is `lstat`ed again and compared. A parent swapped for a
+ * symbolic link between `readdir` and a child's `lstat` resolves the child through the link;
+ * the child's own `lstat`/`fstat` agree with each other because both were resolved through
+ * the same link, so the entry-level identity check cannot see it. The parent's identity can.
+ *
+ * On a mismatch the subtree's entries are **withdrawn**, not merely flagged. A path resolved
+ * through a substituted parent may have produced a digest of a file outside the workspace,
+ * and keeping it in a file would leave an off-tree hash where a reviewer looks for evidence
+ * of the tree. The snapshot is `complete: false` either way, so nothing that was authority
+ * is lost — and the attempt fails (F-G13), so nothing is silently accepted.
  */
-async function walk(root: string, limits: SnapshotLimits): Promise<WalkResult> {
-  const entries: SnapshotEntry[] = [];
+async function walk(
+  root: string,
+  limits: SnapshotLimits,
+  rootStat: Stats,
+  options: TakeSnapshotOptions = {},
+): Promise<WalkResult> {
+  let entries: SnapshotEntry[] = [];
   let totalBytes = 0;
   let stopReason: SnapshotStopReason = null;
+  const nestedGitDirectories: string[] = [];
 
-  const queue: string[] = [''];
+  const queue: PendingDirectory[] = [{ relativePath: '', stat: rootStat }];
 
   while (queue.length > 0) {
-    const relativeDirectory = queue.shift() as string;
+    const current = queue.shift() as PendingDirectory;
+    const relativeDirectory = current.relativePath;
     const absoluteDirectory =
       relativeDirectory === '' ? root : join(root, relativeDirectory);
 
@@ -726,12 +930,24 @@ async function walk(root: string, limits: SnapshotLimits): Promise<WalkResult> {
       break;
     }
 
+    // The seam the parent-swap suite uses to hold the window open. Nothing else passes it.
+    await options.afterDirectoryListed?.(relativeDirectory);
+
     const names = listing.names;
 
     for (const name of names) {
-      if (name === '.' || name === '..' || name.includes(sep) || name === GIT_DIRECTORY) {
-        // `readdir` cannot return separators or dots; a `.git` at any depth is metadata,
-        // not content. The first two conditions are assertions that cost one comparison.
+      // A `.git` at the **workspace root** is the repository's own metadata: excluded from
+      // content here and described by `readGitMetadata` instead. At any other depth it is
+      // not the root repository's metadata — it belongs to a nested repository or a
+      // submodule, which is a place the agent can write — so it is walked as content like
+      // every other directory. Excluding it at every depth made it a silent write area:
+      // a write under `sub/.git` changed no entry and no digest (F-G11).
+      if (
+        name === '.' ||
+        name === '..' ||
+        name.includes(sep) ||
+        (name === GIT_DIRECTORY && relativeDirectory === '')
+      ) {
         continue;
       }
 
@@ -744,6 +960,12 @@ async function walk(root: string, limits: SnapshotLimits): Promise<WalkResult> {
           `Entry ${JSON.stringify(relativePath)} resolves outside ${root}`,
         );
       }
+
+      // A `.git` below the root is content now, and its presence is a fact about the tree
+      // a reviewer must be able to find without diffing digests (F-G14). Recorded whatever
+      // its kind: a submodule pointer is a `.git` *file* and is just as much a nested
+      // repository as a nested clone is.
+      if (name === GIT_DIRECTORY) nestedGitDirectories.push(relativePath);
 
       if (entries.length >= limits.maxEntries) {
         stopReason = 'max-entries';
@@ -762,7 +984,7 @@ async function walk(root: string, limits: SnapshotLimits): Promise<WalkResult> {
 
       if (kind === 'dir') {
         entries.push({ path: relativePath, kind, mode, sizeBytes: 0, sha256: null, symlinkTarget: null });
-        queue.push(relativePath);
+        queue.push({ relativePath, stat });
         continue;
       }
 
@@ -823,9 +1045,49 @@ async function walk(root: string, limits: SnapshotLimits): Promise<WalkResult> {
     }
 
     if (stopReason !== null) break;
+
+    // ── The directory is still the one that was classified (F-G20) ─────────────
+    //
+    // Runs after the children, because the window to hold is between this directory's
+    // `readdir` and a child's `lstat`: a parent swapped for a link inside that window
+    // resolves every child through the link, and the child's own identity check agrees
+    // with itself because both halves were resolved through it.
+    const verdict = directoryIdentityVerdict(current.stat, await statOrUndefined(absoluteDirectory));
+
+    if (verdict !== null) {
+      stopReason = verdict;
+
+      // Only a moved identity withholds entries. When `dev`/`ino` moved (or the path became
+      // a link), the child paths were resolved through a name that now means something
+      // else, so a digest under it may be a digest of a file outside the workspace:
+      // keeping them "for forensics" would put an off-tree hash in a file an operator opens
+      // as evidence of the tree. Withdrawing is the honest answer, and `complete: false`
+      // already says the snapshot is not authority (F-G13 fails the attempt).
+      //
+      // A `ctime`-only mismatch is the same directory with a child that appeared or
+      // vanished. The entries read from it are what they were at read time, so they stay —
+      // the same choice the walk already makes when `unstable` stops it mid-listing.
+      if (verdict === 'parent-replaced') {
+        const contested = (path: string): boolean =>
+          relativeDirectory === '' ||
+          path === relativeDirectory ||
+          path.startsWith(`${relativeDirectory}/`);
+
+        entries = entries.filter((entry) => !contested(entry.path));
+        for (let index = nestedGitDirectories.length - 1; index >= 0; index -= 1) {
+          if (contested(nestedGitDirectories[index] as string)) {
+            nestedGitDirectories.splice(index, 1);
+          }
+        }
+
+        totalBytes = entries.reduce((sum, entry) => sum + entry.sizeBytes, 0);
+      }
+
+      break;
+    }
   }
 
-  return { entries, totalBytes, stopReason };
+  return { entries, totalBytes, stopReason, nestedGitDirectories };
 }
 
 /**
@@ -865,6 +1127,7 @@ export function serialiseSnapshot(input: SnapshotDigestInput): string {
       hooksDirectoryLinkTarget: input.git.hooksDirectoryLinkTarget,
       oversize: [...input.git.oversize].sort(comparePathBytes),
       hooksTruncated: input.git.hooksTruncated,
+      anomalies: [...input.git.anomalies].sort(comparePathBytes),
     },
     entries: input.entries.map((entry) => ({
       path: entry.path,
@@ -916,11 +1179,25 @@ export async function takeWorkspaceSnapshot(
     );
   }
 
-  const walked = await walk(absoluteRoot, limits);
+  const walked = await walk(absoluteRoot, limits, rootStat, options);
   const git = await readGitMetadata(absoluteRoot);
+
+  // A nested `.git` is content now (F-G11), and its presence is a fact about the tree that
+  // a reviewer must be able to see without diffing digests (F-G14). Merged into the
+  // metadata anomaly list rather than a field of its own: one list, one durable record, one
+  // place to look.
+  const anomalies = normaliseAnomalies([
+    ...git.anomalies,
+    ...walked.nestedGitDirectories.map((path) => `nested-git:${path}`),
+  ]);
 
   // Metadata we could not digest, or a hooks directory we could not enumerate, is a gap
   // in the same evidence set. It downgrades completeness rather than being dropped.
+  //
+  // Anomalies deliberately do **not** downgrade completeness: that would hand the agent a
+  // switch that turns evidence off with one `ln -s`, which is the shape of the defect this
+  // gate exists to remove. They are recorded instead — see the worker's
+  // `attempt.evidence_anomaly.v1`.
   const gitIncomplete = git.oversize.length > 0 || git.hooksTruncated;
   const stopReason = walked.stopReason ?? (gitIncomplete ? 'unreadable' : null);
   const complete = stopReason === null;
@@ -933,7 +1210,7 @@ export async function takeWorkspaceSnapshot(
     totalBytes: walked.totalBytes,
     limits,
     entries: walked.entries,
-    git,
+    git: anomalies.length === git.anomalies.length ? git : { ...git, anomalies },
   };
 
   return {
