@@ -150,7 +150,7 @@ Workspaces are nested so the client can build project paths without a second cal
 | POST | `/v1/orgs/:orgId/projects/:projectId/tasks` | **MEMBER** | `{ title, goal, priority?, acceptanceCriteria[], executionProfile?, sourceRef?, baseCommit?, riskClass? }` + optional `Idempotency-Key` | `201` created / `200` duplicate — `{ data: Task, meta: { created: boolean } }` |
 | GET | `/v1/orgs/:orgId/tasks/:taskId` | any member | — | `200 { data: TaskDetail }` |
 | PATCH | `/v1/orgs/:orgId/tasks/:taskId` | **MEMBER** | `{ status, reason? }` | `200 { data: Task }` — human-owned edges only, see §5 |
-| POST | `/v1/orgs/:orgId/tasks/:taskId/run` | **MEMBER** | — | `202 { data: { taskId, workflowRunId, workflowId, temporalRunId, status: "queued" } }` |
+| POST | `/v1/orgs/:orgId/tasks/:taskId/run` | **MEMBER** | — | `202 { data: { taskId, workflowRunId, attemptId, workflowId, temporalRunId, status: "queued" } }` |
 | POST | `/v1/orgs/:orgId/tasks/:taskId/cancel` | **MEMBER** | — | `200 { data: { taskId, status: "cancelled", workflowRunId, orchestrator } }` |
 
 `TaskDetail` = the task plus `project`, `workspace`, `latestRun` (or `null`),
@@ -434,6 +434,44 @@ Every refusal is a `409` with a specific code, and writes a
   reservation commits before Temporal is contacted; refunding it would need a second
   race against a run that may have started after all. The cost is one re-approval after
   an outage; the alternative costs the control.
+
+### 6.1 The execution reservation, and the end of the direct start (Phase 6)
+
+`POST /run` is the only path that creates an `ExecutionAttempt`, and that attempt is now
+the **only** thing that authorises an execution.
+
+- `POST /run` creates the `WorkflowRun` and a `queued` `ExecutionAttempt`, spends the
+  grant naming that attempt, and starts `runTaskWorkflow` with `attemptId`.
+- The worker's first activity *claims* the attempt: one conditional
+  `UPDATE … WHERE status = 'queued' AND "claimedByWorkflowRunId" IS NULL`, keyed to
+  Temporal's run id. `count === 1` is the grant; nothing else can claim it afterwards.
+- The worker's **executor** re-reads that claim before it does anything. It refuses an
+  execution that holds no claim, a claim held by another execution, and — for `HIGH` and
+  `CRITICAL` tasks — an approval that has been revoked, expired, or re-bound since
+  validation ran.
+- Adoption (`queued → running`) is conditional on the row carrying the adopting
+  execution's claim, so an attempt cannot be run by an execution that did not claim it.
+
+**Removed: starting `runTaskWorkflow` without an attempt id.** Until Phase 6 a caller
+with Temporal access could start the workflow by name with `{ taskId, orgId }` and no
+reservation; validation skipped the claim entirely and the execution ran unclaimed. Two
+such starts of one `LOW` task ran concurrently — two successes milliseconds apart, one
+`AgentRun`, and `claimedAt` NULL on both, so the duplicate was invisible in the execution
+record. There is no replacement control for that shape, so the path is **refused**
+(`EXECUTION_CLAIM_REFUSED`, non-retryable) at validation *and* at the executor: an
+execution that names no attempt cannot be shown to be the only one.
+
+Operationally this means a manual/back-office start must now carry the `attemptId` that
+`POST /run` minted — the value returned in the `202` body, and the same one the grant's
+`consumedByAttemptId` names. There is no supported way to run a task that `POST /run` did
+not reserve.
+
+**Stranded reservations.** A worker that dies between the claim and adoption leaves a
+`queued` attempt claimed by a workflow run that no longer exists. The reaper releases
+such a claim only when Temporal reports that specific run as **not found** or
+**terminal** — never on age alone — and records `execution.claim_released.v1` with the
+evidence. The attempt is marked `failed` / `ATTEMPT_ABANDONED` in the same write. Task
+and workflow-run status are not reconciled by that pass (see the Phase 6 record).
 
 ---
 

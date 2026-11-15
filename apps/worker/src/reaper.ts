@@ -10,6 +10,7 @@ import {
 } from '@intelligenz/workspace-manager';
 
 import { cgroupPathFor, killCgroup, listProcesses } from './cgroup';
+import { runClaimReleasePass } from './claim-release';
 import { WORKFLOW_ID_PREFIX } from './config';
 import { workerIdentity } from './identity';
 import { workerLogger } from './log';
@@ -49,6 +50,17 @@ export type WorkflowLiveness = 'active' | 'finished' | 'absent' | 'unknown';
 
 export interface WorkflowLivenessProbe {
   status(taskId: string): Promise<WorkflowLiveness>;
+  /**
+   * Liveness of **one specific execution**, identified by the orchestrator's run id.
+   *
+   * `status(taskId)` answers "is the workflow for this task running"; this answers "is
+   * the execution that holds this claim still there", which is a different question and
+   * the only one a claim release may act on. The workflow id is derived from the task
+   * (`task-<taskId>`, the same rule the API starts with), and the run id is the claim's
+   * holder — so a claim left by an execution that has since been replaced by a new one
+   * under the same workflow id is still resolved to *the execution that wrote it*.
+   */
+  execution(taskId: string, workflowRunId: string): Promise<WorkflowLiveness>;
 }
 
 /** gRPC "not found": there is no execution, which is a definite answer, not an error. */
@@ -89,6 +101,26 @@ export function createTemporalProbe(options: {
 
         // An unreachable server is not evidence that the workflow is gone. `unknown`
         // makes the caller skip, which is the whole point of having the value.
+        return 'unknown';
+      }
+    },
+
+    async execution(taskId: string, workflowRunId: string): Promise<WorkflowLiveness> {
+      try {
+        // Both ids on purpose: the workflow id alone would resolve to whichever
+        // execution Temporal currently holds under it, and a claim belongs to a run id.
+        const described = await (
+          await connect()
+        ).workflow
+          .getHandle(`${WORKFLOW_ID_PREFIX}${taskId}`, workflowRunId)
+          .describe();
+
+        const name = described.status.name;
+
+        return name === 'RUNNING' || name === 'CONTINUED_AS_NEW' ? 'active' : 'finished';
+      } catch (error) {
+        if (grpcStatus(error) === GRPC_NOT_FOUND) return 'absent';
+
         return 'unknown';
       }
     },
@@ -134,6 +166,11 @@ export interface ReaperResult {
   readonly scanned: number;
   readonly actions: readonly ReaperAction[];
   readonly errored: number;
+  /**
+   * Stranded execution claims released by the Phase 6 pass. Optional because the two
+   * workspace passes have no opinion about claims and their result builders predate it.
+   */
+  readonly released?: number;
 }
 
 export interface ReaperDeps {
@@ -692,11 +729,16 @@ export function startReaper(deps: ReaperDeps, probe: { close?(): Promise<void> }
     try {
       const pass = await runReaperPass(deps);
       const sweep = await runOrphanSweep(deps);
+      // Phase 6, F4. Runs last: it only touches rows nothing adopted, so it cannot race
+      // a live workspace, and running it after the two reclamation passes keeps the
+      // ordering of the older, better-tested paths unchanged.
+      const releases = await runClaimReleasePass(deps);
 
       return {
-        scanned: pass.scanned + sweep.scanned,
+        scanned: pass.scanned + sweep.scanned + releases.scanned,
         actions: [...pass.actions, ...sweep.actions],
-        errored: pass.errored + sweep.errored,
+        errored: pass.errored + sweep.errored + releases.errored,
+        released: releases.actions.filter((action) => action.outcome === 'released').length,
       };
     } finally {
       running = false;

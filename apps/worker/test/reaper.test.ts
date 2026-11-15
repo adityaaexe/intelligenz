@@ -6,7 +6,12 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { PrismaClient } from '@intelligenz/database';
 import { workspacePath, type WorkspaceState } from '@intelligenz/workspace-manager';
 
-import { runReaperPass, type ReaperDeps, type ReaperResult, type WorkflowLiveness } from '../src/reaper';
+import {
+  runReaperPass,
+  type ReaperDeps,
+  type ReaperResult,
+  type WorkflowLiveness,
+} from '../src/reaper';
 import { executionAttemptIdFor, executionWorkspaceIdFor } from '../src/activities/ids';
 import { setWorkerLogger } from '../src/log';
 import type { WorkerLogger } from '../src/logger';
@@ -117,9 +122,7 @@ async function seed(options: SeedOptions): Promise<Seeded> {
       rootPath: options.rootPath ?? derivedPath,
       sourceKind: 'empty',
       state: options.state ?? 'executing',
-      ...(leaseOffsetMs === null
-        ? {}
-        : { leaseExpiresAt: new Date(Date.now() + leaseOffsetMs) }),
+      ...(leaseOffsetMs === null ? {} : { leaseExpiresAt: new Date(Date.now() + leaseOffsetMs) }),
       leaseOwner: 'test-worker:reaper:1',
       cleanupAttempts: options.cleanupAttempts ?? 0,
     },
@@ -148,7 +151,13 @@ function deps(overrides: Partial<ReaperDeps> & { liveness?: WorkflowLiveness } =
 
   return {
     prisma: client,
-    probe: { status: async () => liveness },
+    probe: {
+      status: async () => liveness,
+      // The claim-release pass asks about one execution by run id. In these tests every
+      // workspace candidate is owned by a `running` attempt, so no claim is ever a
+      // candidate; reporting the same answer keeps the fake honest rather than clever.
+      execution: async () => liveness,
+    },
     workspaceRoot,
     // A cgroup root that does not exist: `listProcesses` treats ENOENT as "no members".
     // The reaper must never be pointed at the host's real cgroup tree from a test.
@@ -444,7 +453,9 @@ describe.skipIf(!enabled)('reaper', () => {
       expect(action?.reason).toContain('symbolic link');
       expect(await exists(join(decoyWorkspace, 'repo', 'keep.txt'))).toBe(true);
 
-      const row = await client.executionWorkspace.findUniqueOrThrow({ where: { id: 'ws-symlink' } });
+      const row = await client.executionWorkspace.findUniqueOrThrow({
+        where: { id: 'ws-symlink' },
+      });
       expect(row.state).toBe('quarantined');
     }, 30_000);
 

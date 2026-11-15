@@ -98,8 +98,7 @@ export const EXECUTION_ALREADY_CLAIMED = 'EXECUTION_ALREADY_CLAIMED';
 export const EXECUTION_CLAIM_REFUSED = 'EXECUTION_CLAIM_REFUSED';
 
 export type ExecutionClaimRefusalCode =
-  | typeof EXECUTION_ALREADY_CLAIMED
-  | typeof EXECUTION_CLAIM_REFUSED;
+  typeof EXECUTION_ALREADY_CLAIMED | typeof EXECUTION_CLAIM_REFUSED;
 
 /** Everything the claim needs. Every field is server-side: two ids and a timestamp. */
 export interface ClaimIdentity {
@@ -160,7 +159,13 @@ export function classifyLostClaim(input: {
   /** `null` when no row matched this tenant and task. */
   readonly status: string | null;
   readonly claimedByWorkflowRunId: string | null;
-}): { readonly outcome: 'retry' } | { readonly outcome: 'refused'; readonly code: ExecutionClaimRefusalCode; readonly detail: string } {
+}):
+  | { readonly outcome: 'retry' }
+  | {
+      readonly outcome: 'refused';
+      readonly code: ExecutionClaimRefusalCode;
+      readonly detail: string;
+    } {
   // Nothing to claim. The row is invisible through the tenant and task filters, which is
   // the same answer for "no such attempt" and "not yours" — deliberately: distinguishing
   // them would confirm the existence of another tenant's row.
@@ -175,7 +180,10 @@ export function classifyLostClaim(input: {
   }
 
   // The exact case the phase closed: a different execution holds the attempt.
-  if (input.claimedByWorkflowRunId !== null && input.claimedByWorkflowRunId !== input.workflowRunId) {
+  if (
+    input.claimedByWorkflowRunId !== null &&
+    input.claimedByWorkflowRunId !== input.workflowRunId
+  ) {
     return {
       outcome: 'refused',
       code: EXECUTION_ALREADY_CLAIMED,
@@ -326,10 +334,156 @@ export async function claimExecution(identity: ClaimIdentity): Promise<Execution
   );
 }
 
-/** The subset of the client an audit write needs — satisfied by the client and by a transaction. */
-type AuditWriter = Pick<Prisma.TransactionClient, 'auditEvent'>;
-
 /**
+ * Verifies that **this execution** holds the claim on the attempt it names, or throws.
+ *
+ * ## Why this exists at the launch site
+ *
+ * `claimExecution` is written by validation. A write nobody reads is a record of
+ * authority, not a control over it: `executeAgentActivity` is a separately registered
+ * Temporal activity (`activities/index.ts`), dispatched **by name**, so any workflow on
+ * the worker's task queue can call it without ever calling `validateTaskActivity`.
+ * Before this function existed, that path executed an unapproved HIGH-risk task with no
+ * claim at all — validation refused it and the executor ran it anyway.
+ *
+ * `execute-agent.ts` therefore calls this **first**, before the runtime is constructed,
+ * before `startAttempt`, before the cgroup probe, before the workspace lease and before
+ * `runtime.execute`. It sits at the same altitude as the isolation gate, and for the
+ * same reason: a control one activity upstream of the only launch site is advice.
+ *
+ * ## What it checks, and what it deliberately does not
+ *
+ * It checks **identity of the holder**: the named attempt exists in this tenant and
+ * task, it carries a claim, and the claim is this execution's run id. Nothing else.
+ * Attempt *status* is not part of the test, because the interesting legitimate case is
+ * a Temporal retry of this same execution: the first activity attempt adopted the row
+ * (`running`) or crashed after finalizing it (`succeeded`/`failed`). The claim is what
+ * distinguishes that retry from a second execution, and the claim is stable across
+ * retries by construction. Refusing on status here would convert "the worker restarted"
+ * into "the task can never run".
+ *
+ * Approval is re-checked separately and immediately after this, by
+ * `assertTaskAuthorised` with `altitude: 'launch'` — the same function validation uses,
+ * imported rather than copied.
+ */
+export async function requireExecutionClaim(input: {
+  readonly orgId: string;
+  readonly taskId: string;
+  readonly attemptId: string | undefined;
+  /** Temporal's run id, or `undefined` when this call has no activity context. */
+  readonly executionRunId: string | undefined;
+  /**
+   * The database `WorkflowRun.id` the caller says it is executing under, when it names
+   * one. Checked against the attempt's own foreign key: the two are different id spaces
+   * (`WorkflowRun.id` vs Temporal's run id), and an activity told to record against one
+   * run while holding another run's attempt would allocate a stray attempt under the
+   * wrong run. Refusing the disagreement is cheaper than reconciling it later.
+   */
+  readonly workflowRunId?: string | undefined;
+}): Promise<HeldExecutionClaim> {
+  const attemptId = input.attemptId?.trim();
+
+  if (input.executionRunId === undefined) {
+    throw nonRetryableWithDetails(
+      EXECUTION_CLAIM_REFUSED,
+      'This execution has no claimable identity: an activity invoked outside a Temporal ' +
+        'workflow has no run id, so it cannot be the holder of an execution claim. Only ' +
+        'an orchestrated execution may launch an agent.',
+      { reason: 'execution_claim', code: EXECUTION_CLAIM_REFUSED, taskId: input.taskId },
+    );
+  }
+
+  if (attemptId === undefined || attemptId.length === 0) {
+    throw nonRetryableWithDetails(
+      EXECUTION_CLAIM_REFUSED,
+      `Task ${input.taskId} was executed without naming a reserved attempt. An attempt is ` +
+        'the reservation that authorises one execution; an execution that names none ' +
+        'cannot be shown to hold one, and two of them would both run.',
+      { reason: 'execution_claim', code: EXECUTION_CLAIM_REFUSED, taskId: input.taskId },
+    );
+  }
+
+  const attempt = await db().executionAttempt.findFirst({
+    // Tenant scoping plus the task, exactly as the claim write is scoped: an attempt id
+    // from another organisation or another task is not this execution's reservation.
+    where: { id: attemptId, orgId: input.orgId, taskId: input.taskId },
+    select: { claimedByWorkflowRunId: true, claimedAt: true, workflowRunId: true },
+  });
+
+  if (attempt === null) {
+    throw nonRetryableWithDetails(
+      EXECUTION_CLAIM_REFUSED,
+      `Attempt ${attemptId} does not exist for task ${input.taskId} in this organisation, ` +
+        'so there is no reservation authorising this execution.',
+      {
+        reason: 'execution_claim',
+        code: EXECUTION_CLAIM_REFUSED,
+        taskId: input.taskId,
+        attemptId,
+      },
+    );
+  }
+
+  if (attempt.claimedByWorkflowRunId === null) {
+    throw nonRetryableWithDetails(
+      EXECUTION_CLAIM_REFUSED,
+      `Attempt ${attemptId} holds no execution claim. Validation grants it; an execution ` +
+        'that arrives without one has not been authorised to run, whatever it believes.',
+      {
+        reason: 'execution_claim',
+        code: EXECUTION_CLAIM_REFUSED,
+        taskId: input.taskId,
+        attemptId,
+      },
+    );
+  }
+
+  if (attempt.claimedByWorkflowRunId !== input.executionRunId) {
+    throw nonRetryableWithDetails(
+      EXECUTION_ALREADY_CLAIMED,
+      `Attempt ${attemptId} is claimed by workflow run ${attempt.claimedByWorkflowRunId}; ` +
+        'one reservation authorises one execution, and this is not it.',
+      {
+        reason: 'execution_claim',
+        code: EXECUTION_ALREADY_CLAIMED,
+        taskId: input.taskId,
+        attemptId,
+        claimedByWorkflowRunId: attempt.claimedByWorkflowRunId,
+        ...(attempt.claimedAt === null ? {} : { heldSince: attempt.claimedAt.toISOString() }),
+      },
+    );
+  }
+
+  if (input.workflowRunId !== undefined && attempt.workflowRunId !== input.workflowRunId) {
+    // Same task, same execution, different database run: the attempt belongs to another
+    // `WorkflowRun` row. Allowing it would make `startAttempt` allocate an attempt under
+    // the run the caller named while the claim stayed on this one — two rows, two run ids,
+    // one execution, and an accounting trail that contradicts itself.
+    throw nonRetryableWithDetails(
+      EXECUTION_CLAIM_REFUSED,
+      `Attempt ${attemptId} belongs to workflow run ${attempt.workflowRunId}, not to ` +
+        `${input.workflowRunId}. An execution claims the attempt its own run created.`,
+      {
+        reason: 'execution_claim',
+        code: EXECUTION_CLAIM_REFUSED,
+        taskId: input.taskId,
+        attemptId,
+        workflowRunId: attempt.workflowRunId,
+      },
+    );
+  }
+
+  return { attemptId, executionRunId: input.executionRunId };
+}
+
+/** What a successful `requireExecutionClaim` proves, for the code that follows it. */
+export interface HeldExecutionClaim {
+  readonly attemptId: string;
+  readonly executionRunId: string;
+}
+
+/** The subset of the client an audit write needs — satisfied by the client and by a transaction. */
+type AuditWriter = Pick<Prisma.TransactionClient, 'auditEvent'>; /**
  * Writes one claim event.
  *
  * Idempotent on `(orgId, idempotencyKey)` with the same explicit check `emitEventActivity`

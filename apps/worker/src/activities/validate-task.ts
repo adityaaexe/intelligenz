@@ -1,15 +1,6 @@
-import { requiresApproval } from '@intelligenz/contracts';
-
-import type {
-  ValidateTaskActivityInput,
-  ValidateTaskActivityResult,
-} from '../shared/contracts';
-import { computeTaskContentHash, readTaskBinding, resolveBinding } from '../approvals/task-binding';
-import {
-  EXECUTION_CLAIM_REFUSED,
-  claimExecution,
-  executionIdentity,
-} from './claim';
+import { assertTaskAuthorised } from '../approvals/authorisation';
+import type { ValidateTaskActivityInput, ValidateTaskActivityResult } from '../shared/contracts';
+import { EXECUTION_CLAIM_REFUSED, claimExecution, executionIdentity } from './claim';
 import { db, nonRetryableWithDetails } from './support';
 
 /**
@@ -138,8 +129,10 @@ export async function validateTaskActivity(
     };
   }
 
-  // `ready` is accepted as well as `queued`: a client may start the workflow without
-  // going through `POST /run`, which is the only API path that queues the task.
+  // `ready` is accepted as well as `queued`: `POST /run` is the only API path that queues
+  // the task, and a back-office client may start the workflow directly. Since Phase 6 such
+  // a start must also name the attempt `POST /run` reserved — the reservation is what
+  // authorises the execution, so "no attempt" is refused rather than run unclaimed.
   if (task.status !== 'queued' && task.status !== 'ready') {
     return {
       runnable: false,
@@ -150,65 +143,16 @@ export async function validateTaskActivity(
     };
   }
 
-  if (requiresApproval(task.riskClass)) {
-    const binding = resolveBinding(readTaskBinding(task.riskFactors), undefined);
-
-    const expectedTaskContentHash = computeTaskContentHash({
-      title: task.title,
-      goal: task.goal,
-      acceptanceCriteria: task.acceptanceCriteria,
-      riskClass: task.derivedRiskClass ?? task.riskClass,
-      executionProfile: binding.executionProfile,
-      sourceRef: binding.sourceRef,
-      baseCommit: binding.baseCommit,
-    });
-
-    const approvals = await db().approvalRequest.findMany({
-      // Tenant scoping, and newest first: after a re-approval the newest grant is the
-      // one that applies. Reading only `status: 'APPROVED'` would hide a newer
-      // revocation, which is the one row that must be seen.
-      where: { orgId: input.orgId, taskId: task.id },
-      orderBy: { createdAt: 'desc' },
-      select: {
-        id: true,
-        status: true,
-        taskContentHash: true,
-        expiresAt: true,
-        consumedAt: true,
-        // Phase 5. Who the grant was spent by — the column the API now fills in the same
-        // transaction it creates the attempt.
-        consumedByAttemptId: true,
-        revokedAt: true,
-        createdAt: true,
-      },
-    });
-
-    const selection = selectApprovalGrant({
-      approvals,
-      expectedTaskContentHash,
-      now: Date.now(),
-    });
-
-    if ('refusal' in selection) {
-      // **Thrown, not returned.** A caller that started this workflow directly — no
-      // API, no `POST /run` — must not be able to distinguish "refused" from "nothing
-      // to do": the refusal is an exception that ends the workflow, and the details
-      // carry the project id so the workflow can still write the audit event without a
-      // second query. The API's own gate is checked first; this is the gate that cannot
-      // be bypassed (Phase 3 §7, path 3).
-      throw refusalFailure(selection.refusal, task);
-    }
-
-    const bindingRefusal = await evaluateAttemptBinding({
-      orgId: input.orgId,
-      taskId: task.id,
-      approvalId: selection.approval.id,
-      consumedByAttemptId: selection.approval.consumedByAttemptId ?? null,
-      attemptId: input.attemptId,
-    });
-
-    if (bindingRefusal !== null) throw refusalFailure(bindingRefusal, task);
-  }
+  // The gate decides for itself whether this task's class needs a grant; calling it
+  // unconditionally keeps the "does this task need approval" question in one place.
+  await assertTaskAuthorised({
+    task,
+    attemptId: input.attemptId,
+    // Nothing has run yet: the attempt must still be `queued`. The launch site re-runs
+    // the same gate at `launch` altitude, where the claim — not this status — is the
+    // control for "one reservation, one execution".
+    altitude: 'reservation',
+  });
 
   // ── Phase 6: the one-shot claim — the last thing that happens here ────────────
   //
@@ -220,16 +164,43 @@ export async function validateTaskActivity(
   // ordering in which provisioning, a cgroup, a broker call or `runtime.execute` can
   // happen before a claim exists.
   //
-  // It runs for every execution that names an attempt, not only approval-gated ones. An
-  // attempt is the API's reservation of one execution whatever the task's risk class,
-  // and the duplicate-execution hole was never approval-specific: `validateTaskActivity`
-  // used to read the attempt and check its status only when an approval was involved,
-  // so two starts of a LOW task with the same attempt id both passed.
+  // It runs for every execution, not only approval-gated ones. An attempt is the API's
+  // reservation of one execution whatever the task's risk class, and the
+  // duplicate-execution hole was never approval-specific: `validateTaskActivity` used
+  // to read the attempt and check its status only when an approval was involved, so two
+  // starts of a LOW task with the same attempt id both passed.
   const attemptId = input.attemptId?.trim();
 
-  if (attemptId !== undefined && attemptId.length > 0) {
-    await claimForExecution(task, attemptId, input);
+  if (attemptId === undefined || attemptId.length === 0) {
+    // ── Phase 6, F3: an execution with no reservation does not launch ──────────
+    //
+    // This was a convenience path: a caller could start `runTaskWorkflow` directly,
+    // name no attempt, skip the claim entirely, and run. Two such starts of one LOW
+    // task ran concurrently — two successes milliseconds apart, one `AgentRun` (keyed
+    // to the second), and `claimedAt` NULL on both, so the duplicate was invisible in
+    // the execution record as well as unguarded.
+    //
+    // Refusing here is the deliberate trade: there is no longer a way to execute
+    // without a reservation, so "start the workflow by hand" now requires the attempt
+    // id `POST /run` minted. `apps/api/api-contract.md` records the removal. The launch
+    // site refuses the same case independently (`requireExecutionClaim`), because this
+    // activity can be skipped entirely by anything that can dispatch by name.
+    throw nonRetryableWithDetails(
+      EXECUTION_CLAIM_REFUSED,
+      `Task ${task.id} was started without naming a reserved execution attempt. ` +
+        'Every execution must name the attempt POST /run created for it: an attempt is ' +
+        'the reservation that authorises exactly one execution, and an execution with no ' +
+        'reservation cannot be shown to be the only one.',
+      {
+        reason: 'execution_claim',
+        code: EXECUTION_CLAIM_REFUSED,
+        taskId: task.id,
+        projectId: task.projectId,
+      },
+    );
   }
+
+  await claimForExecution(task, attemptId, input);
 
   return { runnable: true, task };
 }
@@ -277,284 +248,4 @@ async function claimForExecution(
     // is a server-side id and the thing a claim is actually about.
     correlationId: input.correlationId ?? workflowRunId,
   });
-}
-
-/**
- * Phase 5: does the grant this task is holding name **this** attempt?
- *
- * Reads the attempt row only when one was named, and only inside the tenant and task the
- * workflow already proved it owns. Everything else is decided by the pure
- * `decideAttemptBinding`, so the order of the checks is reviewable in one screen.
- */
-async function evaluateAttemptBinding(input: {
-  readonly orgId: string;
-  readonly taskId: string;
-  readonly approvalId: string;
-  readonly consumedByAttemptId: string | null;
-  readonly attemptId: string | undefined;
-}): Promise<ApprovalRefusal | null> {
-  const attemptId = input.attemptId?.trim();
-
-  // No attempt named: nothing to look up, and the grant cannot be shown to be this run's.
-  // Checked before the query so a forged/absent id costs no database round trip.
-  if (attemptId === undefined || attemptId.length === 0) {
-    return decideAttemptBinding({
-      approvalId: input.approvalId,
-      consumedByAttemptId: input.consumedByAttemptId,
-      attemptId: undefined,
-      attemptStatus: undefined,
-    });
-  }
-
-  const attempt = await db().executionAttempt.findFirst({
-    // Tenant scoping plus the task: an attempt id from another organisation or another
-    // task is not this execution's reservation.
-    where: { id: attemptId, orgId: input.orgId, taskId: input.taskId },
-    select: { status: true },
-  });
-
-  return decideAttemptBinding({
-    approvalId: input.approvalId,
-    consumedByAttemptId: input.consumedByAttemptId,
-    attemptId,
-    attemptStatus: attempt?.status ?? null,
-  });
-}
-
-/**
- * The decision itself, as a pure function: one code per way the binding can fail.
- *
- * `attemptStatus` is `undefined` when no id was supplied and `null` when an id was
- * supplied but no attempt matched it. The distinction matters — "you named nothing" and
- * "you named something that does not exist here" are different incidents.
- */
-export function decideAttemptBinding(input: {
-  readonly approvalId: string;
-  readonly consumedByAttemptId: string | null;
-  readonly attemptId: string | undefined;
-  readonly attemptStatus: string | null | undefined;
-}): ApprovalRefusal | null {
-  if (input.consumedByAttemptId === null) {
-    // A Phase 4 row: consumed with no attempt link, because the attempt did not exist at
-    // the time. It proves a reservation happened and nothing about who made it, so it
-    // cannot authorise a specific execution. Refusing is the honest answer; inventing a
-    // link now would assert an association nobody observed.
-    return {
-      code: 'APPROVAL_NOT_RESERVED',
-      detail:
-        `approval ${input.approvalId} was consumed without being bound to an execution ` +
-        'attempt (a pre-Phase-5 reservation); a new approval is required',
-    };
-  }
-
-  if (input.attemptId === undefined) {
-    return {
-      code: 'APPROVAL_NOT_RESERVED',
-      detail:
-        `approval ${input.approvalId} is reserved to an execution attempt, but this run ` +
-        'named none; only the reservation holder can run it',
-    };
-  }
-
-  if (input.attemptStatus === null) {
-    return {
-      code: 'APPROVAL_ATTEMPT_MISMATCH',
-      detail:
-        `attempt ${input.attemptId} does not exist for this task; approval ` +
-        `${input.approvalId} is bound to a different attempt`,
-    };
-  }
-
-  if (input.consumedByAttemptId !== input.attemptId) {
-    return {
-      code: 'APPROVAL_ATTEMPT_MISMATCH',
-      detail:
-        `approval ${input.approvalId} was spent by attempt ${input.consumedByAttemptId}, ` +
-        `not by ${input.attemptId}`,
-    };
-  }
-
-  if (input.attemptStatus !== 'queued') {
-    // The reservation holder is already running, or has already run. A second execution
-    // naming the same attempt is a replay of a spent reservation, not a retry.
-    return {
-      code: 'APPROVAL_ATTEMPT_MISMATCH',
-      detail:
-        `attempt ${input.attemptId} is "${input.attemptStatus}"; the reservation has ` +
-        'already been taken, so this is a second execution of one grant',
-    };
-  }
-
-  return null;
-}
-
-/** The refusal as the exception the workflow sees, with the details it needs to audit it. */
-function refusalFailure(
-  refusal: ApprovalRefusal,
-  task: { readonly id: string; readonly projectId: string; readonly riskClass: string },
-): Error {
-  return nonRetryableWithDetails(
-    refusal.code,
-    `Task ${task.id} is ${task.riskClass} and ${refusal.detail}`,
-    {
-      // `reason` keeps the historical vocabulary (`approval_required`) so an existing
-      // consumer switching on it does not break; `code` is the precise answer.
-      reason: 'approval_required',
-      code: refusal.code,
-      taskId: task.id,
-      projectId: task.projectId,
-      riskClass: task.riskClass,
-    },
-  );
-}
-
-/** Every way an approval can fail to authorise this run. One code per condition. */
-export type ApprovalRefusalCode =
-  | 'APPROVAL_REQUIRED'
-  | 'APPROVAL_NOT_RESERVED'
-  | 'APPROVAL_REVOKED'
-  | 'APPROVAL_EXPIRED'
-  | 'APPROVAL_UNBOUND'
-  | 'APPROVAL_STALE'
-  /**
-   * Phase 5. The grant is bound to an attempt, and this run named a different one (or a
-   * different attempt's reservation was already taken). Distinct from
-   * `APPROVAL_NOT_RESERVED`, which means no attempt link exists at all — an operator
-   * fixes the two differently.
-   */
-  | 'APPROVAL_ATTEMPT_MISMATCH';
-
-export interface ApprovalCandidate {
-  readonly id: string;
-  readonly status: 'PENDING' | 'APPROVED' | 'REJECTED' | 'CHANGES_REQUESTED' | 'EXPIRED' | 'REVOKED';
-  readonly taskContentHash: string | null;
-  readonly expiresAt: Date | null;
-  readonly consumedAt: Date | null;
-  /**
-   * Phase 5: which attempt spent the grant. Optional in the type because the pure
-   * selection below does not depend on it — the binding check is a separate decision
-   * (`decideAttemptBinding`) that the caller makes once it knows which attempt this run
-   * is. Absent therefore means "not read", never "no link".
-   */
-  readonly consumedByAttemptId?: string | null;
-  readonly revokedAt: Date | null;
-  readonly createdAt: Date;
-}
-
-export interface ApprovalRefusal {
-  readonly code: ApprovalRefusalCode;
-  readonly detail: string;
-}
-
-/**
- * The selection, returning the accepted candidate so the caller can go on to check the
- * Phase 5 attempt binding against it.
- *
- * `evaluateApprovalGrant` below is the same loop with the candidate thrown away; it stays
- * exported because "which grant applies" is a question worth testing on its own, and
- * because a caller that only needs a yes/no should not have to destructure a union.
- */
-export function selectApprovalGrant(input: {
-  readonly approvals: readonly ApprovalCandidate[];
-  readonly expectedTaskContentHash: string;
-  readonly now: number;
-}): { readonly approval: ApprovalCandidate } | { readonly refusal: ApprovalRefusal } {
-  for (const approval of input.approvals) {
-    if (approval.status === 'REVOKED' || approval.revokedAt !== null) {
-      return {
-        refusal: {
-          code: 'APPROVAL_REVOKED',
-          detail: `approval ${approval.id} was revoked; a new approval is required`,
-        },
-      };
-    }
-
-    if (approval.status === 'EXPIRED') {
-      return {
-        refusal: {
-          code: 'APPROVAL_EXPIRED',
-          detail: `approval ${approval.id} expired; a new approval is required`,
-        },
-      };
-    }
-
-    // PENDING, REJECTED and CHANGES_REQUESTED explain nothing that `APPROVAL_REQUIRED`
-    // does not already say. They are not live grants, and they do not veto an older
-    // approved one: a re-approval request sits in the table as PENDING while the grant
-    // it replaces is still the one that applies.
-    if (approval.status !== 'APPROVED') continue;
-
-    // From here the answer is about this row. Every failure is a refusal, never a reason
-    // to look further down the history.
-    if (approval.expiresAt !== null && approval.expiresAt.getTime() <= input.now) {
-      return {
-        refusal: {
-          code: 'APPROVAL_EXPIRED',
-          detail: `approval ${approval.id} expired at ${approval.expiresAt.toISOString()}; a new approval is required`,
-        },
-      };
-    }
-
-    // The API reservation is what makes the grant spendable. A direct workflow start
-    // finds `consumedAt` null and is refused here — the grant is not this caller's to
-    // spend, and the worker does not spend it.
-    if (approval.consumedAt === null) {
-      return {
-        refusal: {
-          code: 'APPROVAL_NOT_RESERVED',
-          detail:
-            `approval ${approval.id} has not been reserved by the API; a run that did not ` +
-            'come through POST /run cannot spend it',
-        },
-      };
-    }
-
-    if (approval.taskContentHash === null) {
-      // A Phase 3 row: approved before binding existed. It cannot be proven to be about
-      // the content that exists now, so it is not usable. Refusing is the honest option;
-      // back-filling a hash would assert something nobody observed.
-      return {
-        refusal: {
-          code: 'APPROVAL_UNBOUND',
-          detail: `approval ${approval.id} predates content binding and cannot authorise a run`,
-        },
-      };
-    }
-
-    if (approval.taskContentHash !== input.expectedTaskContentHash) {
-      return {
-        refusal: {
-          code: 'APPROVAL_STALE',
-          detail:
-            `approval ${approval.id} was granted for different content, risk class, ` +
-            'execution profile or source; a new approval is required',
-        },
-      };
-    }
-
-    return { approval };
-  }
-
-  return {
-    refusal: {
-      code: 'APPROVAL_REQUIRED',
-      detail: 'no APPROVED approval request exists for it',
-    },
-  };
-}
-
-/**
- * The gate's verdict as a yes/no.
- *
- * Same conditions, same order, same codes as `selectApprovalGrant` — this is a thin
- * projection of it, not a second implementation.
- */
-export function evaluateApprovalGrant(input: {
-  readonly approvals: readonly ApprovalCandidate[];
-  readonly expectedTaskContentHash: string;
-  readonly now: number;
-}): ApprovalRefusal | null {
-  const selection = selectApprovalGrant(input);
-
-  return 'refusal' in selection ? selection.refusal : null;
 }

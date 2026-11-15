@@ -15,7 +15,7 @@ Every defect found during this phase, what fixed it, and what remains.
 
 | # | Item | Why it matters | What closes it |
 |---|---|---|---|
-| O1 | **Approval TOCTOU** — two executions holding the genuine attempt id can both validate while the attempt is `queued` | With Temporal access plus the attempt id, a second agent can run | A one-shot `claimed` state written by validation and honoured by the execution path; must not break crash-retry |
+| O1 | **Approval TOCTOU** — two executions holding the genuine attempt id can both validate while the attempt is `queued` | With Temporal access plus the attempt id, a second agent can run — and, until AG-602, so could an execution holding **no** attempt id at all, by calling the executor by activity name | **Closed at the execution boundary (Phase 6, AG-602).** The claim is written by validation *and required by the launch site*: `requireExecutionClaim` runs first in `executeAgentActivity`, the approval gate is re-run there through the same function, adoption is conditional on the claim, and a launch naming no attempt is refused. A stranded claim is released by the reaper only when Temporal reports its run absent or terminal, with `execution.claim_released.v1`. Crash-retry preserved (a retry of the same execution still proceeds, as attempt N+1 under the same claim). Record: `docs/engineering/phase6-trust-boundary/TRUST-BOUNDARY-CLOSURE.md`. Remaining: task/run status reconciliation for a stranded reservation (residual 1 in that record) |
 | O2 | **Credential custody** — the store is owned by the worker's UID | Worker-level compromise reads every provider credential | Distinct service identity + supervisor; on this host, a privilege-drop wrapper with a dedicated user |
 | O3 | **Diff integrity** — a repo-defined git filter can shape `diff.patch` | The agent controls the evidence of its own change | Snapshot the tree and compute changes without invoking repository-controlled helpers |
 | O4 | **Multi-tenant untested** | One org seeded; cross-tenant claims are assertions | Two real orgs and 40+ adversarial scenarios |
@@ -30,7 +30,7 @@ Every defect found during this phase, what fixed it, and what remains.
 | O8 | CI never executed | No `gh`, no remote, no push credential |
 | O9 | No SBOM; 1 low + 2 moderate advisories unclassified in writing | — |
 | O10 | No backup, no retention policy, no encryption at rest | — |
-| O11 | One flaky test (`isolation-gate`, 1 failure in 4 runs) | Volume-pool contention suspected; a flaky test is not evidence |
+| O11 | One flaky test (`isolation-gate`, 1 failure in 4 runs) | **Cause measured, not volume contention** (that earlier hypothesis was wrong: 0 stray locks, all volumes at 1%). `LocalSimulatedRuntime` fails `hash(taskId ␀ goal) % 1000 < 150` by design, and the fixture minted a random UUID task id, so asserting `succeeded` failed ~15% of runs (computed bucket 14.77%, observed 1/6). Fixed in Phase 6 with the documented `[simulate:ok]` lever; assertion unchanged; 10/10 consecutive runs |
 
 ## Deliberately not done
 

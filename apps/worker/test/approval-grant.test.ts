@@ -4,11 +4,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import type { PrismaClient } from '@intelligenz/database';
 
-import {
-  evaluateApprovalGrant,
-  validateTaskActivity,
-  type ApprovalCandidate,
-} from '../src/activities/validate-task';
+import { evaluateApprovalGrant, type ApprovalCandidate } from '../src/approvals/authorisation';
+import { validateTaskActivity } from '../src/activities/validate-task';
 import { computeTaskContentHash } from '../src/approvals/task-binding';
 import { resetWorkerConfig } from '../src/config';
 import { resetAgentRuntime } from '../src/runtime';
@@ -226,7 +223,10 @@ describe.skipIf(!enabled)('validateTaskActivity approval gate', () => {
 
     // The same approval, the same row: only the task moved. That is precisely what the
     // hash exists to detect, and what a status-only check would wave through.
-    await client.task.update({ where: { id: taskId }, data: { goal: `${GOAL} Also update the docs.` } });
+    await client.task.update({
+      where: { id: taskId },
+      data: { goal: `${GOAL} Also update the docs.` },
+    });
 
     await expect(validate(taskId)).rejects.toMatchObject({ type: 'APPROVAL_STALE' });
   });

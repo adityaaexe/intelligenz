@@ -18,10 +18,12 @@ import type { EventEnvelope, RiskClass, TaskStatus } from '@intelligenz/contract
  * Contract §16 signature, extended in Phase 5 with `attemptId`.
  *
  * `attemptId` is **optional in the type and required in practice**: the API always sends
- * it, but a workflow started directly through Temporal can omit it, and that case must be
- * a *refusal* the gate can name — not a workflow that fails to deserialize. An old
- * execution recorded before the field existed replays with `undefined` and is refused the
- * same way, which is the honest answer: its grant was never bound to an attempt.
+ * it, and since Phase 6 (F3) a workflow started without one is refused
+ * (`EXECUTION_CLAIM_REFUSED`) instead of running unclaimed — an execution with no
+ * reservation cannot be shown to be the only one, so "start the workflow by hand" now
+ * requires the attempt id `POST /run` minted. Optional in the type so an old execution
+ * recorded before the field existed replays into a *refusal* rather than a
+ * deserialization failure.
  */
 export interface RunTaskWorkflowInput {
   readonly taskId: string;
@@ -80,10 +82,7 @@ export interface RunnableTask {
 }
 
 export type NotRunnableReason =
-  | 'not_found'
-  | 'not_runnable'
-  | 'already_terminal'
-  | 'approval_required';
+  'not_found' | 'not_runnable' | 'already_terminal' | 'approval_required';
 
 export type ValidateTaskActivityResult =
   | { readonly runnable: true; readonly task: RunnableTask }
@@ -128,8 +127,35 @@ export interface ExecuteAgentActivityInput {
    * working: the database `WorkflowRun.id` this execution belongs to. Without it the
    * activity falls back to the newest run for the task, which is the same row under
    * the one-live-workflow-per-task rule. The workflow always passes it.
+   *
+   * **Not** the claim identity. That is `executionRunId` below; the two are different id
+   * spaces and conflating them would let a database row id stand in for an orchestrator
+   * run id.
    */
   readonly workflowRunId?: string;
+  /**
+   * Phase 6. The attempt `POST /run` reserved and `validateTaskActivity` claimed for this
+   * execution. The activity **requires** it in practice: without it there is no
+   * reservation to hold, and an execution that holds none is refused
+   * (`EXECUTION_CLAIM_REFUSED`) before the runtime is constructed.
+   *
+   * Optional in the type for the same reason as `RunTaskWorkflowInput.attemptId`: an
+   * execution recorded before this field existed replays with `undefined` and must be
+   * refused as a claim failure, not fail to deserialize.
+   */
+  readonly attemptId?: string;
+  /**
+   * Phase 6. Temporal's run id, consulted **only** when the activity has no execution
+   * context — a direct invocation from a test or an operational script. Inside a worker
+   * the id is read from `Context.current().info.workflowExecution.runId`, because an
+   * input field is a parameter, and a parameter can be forged by anything that can start
+   * a workflow.
+   *
+   * A direct call therefore proves only that the caller knows a run id; it cannot
+   * impersonate a different execution, because the claim it must satisfy was written
+   * under that same id.
+   */
+  readonly executionRunId?: string;
 }
 
 /** The normalised result, exactly as the port defines it. */

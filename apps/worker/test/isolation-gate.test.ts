@@ -15,6 +15,7 @@ import {
   createTask,
   createTenant,
   dropTenant,
+  reserveAndClaim,
   testDatabaseUrl,
   useTestDatabase,
   type TenantFixture,
@@ -122,12 +123,20 @@ describe.skipIf(!enabled)('isolation tier gate', () => {
     const fixture = await tenant('isolation-vm');
     const task = await createTask(client, fixture, { title: 'Requires a virtual machine' });
 
+    // Phase 6: the executor requires a held execution claim before it does anything, so
+    // the fixture supplies the reservation `POST /run` would have created. The refusal
+    // under test is still the isolation gate's — the claim is what lets the activity run
+    // far enough to reach it.
+    const claim = await reserveAndClaim(client, fixture, task);
+
     const failure = await withResourceProfile('VM', () =>
       attemptFailure({
         taskId: task.taskId,
         orgId: fixture.orgId,
         correlationId: 'isolation-vm',
         workflowRunId: task.workflowRunId,
+        attemptId: claim.attemptId,
+        executionRunId: claim.executionRunId,
       }),
     );
 
@@ -182,6 +191,8 @@ describe.skipIf(!enabled)('isolation tier gate', () => {
     const forged = ['WORKER_VM_AVAILABLE', 'KVM_AVAILABLE', 'VM_AVAILABLE', 'ISOLATION_TIER'];
     const previous = forged.map((name) => [name, process.env[name]] as const);
 
+    const claim = await reserveAndClaim(client, fixture, task);
+
     let failure: unknown;
 
     try {
@@ -193,6 +204,8 @@ describe.skipIf(!enabled)('isolation tier gate', () => {
           orgId: fixture.orgId,
           correlationId: 'isolation-forged-env',
           workflowRunId: task.workflowRunId,
+          attemptId: claim.attemptId,
+          executionRunId: claim.executionRunId,
         }),
       );
     } finally {
@@ -219,11 +232,15 @@ describe.skipIf(!enabled)('isolation tier gate', () => {
 
     // Every field a client-side model might try: a tier, a boolean, and a whole report.
     // None of them is read — the requirement is `profile.isolation`, chosen server-side.
+    const claim = await reserveAndClaim(client, fixture, task);
+
     const forged = {
       taskId: task.taskId,
       orgId: fixture.orgId,
       correlationId: 'isolation-forged-input',
       workflowRunId: task.workflowRunId,
+      attemptId: claim.attemptId,
+      executionRunId: claim.executionRunId,
       isolationTier: 'restricted-shared-kernel',
       requiresVm: false,
       isolation: { required: 'restricted-shared-kernel', effective: 'restricted-shared-kernel' },
@@ -256,12 +273,16 @@ describe.skipIf(!enabled)('isolation tier gate', () => {
       goal: 'Fix the failing test in src/sum.js and prove it passes. [simulate:ok]',
     });
 
+    const claim = await reserveAndClaim(client, fixture, task);
+
     const result = await withResourceProfile(undefined, () =>
       executeAgentActivity({
         taskId: task.taskId,
         orgId: fixture.orgId,
         correlationId: 'isolation-restricted',
         workflowRunId: task.workflowRunId,
+        attemptId: claim.attemptId,
+        executionRunId: claim.executionRunId,
       }),
     );
 

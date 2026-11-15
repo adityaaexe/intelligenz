@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { createPrismaClient, type PrismaClient } from '@intelligenz/database';
 
 import { loadNearestEnvFile } from '../../src/config';
+import { claimExecution } from '../../src/activities/claim';
 
 /**
  * Worker-test database access.
@@ -142,6 +143,47 @@ export async function createTask(
   });
 
   return { taskId: task.id, workflowRunId: run.id };
+}
+
+/**
+ * The row `POST /run` reserves and validation claims, written the way production writes
+ * it: a `queued` attempt plus a conditional claim by one execution run id.
+ *
+ * Phase 6 made the claim an entry condition of `executeAgentActivity`, so a test that
+ * calls the activity directly has to hold one — which is the point: there is no longer a
+ * direct invocation path that skips the reservation. `claimExecution` is used rather than
+ * a hand-written `updateMany` so the fixture cannot drift from the writer it stands in
+ * for.
+ */
+export async function reserveAndClaim(
+  client: PrismaClient,
+  tenant: TenantFixture,
+  task: TaskFixture,
+  executionRunId: string = `execution-${randomUUID()}`,
+): Promise<{ readonly attemptId: string; readonly executionRunId: string }> {
+  const attempt = await client.executionAttempt.create({
+    data: {
+      orgId: tenant.orgId,
+      taskId: task.taskId,
+      workflowRunId: task.workflowRunId,
+      attemptNumber: 1,
+      runtimeId: 'unassigned',
+      simulated: true,
+      status: 'queued',
+    },
+    select: { id: true },
+  });
+
+  await claimExecution({
+    orgId: tenant.orgId,
+    taskId: task.taskId,
+    projectId: tenant.projectId,
+    attemptId: attempt.id,
+    workflowRunId: executionRunId,
+    correlationId: randomUUID(),
+  });
+
+  return { attemptId: attempt.id, executionRunId };
 }
 
 /**

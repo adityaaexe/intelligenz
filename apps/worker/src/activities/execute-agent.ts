@@ -24,6 +24,7 @@ import {
   type WorkspaceHandle,
 } from '@intelligenz/workspace-manager';
 import { getWorkerConfig } from '../config';
+import { assertTaskAuthorised } from '../approvals/authorisation';
 import { detectIsolationCapability, isolationRefusalMessage, planIsolation } from '../isolation';
 import {
   applyIoMax,
@@ -68,6 +69,7 @@ import {
   startAttempt,
 } from './attempts';
 import { executionWorkspaceIdFor } from './ids';
+import { requireExecutionClaim, executionIdentity } from './claim';
 import { workerIdentity } from '../identity';
 import { workerLogger } from '../log';
 import { db, nonRetryable, retryable } from './support';
@@ -160,6 +162,32 @@ const MAX_TOOL_INVOCATIONS = 2_000;
 export async function executeAgentActivity(
   input: ExecuteAgentActivityInput,
 ): Promise<ExecuteAgentActivityResult> {
+  // ── The execution claim — the first act, before anything exists to undo ───────
+  //
+  // Not "first" as a figure of speech. This runs before the runtime adapter is
+  // constructed, before the task is read, before `startAttempt`, before the cgroup probe,
+  // before the workspace lease, before the broker and before `runtime.execute`. A refusal
+  // here has **zero** side effects: no attempt row, no workspace, no cgroup, no `AgentRun`,
+  // no broker request.
+  //
+  // It sits here rather than only in `validateTaskActivity` because activities are
+  // dispatched by *name*: any workflow on this worker's task queue can invoke
+  // `executeAgentActivity` directly, skipping validation entirely. Until this check
+  // existed, that path executed an unapproved HIGH-risk task with no claim written — the
+  // gate one activity upstream was real, and irrelevant to the caller that skipped it.
+  //
+  // The identity comes from the activity context, never from the input, except on the
+  // direct-invocation path where there is no context to read (`executionIdentity`).
+  const claim = await requireExecutionClaim({
+    orgId: input.orgId,
+    taskId: input.taskId,
+    attemptId: input.attemptId,
+    executionRunId: executionIdentity({
+      ...(input.executionRunId === undefined ? {} : { workflowRunId: input.executionRunId }),
+    }),
+    workflowRunId: input.workflowRunId,
+  });
+
   const config = getWorkerConfig();
   const runtime = getAgentRuntime(config);
   const simulatedAdapter = runtime.id === LOCAL_SIMULATED_ID;
@@ -167,12 +195,32 @@ export async function executeAgentActivity(
   const task = await db().task.findFirst({
     // Tenant scoping.
     where: { id: input.taskId, orgId: input.orgId },
-    select: { id: true, goal: true, riskClass: true, status: true, projectId: true },
+    select: {
+      id: true,
+      orgId: true,
+      goal: true,
+      title: true,
+      acceptanceCriteria: true,
+      riskClass: true,
+      derivedRiskClass: true,
+      riskFactors: true,
+      status: true,
+      projectId: true,
+    },
   });
 
   if (task === null) {
     throw nonRetryable('TASK_NOT_FOUND', `Task ${input.taskId} does not exist in this org.`);
   }
+
+  // ── The approval-and-risk gate, re-checked where the work starts ──────────────
+  //
+  // The same function `validateTaskActivity` calls, imported rather than re-implemented,
+  // at `launch` altitude: the claim above already proved this execution holds the
+  // reservation, so what remains is whether the grant still authorises *this attempt* —
+  // a revocation, an expiry, a content change, or a grant bound to a different attempt
+  // all refuse here even though validation saw a valid grant moments earlier.
+  await assertTaskAuthorised({ task, attemptId: claim.attemptId, altitude: 'launch' });
 
   // ── Resource policy, resolved before anything runs ────────────────────────────
   //
@@ -245,6 +293,9 @@ export async function executeAgentActivity(
       // No model call happened and none will: `simulated` is literal, not a placeholder.
       simulated: true,
       startedAt: new Date(),
+      // The claim this activity verified on entry. `startAttempt` adopts only a row
+      // carrying it, so even this retirement path cannot take another execution's row.
+      executionRunId: claim.executionRunId,
     });
 
     await finalizeAttempt({
@@ -342,7 +393,7 @@ export async function executeAgentActivity(
       `Workflow run ${workflowRun.id} already exhausted its CPU budget on an earlier ` +
         `attempt (${String(priorBudgetStops)} recorded stop(s), restart limit ` +
         `${String(CPU_BUDGET_RESTART_LIMIT)}). Refusing to restart it: the budget exists to ` +
-        'stop a runaway run, and retrying it would just buy more CPU. Raise the task\'s ' +
+        "stop a runaway run, and retrying it would just buy more CPU. Raise the task's " +
         'profile or split the task.',
     );
   }
@@ -356,6 +407,9 @@ export async function executeAgentActivity(
     // error has no result, and then the adapter's nature is the only honest value.
     simulated: simulatedAdapter,
     startedAt: new Date(),
+    // The same execution that passed the entry check. Adoption is conditional on the
+    // attempt carrying this claim (F2).
+    executionRunId: claim.executionRunId,
   });
 
   let lease: WorkspaceLease | undefined;

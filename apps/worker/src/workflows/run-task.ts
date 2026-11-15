@@ -81,9 +81,7 @@ const executorActivities = proxyActivities<typeof activitiesModule.activities>({
   },
 });
 
-export async function runTaskWorkflow(
-  input: RunTaskWorkflowInput,
-): Promise<RunTaskWorkflowResult> {
+export async function runTaskWorkflow(input: RunTaskWorkflowInput): Promise<RunTaskWorkflowResult> {
   const { taskId, orgId, correlationId } = input;
 
   // `runId` is the Temporal run id. It is what `recordStartActivity` uses to adopt the
@@ -168,6 +166,10 @@ export async function runTaskWorkflow(
       // The database run id, not the Temporal one: the attempt's `workflowRunId` is a
       // foreign key, and `recordStartActivity` has already resolved which row this is.
       workflowRunId: started.workflowRunId,
+      // Phase 6: the reservation `POST /run` minted. Passed explicitly so a direct
+      // start that omitted it is refused at the launch site rather than running without
+      // a claim; an old history replays with `undefined` and is refused the same way.
+      ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
     });
 
     await taskActivities.persistResultActivity({ taskId, orgId, result });
@@ -241,7 +243,8 @@ async function failBeforeExecution(
     return { status: 'failed', summary: validation.detail };
   }
 
-  const code = validation.reason === 'approval_required' ? 'APPROVAL_REQUIRED' : 'TASK_NOT_RUNNABLE';
+  const code =
+    validation.reason === 'approval_required' ? 'APPROVAL_REQUIRED' : 'TASK_NOT_RUNNABLE';
 
   await taskActivities.completeTaskActivity({
     taskId: input.taskId,
@@ -433,7 +436,9 @@ function envelope(input: EnvelopeInput): EventEnvelope {
   };
 }
 
-function outcomeOf(status: 'succeeded' | 'failed' | 'timeout' | 'cancelled'): RunTaskWorkflowResult['status'] {
+function outcomeOf(
+  status: 'succeeded' | 'failed' | 'timeout' | 'cancelled',
+): RunTaskWorkflowResult['status'] {
   if (status === 'succeeded') return 'succeeded';
   if (status === 'cancelled') return 'cancelled';
 
@@ -503,7 +508,8 @@ function errorChain(error: unknown, depth = 0): readonly unknown[] {
   if (depth > 6) return [];
 
   const chain: unknown[] = [error];
-  const cause = typeof error === 'object' && error !== null ? (error as { cause?: unknown }).cause : undefined;
+  const cause =
+    typeof error === 'object' && error !== null ? (error as { cause?: unknown }).cause : undefined;
 
   if (cause !== undefined && cause !== error) chain.push(...errorChain(cause, depth + 1));
 

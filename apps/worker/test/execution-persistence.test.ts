@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,6 +17,7 @@ import {
   createTask,
   createTenant,
   dropTenant,
+  reserveAndClaim,
   testDatabaseUrl,
   useTestDatabase,
   type TenantFixture,
@@ -82,11 +84,16 @@ describe.skipIf(!enabled)('execution attempts', () => {
       goal: 'Fix the failing test and prove it passes. [simulate:ok]',
     });
 
+    // The reservation and the claim, then the activity — the order production forces.
+    const claim = await reserveAndClaim(client, fixture, task);
+
     const first = await executeAgentActivity({
       taskId: task.taskId,
       orgId: fixture.orgId,
       correlationId: 'attempt-test-1',
       workflowRunId: task.workflowRunId,
+      attemptId: claim.attemptId,
+      executionRunId: claim.executionRunId,
     });
 
     expect(first.simulated).toBe(true);
@@ -110,6 +117,9 @@ describe.skipIf(!enabled)('execution attempts', () => {
       orgId: fixture.orgId,
       correlationId: 'attempt-test-2',
       workflowRunId: task.workflowRunId,
+      // The same execution: a Temporal retry keeps its run id, and the claim it holds.
+      attemptId: claim.attemptId,
+      executionRunId: claim.executionRunId,
     });
 
     expect(second.status).toBe('succeeded');
@@ -121,6 +131,12 @@ describe.skipIf(!enabled)('execution attempts', () => {
 
     expect(afterSecond.map((row) => row.attemptNumber)).toEqual([1, 2]);
     expect(afterSecond.every((row) => row.simulated)).toBe(true);
+    // The retry's second attempt carries the same execution's claim: no attempt that ran
+    // is left with a NULL holder.
+    expect(afterSecond.map((row) => row.claimedByWorkflowRunId)).toEqual([
+      claim.executionRunId,
+      claim.executionRunId,
+    ]);
   }, 30_000);
 
   it('never reuses an attempt number even when a caller asks twice', async () => {
@@ -139,6 +155,7 @@ describe.skipIf(!enabled)('execution attempts', () => {
       runtimeId: 'local-simulated',
       simulated: true,
       startedAt: new Date(),
+      executionRunId: `execution-${randomUUID()}`,
     });
     const two = await startAttempt({
       orgId: fixture.orgId,
@@ -147,6 +164,7 @@ describe.skipIf(!enabled)('execution attempts', () => {
       runtimeId: 'local-simulated',
       simulated: true,
       startedAt: new Date(),
+      executionRunId: `execution-${randomUUID()}`,
     });
 
     expect([one.attemptNumber, two.attemptNumber]).toEqual([1, 2]);
@@ -162,11 +180,15 @@ describe.skipIf(!enabled)('result persistence', () => {
       goal: 'Write a report. [simulate:ok]',
     });
 
+    const claim = await reserveAndClaim(client, fixture, task);
+
     const result = await executeAgentActivity({
       taskId: task.taskId,
       orgId: fixture.orgId,
       correlationId: 'persist-1',
       workflowRunId: task.workflowRunId,
+      attemptId: claim.attemptId,
+      executionRunId: claim.executionRunId,
     });
 
     expect(result.simulated).toBe(true);
@@ -178,7 +200,9 @@ describe.skipIf(!enabled)('result persistence', () => {
       result,
     });
 
-    const agentRun = await client.agentRun.findUniqueOrThrow({ where: { id: persisted.agentRunId } });
+    const agentRun = await client.agentRun.findUniqueOrThrow({
+      where: { id: persisted.agentRunId },
+    });
 
     expect(agentRun.simulated).toBe(true);
     expect(agentRun.model).toBe('simulated');
@@ -204,11 +228,15 @@ describe.skipIf(!enabled)('result persistence', () => {
     const fixture = await tenant('persist-lie');
     const task = await createTask(client, fixture, { title: 'Refuse a simulated lie' });
 
+    const claim = await reserveAndClaim(client, fixture, task);
+
     const result = await executeAgentActivity({
       taskId: task.taskId,
       orgId: fixture.orgId,
       correlationId: 'persist-lie',
       workflowRunId: task.workflowRunId,
+      attemptId: claim.attemptId,
+      executionRunId: claim.executionRunId,
     });
 
     await expect(
@@ -238,6 +266,7 @@ describe.skipIf(!enabled)('result persistence', () => {
       runtimeId: 'opencode-cli',
       simulated: false,
       startedAt: new Date(),
+      executionRunId: `execution-${randomUUID()}`,
     });
 
     const workspaceId = executionWorkspaceIdFor(run.id, 1);
@@ -263,8 +292,18 @@ describe.skipIf(!enabled)('result persistence', () => {
       runtimeVersion: '2.2.7',
       providerMeta: { model: 'commandcode/deepseek/deepseek-v4-flash', workspaceId },
       toolInvocations: [
-        { sequence: 1, tool: 'read', summary: 'read src/sum.js', occurredAt: new Date().toISOString() },
-        { sequence: 2, tool: 'edit', summary: 'edit src/sum.js', occurredAt: new Date().toISOString() },
+        {
+          sequence: 1,
+          tool: 'read',
+          summary: 'read src/sum.js',
+          occurredAt: new Date().toISOString(),
+        },
+        {
+          sequence: 2,
+          tool: 'edit',
+          summary: 'edit src/sum.js',
+          occurredAt: new Date().toISOString(),
+        },
       ],
     };
 
@@ -274,7 +313,9 @@ describe.skipIf(!enabled)('result persistence', () => {
       result,
     });
 
-    const agentRun = await client.agentRun.findUniqueOrThrow({ where: { id: persisted.agentRunId } });
+    const agentRun = await client.agentRun.findUniqueOrThrow({
+      where: { id: persisted.agentRunId },
+    });
 
     expect(agentRun.simulated).toBe(false);
     expect(agentRun.runtimeVersion).toBe('2.2.7');
@@ -282,7 +323,9 @@ describe.skipIf(!enabled)('result persistence', () => {
     expect(agentRun.model).toBe('commandcode/deepseek/deepseek-v4-flash');
     expect(agentRun.costUsd?.toString()).toBe('0.0005');
 
-    const workspace = await client.executionWorkspace.findUniqueOrThrow({ where: { id: workspaceId } });
+    const workspace = await client.executionWorkspace.findUniqueOrThrow({
+      where: { id: workspaceId },
+    });
     expect(workspace.agentRunId).toBe(agentRun.id);
 
     const invocations = await client.toolInvocation.findMany({
@@ -308,6 +351,7 @@ describe.skipIf(!enabled)('result persistence', () => {
       runtimeId: 'opencode-cli',
       simulated: false,
       startedAt: new Date(),
+      executionRunId: `execution-${randomUUID()}`,
     });
 
     const occurredAt = new Date().toISOString();
@@ -342,7 +386,9 @@ describe.skipIf(!enabled)('result persistence', () => {
     expect(rows[0]?.sequence).toBe(1);
     expect(rows[199]?.sequence).toBe(200);
 
-    const agentRun = await client.agentRun.findUniqueOrThrow({ where: { id: persisted.agentRunId } });
+    const agentRun = await client.agentRun.findUniqueOrThrow({
+      where: { id: persisted.agentRunId },
+    });
     expect(agentRun.providerMeta).toMatchObject({
       toolInvocations: { total: 205, persisted: 200, truncated: true },
     });

@@ -10,7 +10,9 @@ import type { PrismaClient } from '@intelligenz/database';
 
 import { activities } from '../src/activities';
 import { finalizeAttempt, startAttempt } from '../src/activities/attempts';
-import { decideAttemptBinding, validateTaskActivity } from '../src/activities/validate-task';
+import { claimExecution } from '../src/activities/claim';
+import { decideAttemptBinding } from '../src/approvals/authorisation';
+import { validateTaskActivity } from '../src/activities/validate-task';
 import { computeTaskContentHash } from '../src/approvals/task-binding';
 import { resetWorkerConfig } from '../src/config';
 import { resetAgentRuntime } from '../src/runtime';
@@ -210,7 +212,9 @@ async function assertNothingRan(reservation: Reservation): Promise<void> {
     }),
   ).toBe(0);
   expect(
-    await prisma.executionWorkspace.count({ where: { orgId: owned.orgId, taskId: reservation.taskId } }),
+    await prisma.executionWorkspace.count({
+      where: { orgId: owned.orgId, taskId: reservation.taskId },
+    }),
   ).toBe(0);
 
   const attempt = await prisma.executionAttempt.findUniqueOrThrow({
@@ -235,7 +239,11 @@ describe('decideAttemptBinding (pure)', () => {
   });
 
   it('refuses a different attempt with APPROVAL_ATTEMPT_MISMATCH', () => {
-    const refusal = decideAttemptBinding({ ...base, attemptId: 'attempt-2', attemptStatus: 'queued' });
+    const refusal = decideAttemptBinding({
+      ...base,
+      attemptId: 'attempt-2',
+      attemptStatus: 'queued',
+    });
 
     expect(refusal?.code).toBe('APPROVAL_ATTEMPT_MISMATCH');
   });
@@ -258,13 +266,21 @@ describe('decideAttemptBinding (pure)', () => {
   });
 
   it('refuses a run that names no attempt', () => {
-    const refusal = decideAttemptBinding({ ...base, attemptId: undefined, attemptStatus: undefined });
+    const refusal = decideAttemptBinding({
+      ...base,
+      attemptId: undefined,
+      attemptStatus: undefined,
+    });
 
     expect(refusal?.code).toBe('APPROVAL_NOT_RESERVED');
   });
 
   it('refuses an attempt whose reservation has already been taken', () => {
-    const refusal = decideAttemptBinding({ ...base, attemptId: 'attempt-1', attemptStatus: 'running' });
+    const refusal = decideAttemptBinding({
+      ...base,
+      attemptId: 'attempt-1',
+      attemptStatus: 'running',
+    });
 
     expect(refusal?.code).toBe('APPROVAL_ATTEMPT_MISMATCH');
   });
@@ -380,10 +396,37 @@ describe.skipIf(!enabled)('validateTaskActivity attempt binding', () => {
 });
 
 describe.skipIf(!enabled)('startAttempt adopts the reservation', () => {
+  /**
+   * The row `POST /run` reserved, claimed by the execution that is about to start it.
+   *
+   * Adoption is conditional on the claim (Phase 6, F2), so a test that wants to exercise
+   * adoption must first write the claim — through `claimExecution`, the same writer
+   * validation uses, not by hand.
+   */
+  async function claim(reservation: Reservation, workflowRunId: string): Promise<void> {
+    const { prisma, tenant: owned } = fixture();
+
+    await claimExecution({
+      orgId: owned.orgId,
+      taskId: reservation.taskId,
+      projectId: owned.projectId,
+      attemptId: reservation.attemptId,
+      workflowRunId,
+      correlationId: randomUUID(),
+    });
+
+    // Referenced so the fixture's client is the one the claim wrote through; a second
+    // client would make the assertion below a different connection's view.
+    void prisma;
+  }
+
   it('claims the queued attempt instead of inserting a second one', async () => {
     const reservation = await reservedTask('adopt');
+    const execution = `execution-${randomUUID()}`;
 
     const { prisma, tenant: owned } = fixture();
+
+    await claim(reservation, execution);
 
     const attempt = await startAttempt({
       orgId: owned.orgId,
@@ -392,6 +435,7 @@ describe.skipIf(!enabled)('startAttempt adopts the reservation', () => {
       runtimeId: 'local-simulated',
       simulated: true,
       startedAt: new Date(),
+      executionRunId: execution,
     });
 
     expect(attempt.id).toBe(reservation.attemptId);
@@ -413,8 +457,9 @@ describe.skipIf(!enabled)('startAttempt adopts the reservation', () => {
 
     const { prisma, tenant: owned } = fixture();
 
-    // A direct start for the same task: a second workflow run with no reservation of its
-    // own. It must not borrow the first run's queued attempt.
+    // A second workflow run for the same task, with no reservation of its own. The first
+    // run's attempt is *unclaimed* here, which is the weaker case: even then the second
+    // run must not borrow it, because the CAS also requires `workflowRunId` to match.
     const otherRun = await prisma.workflowRun.create({
       data: {
         orgId: owned.orgId,
@@ -433,6 +478,7 @@ describe.skipIf(!enabled)('startAttempt adopts the reservation', () => {
       runtimeId: 'local-simulated',
       simulated: true,
       startedAt: new Date(),
+      executionRunId: `execution-${randomUUID()}`,
     });
 
     expect(attempt.attemptNumber).toBe(1);
@@ -448,8 +494,11 @@ describe.skipIf(!enabled)('startAttempt adopts the reservation', () => {
 
   it('allocates attempt #2 after attempt #1 was finalized, so a retry keeps its history', async () => {
     const reservation = await reservedTask('retry-history');
+    const execution = `execution-${randomUUID()}`;
 
     const { prisma, tenant: owned } = fixture();
+
+    await claim(reservation, execution);
 
     const first = await startAttempt({
       orgId: owned.orgId,
@@ -458,6 +507,7 @@ describe.skipIf(!enabled)('startAttempt adopts the reservation', () => {
       runtimeId: 'local-simulated',
       simulated: true,
       startedAt: new Date(),
+      executionRunId: execution,
     });
 
     await finalizeAttempt({
@@ -474,6 +524,7 @@ describe.skipIf(!enabled)('startAttempt adopts the reservation', () => {
       runtimeId: 'local-simulated',
       simulated: true,
       startedAt: new Date(),
+      executionRunId: execution,
     });
 
     expect([first.attemptNumber, second.attemptNumber]).toEqual([1, 2]);
@@ -481,12 +532,14 @@ describe.skipIf(!enabled)('startAttempt adopts the reservation', () => {
     const rows = await prisma.executionAttempt.findMany({
       where: { workflowRunId: reservation.workflowRunId },
       orderBy: { attemptNumber: 'asc' },
-      select: { attemptNumber: true, status: true },
+      select: { attemptNumber: true, status: true, claimedByWorkflowRunId: true },
     });
 
     expect(rows).toEqual([
-      { attemptNumber: 1, status: 'failed' },
-      { attemptNumber: 2, status: 'running' },
+      { attemptNumber: 1, status: 'failed', claimedByWorkflowRunId: execution },
+      // The retry's new attempt carries the same claim: the row that ran is attributable
+      // to the authority that allowed it, which is the whole point of the column.
+      { attemptNumber: 2, status: 'running', claimedByWorkflowRunId: execution },
     ]);
   });
 });
@@ -578,6 +631,8 @@ function probeTcp(address: string): Promise<{ ok: boolean; reason: string }> {
     socket.setTimeout(1_500);
     socket.once('connect', () => finish(true, `Temporal reachable at ${address}`));
     socket.once('timeout', () => finish(false, `Temporal timed out at ${address}`));
-    socket.once('error', (error) => finish(false, `Temporal unreachable at ${address}: ${error.message}`));
+    socket.once('error', (error) =>
+      finish(false, `Temporal unreachable at ${address}: ${error.message}`),
+    );
   });
 }
