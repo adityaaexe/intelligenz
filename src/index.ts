@@ -1,5 +1,12 @@
 export { Journal, parseJournal, verifyJournal, type VerifyResult } from './journal.js';
 export {
+  createAnchor,
+  readAnchor,
+  verifyAnchor,
+  type Anchor,
+  type AnchorVerifyResult,
+} from './anchor.js';
+export {
   replay,
   type EventHandler,
   type ReplayHandlerMap,

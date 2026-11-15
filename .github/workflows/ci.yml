@@ -31,3 +31,5 @@ jobs:
           "
           node dist/src/cli.js verify smoke.jsonl
           node dist/src/cli.js tail smoke.jsonl 1
+          node dist/src/cli.js anchor smoke.jsonl --out smoke.anchor.json
+          node dist/src/cli.js verify smoke.jsonl --anchor smoke.anchor.json

@@ -1,6 +1,6 @@
 {
   "name": "intelligenz",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Deterministic, tamper-evident run journals for multi-agent systems.",
   "license": "MIT",
   "type": "module",
@@ -20,7 +20,9 @@
   },
   "files": [
     "dist/src",
+    "docs",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
