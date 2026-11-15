@@ -1,0 +1,23 @@
+-- Phase 6 (AG-604): the claim records the workflow id it was granted under.
+--
+-- Additive only. One nullable column, no back-fill, no index, nothing narrowed or
+-- reinterpreted.
+--
+-- The defect this closes: the release pass identified a claim's holder by run id alone
+-- and asked Temporal about it under the **derived** workflow id `task-<taskId>`. Since
+-- `describeWorkflowExecution` is keyed by workflow id *and* run id, a claim written by a
+-- workflow started under any other id answered NOT_FOUND — and since AG-603 correctly
+-- classifies NOT_FOUND as "absent", the pass released a claim held by a **live**
+-- execution. Its next terminal write was then refused, so the run could not record its
+-- result: a fail-open release in the one module that must never fail open.
+--
+-- The fix is to record the identity instead of deriving it. `validateTaskActivity` reads
+-- `Context.current().info.workflowExecution.workflowId` — server-set context, as
+-- unforgeable as the run id beside it — and writes it in the same conditional UPDATE that
+-- grants the claim. The release probe then asks about the recorded pair and nothing else.
+--
+-- NULL means the claim predates this column. Such a claim cannot be probed exactly, so
+-- the release pass treats it as doubt and skips it (`unknown`): a stranded claim costs
+-- availability, a released live claim costs work. Deliberately not back-filled, because a
+-- guessed workflow id would be indistinguishable from an observed one.
+ALTER TABLE "ExecutionAttempt" ADD COLUMN "claimedByWorkflowId" TEXT;

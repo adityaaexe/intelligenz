@@ -5,6 +5,7 @@ import {
   EXECUTION_IDENTITY_UNAVAILABLE,
   claimExecution,
   executionIdentity,
+  executionWorkflowId,
 } from './claim';
 import { db, nonRetryableWithDetails } from './support';
 
@@ -250,6 +251,12 @@ async function claimForExecution(
     projectId: task.projectId,
     attemptId,
     workflowRunId,
+    // Phase 6 re-review N7: the workflow id is recorded beside the run id, in the same
+    // conditional write, so the release pass can later ask Temporal about the exact
+    // execution instead of guessing `task-<taskId>` for it. Read from the same
+    // server-set context as the run id above; `null` if this call has no workflow
+    // context (which the shipped path cannot be — see the module header).
+    workflowId: executionWorkflowId(),
     // The request correlation when there is one; otherwise the execution itself, which
     // is a server-side id and the thing a claim is actually about.
     correlationId: input.correlationId ?? workflowRunId,

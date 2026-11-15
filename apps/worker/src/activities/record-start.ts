@@ -3,6 +3,7 @@ import type {
   RecordStartActivityInput,
   RecordStartActivityResult,
 } from '../shared/contracts';
+import { executionIdentity, requireStartAuthority } from './claim';
 import { db, nonRetryable } from './support';
 
 /**
@@ -23,6 +24,20 @@ import { db, nonRetryable } from './support';
 export async function recordStartActivity(
   input: RecordStartActivityInput,
 ): Promise<RecordStartActivityResult> {
+  // ── Authority before the first read, let alone the first write — N4 residual ──
+  //
+  // Dispatched by name, so before AG-604 any workflow on this worker's task queue could
+  // move a task `queued → running` — the reviewer's probe did exactly that from a
+  // standalone activity. There is no pre-dispatch arm for a start: every legitimate call
+  // happens after `validateTaskActivity` granted the claim, so a call without one is a
+  // second execution rather than a refusal.
+  await requireStartAuthority({
+    orgId: input.orgId,
+    taskId: input.taskId,
+    attemptId: input.attemptId,
+    executionRunId: executionIdentity(),
+  });
+
   const prisma = db();
   const now = new Date();
 

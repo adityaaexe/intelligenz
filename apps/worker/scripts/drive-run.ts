@@ -51,6 +51,24 @@ Supply the queued attempt id that POST /run returned in its 202 body:
 
 For a task with no reservation, create one first (POST /run), then start with its id.`;
 
+/**
+ * The second refusal: an attempt id that was **supplied but is blank**.
+ *
+ * A different operator mistake from an omitted argument, and a different fix: shell magic
+ * (`$ATTEMPT_ID` unset, `""` from a script) produces an empty word rather than a missing
+ * one. It is refused before a Temporal handshake for the same reason, and reported with its
+ * own message so the operator can tell the two cases apart.
+ */
+const EMPTY_ATTEMPT_ID = `drive-run.ts start: the attempt id is empty.
+
+An empty string is not an attempt id: it names no reservation, so the workflow would be
+started, refused by validateTaskActivity three activities later, and reported as a worker
+failure rather than as the argument bug it is.
+
+Check the value you are passing (an unset shell variable expands to nothing):
+
+  drive-run.ts start <taskId> <orgId> <attemptId> [correlationId]`;
+
 async function main(): Promise<void> {
   loadNearestEnvFile();
 
@@ -66,6 +84,11 @@ async function main(): Promise<void> {
   // and making the operator wait for a Temporal handshake to be told so is noise. The
   // alternative — letting the workflow start — fails three activities later with
   // EXECUTION_CLAIM_REFUSED and reads like a worker bug rather than a missing argument.
+  //
+  // Two refusals, deliberately, and each is observed by its own test: *omitted* here, and
+  // *empty* below. They are distinct mistakes with distinct fixes, so they are distinct
+  // guards rather than one guard duplicated — a duplicate would let a revert of either one
+  // hide behind the other.
   if (command === 'start') {
     const [orgId, attemptId] = rest;
 
@@ -75,8 +98,14 @@ async function main(): Promise<void> {
       return;
     }
 
-    if (attemptId === undefined || attemptId.trim().length === 0) {
+    if (attemptId === undefined) {
       process.stderr.write(`${MISSING_ATTEMPT_ID}\n`);
+      process.exitCode = 2;
+      return;
+    }
+
+    if (attemptId.trim().length === 0) {
+      process.stderr.write(`${EMPTY_ATTEMPT_ID}\n`);
       process.exitCode = 2;
       return;
     }
@@ -89,12 +118,12 @@ async function main(): Promise<void> {
       case 'start': {
         const [orgId, attemptId, correlationId] = rest;
 
-        // Narrowed by the pre-flight above; restated for the type system rather than with
-        // a non-null assertion.
+        // Narrowed by the pre-flight above. This is an invariant, not a second refusal: if
+        // it ever fires, the pre-flight was changed and the dispatch must not proceed on a
+        // guess. It deliberately does not print an operator message — it would be
+        // indistinguishable from the refusals above and would mask a revert of either.
         if (orgId === undefined || attemptId === undefined) {
-          process.stderr.write(`${MISSING_ATTEMPT_ID}\n`);
-          process.exitCode = 2;
-          return;
+          throw new Error('drive-run.ts: the start pre-flight did not narrow the arguments');
         }
 
         const started = await client.startRunTask({

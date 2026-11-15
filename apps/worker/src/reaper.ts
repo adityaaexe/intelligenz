@@ -51,16 +51,23 @@ export type WorkflowLiveness = 'active' | 'finished' | 'absent' | 'unknown';
 export interface WorkflowLivenessProbe {
   status(taskId: string): Promise<WorkflowLiveness>;
   /**
-   * Liveness of **one specific execution**, identified by the orchestrator's run id.
+   * Liveness of **one specific execution**, identified by the workflow id **and** run id
+   * the claim recorded.
    *
    * `status(taskId)` answers "is the workflow for this task running"; this answers "is
    * the execution that holds this claim still there", which is a different question and
-   * the only one a claim release may act on. The workflow id is derived from the task
-   * (`task-<taskId>`, the same rule the API starts with), and the run id is the claim's
-   * holder — so a claim left by an execution that has since been replaced by a new one
-   * under the same workflow id is still resolved to *the execution that wrote it*.
+   * the only one a claim release may act on. Both ids are supplied by the claim
+   * (`ExecutionAttempt.claimedByWorkflowId` / `claimedByWorkflowRunId`), which is why the
+   * claimed pair is recorded rather than derived: `describeWorkflowExecution` is keyed by
+   * the pair, so asking about `task-<taskId>` plus a run id minted for any other workflow
+   * id answers NOT_FOUND for a **live** execution. Phase 6 re-review N7 released a live
+   * claim exactly that way; the recorded pair is what makes this question exact.
+   *
+   * Returns `absent` only when the server says there is no such execution. A claim whose
+   * workflow id was never recorded cannot be asked about exactly and must not be probed
+   * with a guess — `claim-release.ts` skips it before calling this.
    */
-  execution(taskId: string, workflowRunId: string): Promise<WorkflowLiveness>;
+  execution(workflowId: string, workflowRunId: string): Promise<WorkflowLiveness>;
 }
 
 /** gRPC "not found": there is no execution, which is a definite answer, not an error. */
@@ -148,14 +155,16 @@ export function createTemporalProbe(options: {
       }
     },
 
-    async execution(taskId: string, workflowRunId: string): Promise<WorkflowLiveness> {
+    async execution(workflowId: string, workflowRunId: string): Promise<WorkflowLiveness> {
       try {
-        // Both ids on purpose: the workflow id alone would resolve to whichever
-        // execution Temporal currently holds under it, and a claim belongs to a run id.
+        // Both ids on purpose, and both as recorded: the workflow id alone would resolve
+        // to whichever execution Temporal currently holds under it, and the run id alone
+        // is not a key. Substituting the task's derived id for the recorded one is N7 —
+        // it turns a live claim held by a non-canonical execution into `absent`.
         const described = await (
           await connect()
         ).workflow
-          .getHandle(`${WORKFLOW_ID_PREFIX}${taskId}`, workflowRunId)
+          .getHandle(workflowId, workflowRunId)
           .describe();
 
         const name = described.status.name;

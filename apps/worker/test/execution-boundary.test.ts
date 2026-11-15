@@ -19,6 +19,7 @@ import { runClaimReleasePass } from '../src/claim-release';
 import { getWorkerConfig, resetWorkerConfig } from '../src/config';
 import { createTemporalProbe } from '../src/reaper';
 import { resetAgentRuntime } from '../src/runtime';
+import { AGENT_ACTOR_ID } from '../src/shared/actors';
 import type { RunTaskWorkflowResult } from '../src/shared/contracts';
 import {
   createExecutionHarness,
@@ -244,6 +245,7 @@ async function claimedSession(reservation: Reservation): Promise<ExecutionSessio
 
 async function attemptRow(attemptId: string): Promise<{
   status: string;
+  claimedByWorkflowId: string | null;
   claimedByWorkflowRunId: string | null;
   claimedAt: Date | null;
   terminationReason: string | null;
@@ -252,6 +254,7 @@ async function attemptRow(attemptId: string): Promise<{
     where: { id: attemptId },
     select: {
       status: true,
+      claimedByWorkflowId: true,
       claimedByWorkflowRunId: true,
       claimedAt: true,
       terminationReason: true,
@@ -933,7 +936,11 @@ describe.skipIf(!temporalEnabled)('N4 — persistence and completion require aut
     if (harness === undefined) throw new Error('suite not initialised');
 
     const fixture = await tenant('n4-complete-rogue');
-    const reservation = await reservedTask(fixture, 'complete-rogue');
+    // `queued`, so the write would actually land if the arm admitted it. A `ready` task
+    // cannot be completed (`completeTask`'s guard is queued/running/verifying), so the
+    // refusal would be the only observable outcome even with the workflow-id check removed
+    // — the test would pass for the wrong reason (N4 review note).
+    const reservation = await reservedTask(fixture, 'complete-rogue', { status: 'queued' });
 
     // No claim anywhere, so the pre-dispatch arm applies — and it requires the caller to be
     // `task-<taskId>`. This session's id is a random `probe-…`, which is what a rogue
@@ -956,7 +963,7 @@ describe.skipIf(!temporalEnabled)('N4 — persistence and completion require aut
       select: { status: true },
     });
 
-    expect(task.status).toBe('ready');
+    expect(task.status).toBe('queued');
   }, 60_000);
 
   it('allows the pre-dispatch arm for the task’s own execution, so a refusal is still recorded', async () => {
@@ -1017,7 +1024,10 @@ describe.skipIf(!enabled)(
       return runClaimReleasePass({
         prisma: client,
         probe: {
-          execution: async (_taskId, workflowRunId) => answers[workflowRunId] ?? 'unknown',
+          // Keyed by run id, and the workflow id is asserted where it matters: this stub's
+          // subject is the *decision* the pass makes, and the exact-pair question is
+          // proved against the shipped probe below (N7).
+          execution: async (_workflowId, workflowRunId) => answers[workflowRunId] ?? 'unknown',
         },
         intervalMs: INTERVAL_MS,
         // Scoped to this suite's rows through the answers map: anything else is `unknown`
@@ -1026,18 +1036,25 @@ describe.skipIf(!enabled)(
       });
     }
 
-    /** A reservation claimed by `execution`, old enough to be a candidate. */
+    /**
+     * A reservation whose claim records **both** ids, the way `validateTaskActivity` does.
+     *
+     * The pair is the point of N7: a claim is identified by the workflow id *and* the run
+     * id, because that is what `describeWorkflowExecution` is keyed by. A fixture that
+     * wrote only the run id would describe a row production cannot produce any more.
+     */
     async function strandedAttempt(
       fixture: TenantFixture,
       label: string,
-      execution: string,
+      holder: { readonly workflowId: string; readonly runId: string },
     ): Promise<Reservation> {
       const reservation = await reservedTask(fixture, label);
 
       await client.executionAttempt.update({
         where: { id: reservation.attemptId },
         data: {
-          claimedByWorkflowRunId: execution,
+          claimedByWorkflowId: holder.workflowId,
+          claimedByWorkflowRunId: holder.runId,
           // Two intervals plus a margin: inside the grace window a claim is not even looked
           // at, because the workflow holding it may not have reached adoption yet.
           claimedAt: new Date(Date.now() - INTERVAL_MS * 4),
@@ -1050,13 +1067,21 @@ describe.skipIf(!enabled)(
     it('releases a claim whose workflow run is provably absent, and audits the evidence', async () => {
       const fixture = await tenant('f4-vanished');
       const execution = `execution-vanished-${randomUUID()}`;
-      const reservation = await strandedAttempt(fixture, 'vanished', execution);
+      const workflowId = `task-vanished-${randomUUID()}`;
+      const reservation = await strandedAttempt(fixture, 'vanished', {
+        workflowId,
+        runId: execution,
+      });
 
       const result = await releasePass({ [execution]: 'absent' });
 
       const action = result.actions.find((entry) => entry.attemptId === reservation.attemptId);
 
-      expect(action).toMatchObject({ outcome: 'released', workflowRunId: execution });
+      expect(action).toMatchObject({
+        outcome: 'released',
+        workflowId,
+        workflowRunId: execution,
+      });
 
       const row = await attemptRow(reservation.attemptId);
 
@@ -1064,6 +1089,7 @@ describe.skipIf(!enabled)(
       // "never claimed", with the release recorded in the audit trail instead of disguised
       // as an unclaimed row carrying a suspicious timestamp.
       expect(row.status).toBe('failed');
+      expect(row.claimedByWorkflowId).toBeNull();
       expect(row.claimedByWorkflowRunId).toBeNull();
       expect(row.claimedAt).toBeNull();
       expect(row.terminationReason).toBe('crashed');
@@ -1081,6 +1107,8 @@ describe.skipIf(!enabled)(
       expect(audits[0]?.payload).toMatchObject({
         attemptId: reservation.attemptId,
         taskId: reservation.taskId,
+        // Both ids, so an operator can re-run the exact question the pass asked.
+        workflowId,
         workflowRunId: execution,
         liveness: 'absent',
       });
@@ -1089,7 +1117,10 @@ describe.skipIf(!enabled)(
     it('releases a claim whose workflow finished without adopting, and audits that evidence too', async () => {
       const fixture = await tenant('f4-finished');
       const execution = `execution-finished-${randomUUID()}`;
-      const reservation = await strandedAttempt(fixture, 'finished', execution);
+      const reservation = await strandedAttempt(fixture, 'finished', {
+        workflowId: `task-finished-${randomUUID()}`,
+        runId: execution,
+      });
 
       const result = await releasePass({ [execution]: 'finished' });
 
@@ -1114,7 +1145,10 @@ describe.skipIf(!enabled)(
     it('never releases a claim held by a live workflow — the negative control', async () => {
       const fixture = await tenant('f4-live');
       const execution = `execution-live-${randomUUID()}`;
-      const reservation = await strandedAttempt(fixture, 'live', execution);
+      const reservation = await strandedAttempt(fixture, 'live', {
+        workflowId: `task-live-${randomUUID()}`,
+        runId: execution,
+      });
 
       const result = await releasePass({ [execution]: 'active' });
 
@@ -1129,6 +1163,7 @@ describe.skipIf(!enabled)(
       const row = await attemptRow(reservation.attemptId);
 
       expect(row.status).toBe('queued');
+      expect(row.claimedByWorkflowId).toMatch(/^task-live-/);
       expect(row.claimedByWorkflowRunId).toBe(execution);
       expect(row.claimedAt).not.toBeNull();
 
@@ -1146,7 +1181,10 @@ describe.skipIf(!enabled)(
     it('never releases on a timer alone: an unanswerable probe is doubt, not absence', async () => {
       const fixture = await tenant('f4-unknown');
       const execution = `execution-unknown-${randomUUID()}`;
-      const reservation = await strandedAttempt(fixture, 'unknown', execution);
+      const reservation = await strandedAttempt(fixture, 'unknown', {
+        workflowId: `task-unknown-${randomUUID()}`,
+        runId: execution,
+      });
 
       // The probe has no answer for this run, which is what an unreachable Temporal looks
       // like. Age is not evidence.
@@ -1171,7 +1209,11 @@ describe.skipIf(!enabled)(
 
       await client.executionAttempt.update({
         where: { id: reservation.attemptId },
-        data: { claimedByWorkflowRunId: execution, claimedAt: new Date() },
+        data: {
+          claimedByWorkflowId: `task-fresh-${randomUUID()}`,
+          claimedByWorkflowRunId: execution,
+          claimedAt: new Date(),
+        },
       });
 
       const result = await releasePass({ [execution]: 'absent' });
@@ -1189,13 +1231,13 @@ describe.skipIf(!enabled)(
     }, 30_000);
 
     /**
-     * N2 — the `absent` answer, end to end, from the **shipped** probe.
+     * N2 and N7 — the answers, end to end, from the **shipped** probe.
      *
      * The five tests above inject a stub probe, so the shipped `createTemporalProbe` had no
      * coverage at all — which is how the re-review found that `absent` was unreachable: the
      * SDK converts gRPC `NOT_FOUND` into `WorkflowNotFoundError`, which carries no `code`,
      * so the classifier answered `unknown` and the release could only ever fire for a
-     * *terminal* run. These two tests run the real probe against the real server.
+     * *terminal* run. The tests below run the real probe against the real server.
      *
      * The answers are scoped to this test's own run ids on purpose: `runClaimReleasePass`
      * scans the whole table, other suites in this package run concurrently against the same
@@ -1211,49 +1253,97 @@ describe.skipIf(!enabled)(
 
       return {
         probe: {
-          execution: async (taskId: string, workflowRunId: string) =>
-            owned.has(workflowRunId) ? probe.execution(taskId, workflowRunId) : 'unknown',
+          // The **pair**, as recorded. A run id outside this test's set is a stranger's row.
+          execution: async (workflowId: string, workflowRunId: string) =>
+            owned.has(workflowRunId) ? probe.execution(workflowId, workflowRunId) : 'unknown',
         },
         close: () => probe.close(),
       };
     }
 
-    // N2 needs the shipped probe against a real server; without one these skip, visibly.
-    describe.skipIf(!temporalEnabled)('N2 — the shipped probe against a real server', () => {
-      it('releases a claim whose run the server has never heard of — the unreachable arm', async () => {
+    /** One release pass with the real probe, scoped to `owned`. */
+    async function realPass(owned: ReadonlySet<string>) {
+      const { probe, close } = scopedRealProbe(owned);
+
+      try {
+        return await runClaimReleasePass({
+          prisma: client,
+          probe,
+          intervalMs: INTERVAL_MS,
+          batchSize: 200,
+        });
+      } finally {
+        await close();
+      }
+    }
+
+    /**
+     * The claim a stranded attempt holds, written the way `validateTaskActivity` writes it.
+     *
+     * Read from the catalogue first, because the workflow-id column is the fix this file
+     * tests: on a checkout that predates it (the commit N7 was found in) the state below
+     * cannot be expressed at all, and the N7 test must still be *runnable* there — it fails
+     * because that commit probes a derived `task-<taskId>` and releases a live claim, which
+     * is the defect, not because the fixture could not be written.
+     */
+    async function claimRecordsWorkflowId(): Promise<boolean> {
+      const rows = await client.$queryRaw<Array<{ present: boolean }>>`
+        SELECT EXISTS (
+          SELECT 1 FROM information_schema.columns
+           WHERE table_schema = current_schema()
+             AND table_name = 'ExecutionAttempt'
+             AND column_name = 'claimedByWorkflowId'
+        ) AS present`;
+
+      return rows[0]?.present === true;
+    }
+
+    async function holdClaim(
+      attemptId: string,
+      holder: { readonly workflowId: string | null; readonly runId: string },
+    ): Promise<void> {
+      const recordsWorkflowId = await claimRecordsWorkflowId();
+
+      await client.executionAttempt.update({
+        where: { id: attemptId },
+        data: {
+          claimedByWorkflowRunId: holder.runId,
+          claimedAt: new Date(Date.now() - INTERVAL_MS * 4),
+          ...(recordsWorkflowId ? { claimedByWorkflowId: holder.workflowId } : {}),
+        },
+      });
+    }
+
+    // N2 and N7 need the shipped probe against a real server; without one these skip,
+    // visibly.
+    describe.skipIf(!temporalEnabled)('N2 / N7 — the shipped probe against a real server', () => {
+      it('releases a claim whose recorded execution the server has never heard of', async () => {
         const fixture = await tenant('n2-absent');
         // A **UUID**, because that is what a run id is. The server answers a malformed run id
         // with gRPC 3 (invalid argument) rather than NOT_FOUND, and that is a different fact:
         // the id is wrong, not the execution missing. `absent-run-is-malformed` below keeps
         // that distinction honest.
         const execution = randomUUID();
-        const reservation = await strandedAttempt(fixture, 'absent-run', execution);
+        const reservation = await reservedTask(fixture, 'absent-run');
+        // The canonical workflow id, which is what a claim that outlived its execution's
+        // retention actually records. The pair does not exist → `absent` → release.
+        await holdClaim(reservation.attemptId, {
+          workflowId: `task-${reservation.taskId}`,
+          runId: execution,
+        });
 
-        const { probe, close } = scopedRealProbe(new Set([execution]));
+        const result = await realPass(new Set([execution]));
 
-        try {
-          // The claim holder is a run id that does not exist. `describeWorkflowExecution`
-          // answers NOT_FOUND, the SDK raises `WorkflowNotFoundError`, and classification by
-          // identity is what stops this being `unknown`.
-          const result = await runClaimReleasePass({
-            prisma: client,
-            probe,
-            intervalMs: INTERVAL_MS,
-            batchSize: 200,
-          });
-
-          expect(
-            result.actions.find((entry) => entry.attemptId === reservation.attemptId),
-          ).toMatchObject({ outcome: 'released', workflowRunId: execution });
-        } finally {
-          await close();
-        }
+        expect(
+          result.actions.find((entry) => entry.attemptId === reservation.attemptId),
+        ).toMatchObject({ outcome: 'released', workflowRunId: execution });
 
         // Before AG-603 this row stayed `queued` and claimed for ever: the only outcome the
         // pass could produce for a deleted or aged-out run was `skipped_unknown`.
         const row = await attemptRow(reservation.attemptId);
 
         expect(row.status).toBe('failed');
+        expect(row.claimedByWorkflowId).toBeNull();
         expect(row.claimedByWorkflowRunId).toBeNull();
 
         const audits = await client.auditEvent.findMany({
@@ -1275,24 +1365,17 @@ describe.skipIf(!enabled)(
         // the claim is nonsense — and the pass must still skip. This is the negative control
         // for the classifier: fail-closed survives the N2 fix.
         const execution = `execution-malformed-${randomUUID()}`;
-        const reservation = await strandedAttempt(fixture, 'malformed-run', execution);
+        const reservation = await reservedTask(fixture, 'malformed-run');
+        await holdClaim(reservation.attemptId, {
+          workflowId: `task-${reservation.taskId}`,
+          runId: execution,
+        });
 
-        const { probe, close } = scopedRealProbe(new Set([execution]));
+        const result = await realPass(new Set([execution]));
 
-        try {
-          const result = await runClaimReleasePass({
-            prisma: client,
-            probe,
-            intervalMs: INTERVAL_MS,
-            batchSize: 200,
-          });
-
-          expect(
-            result.actions.find((entry) => entry.attemptId === reservation.attemptId),
-          ).toMatchObject({ outcome: 'skipped_unknown' });
-        } finally {
-          await close();
-        }
+        expect(
+          result.actions.find((entry) => entry.attemptId === reservation.attemptId),
+        ).toMatchObject({ outcome: 'skipped_unknown' });
 
         const row = await attemptRow(reservation.attemptId);
 
@@ -1300,48 +1383,36 @@ describe.skipIf(!enabled)(
         expect(row.claimedByWorkflowRunId).toBe(execution);
       }, 60_000);
 
-      it('does not release a claim held by a live run, measured by the same real probe', async () => {
+      it('does not release a claim held by a live run under the canonical workflow id', async () => {
         if (harness === undefined) throw new Error('suite not initialised');
 
         const fixture = await tenant('n2-live');
         const reservation = await reservedTask(fixture, 'live-run');
 
         // A real, running execution started under the id the orchestrator derives for this
-        // task (`task-<taskId>`), which is the id `createTemporalProbe` asks the server about.
-        // A `probe-…` id would be a *different* execution and the probe would correctly call
-        // this claim absent. The session is started and never given steps, so it stays in
-        // `probeExecution`'s `condition` — a live workflow, not a guess.
+        // task (`task-<taskId>`). The session is started and never given steps, so it stays
+        // in `probeExecution`'s `condition` — a live workflow, not a guess.
         const live = await harness.session({ workflowId: `task-${reservation.taskId}` });
 
-        await client.executionAttempt.update({
-          where: { id: reservation.attemptId },
-          data: {
-            claimedByWorkflowRunId: live.runId,
-            claimedAt: new Date(Date.now() - INTERVAL_MS * 4),
-          },
+        await holdClaim(reservation.attemptId, {
+          workflowId: `task-${reservation.taskId}`,
+          runId: live.runId,
         });
 
-        const { probe, close } = scopedRealProbe(new Set([live.runId]));
-
         try {
-          const result = await runClaimReleasePass({
-            prisma: client,
-            probe,
-            intervalMs: INTERVAL_MS,
-            batchSize: 200,
-          });
+          const result = await realPass(new Set([live.runId]));
 
           expect(
             result.actions.find((entry) => entry.attemptId === reservation.attemptId),
           ).toMatchObject({ outcome: 'skipped_live' });
         } finally {
-          await close();
           await live.stop();
         }
 
         const row = await attemptRow(reservation.attemptId);
 
         expect(row.status).toBe('queued');
+        expect(row.claimedByWorkflowId).toBe(`task-${reservation.taskId}`);
         expect(row.claimedByWorkflowRunId).toBe(live.runId);
 
         expect(
@@ -1354,7 +1425,467 @@ describe.skipIf(!enabled)(
           }),
         ).toBe(0);
       }, 60_000);
+
+      /**
+       * N7 — the reviewer's §G reproduction, against the shipped probe.
+       *
+       * The claim's holder is a **live** execution started under a workflow id that is not
+       * `task-<taskId>`. Before AG-604 the probe asked the server about
+       * `task-<taskId>` + this run id; the server has no such run under that id and answers
+       * NOT_FOUND; the N2 classifier — correctly — mapped that to `absent`; and the pass
+       * released a claim whose execution was `RUNNING`. The run's next terminal write was
+       * then refused `EXECUTION_CLAIM_REFUSED`, so it could not record its result: a
+       * fail-open release, produced by a correct fix to a fail-closed bug.
+       *
+       * The fix is not a weaker classifier. It is that the claim records the workflow id it
+       * was granted under, and the probe asks about **that pair**. This test is the §G
+       * reproduction; it fails on the commit before the fix.
+       */
+      it('does not release a claim held by a live execution whose workflow id is not task-<taskId>', async () => {
+        if (harness === undefined) throw new Error('suite not initialised');
+
+        const fixture = await tenant('n7-live-foreign-id');
+        const reservation = await reservedTask(fixture, 'n7-live-foreign');
+
+        // The shape any non-orchestrator start produces: a back-office workflow, a replay,
+        // another workflow type on the queue, or this harness. Live, and not `task-<id>`.
+        const workflowId = `probe-${randomUUID()}`;
+        const live = await harness.session({ workflowId });
+
+        await holdClaim(reservation.attemptId, { workflowId, runId: live.runId });
+
+        try {
+          const result = await realPass(new Set([live.runId]));
+
+          expect(
+            result.actions.find((entry) => entry.attemptId === reservation.attemptId),
+          ).toMatchObject({ outcome: 'skipped_live', workflowId, workflowRunId: live.runId });
+        } finally {
+          await live.stop();
+        }
+
+        // The claim is intact and the attempt is untouched. This is the whole assertion: a
+        // live execution may still adopt, and its authority to finish is not taken away.
+        const row = await attemptRow(reservation.attemptId);
+
+        expect(row.status).toBe('queued');
+        expect(row.claimedByWorkflowId).toBe(workflowId);
+        expect(row.claimedByWorkflowRunId).toBe(live.runId);
+        expect(row.claimedAt).not.toBeNull();
+
+        expect(
+          await client.auditEvent.count({
+            where: {
+              orgId: fixture.orgId,
+              aggregateId: reservation.attemptId,
+              eventType: 'execution.claim_released.v1',
+            },
+          }),
+        ).toBe(0);
+      }, 60_000);
+
+      it('releases a claim whose recorded execution has finished, and audits the pair', async () => {
+        if (harness === undefined) throw new Error('suite not initialised');
+
+        const fixture = await tenant('n7-finished');
+        const reservation = await reservedTask(fixture, 'n7-finished-run');
+
+        // A real execution, started under the canonical id, that ends without adopting.
+        const workflowId = `task-${reservation.taskId}`;
+        const finished = await harness.session({ workflowId });
+        await finished.stop();
+
+        await holdClaim(reservation.attemptId, { workflowId, runId: finished.runId });
+
+        const result = await realPass(new Set([finished.runId]));
+
+        expect(
+          result.actions.find((entry) => entry.attemptId === reservation.attemptId),
+        ).toMatchObject({ outcome: 'released', workflowId, workflowRunId: finished.runId });
+
+        const row = await attemptRow(reservation.attemptId);
+
+        expect(row.status).toBe('failed');
+        expect(row.terminationReason).toBe('crashed');
+        expect(row.claimedByWorkflowId).toBeNull();
+        expect(row.claimedByWorkflowRunId).toBeNull();
+
+        const audits = await client.auditEvent.findMany({
+          where: {
+            orgId: fixture.orgId,
+            aggregateId: reservation.attemptId,
+            eventType: 'execution.claim_released.v1',
+          },
+          select: { payload: true },
+        });
+
+        expect(audits).toHaveLength(1);
+        expect(audits[0]?.payload).toMatchObject({
+          workflowId,
+          workflowRunId: finished.runId,
+          liveness: 'finished',
+        });
+      }, 60_000);
+
+      it('skips a claim that records no workflow id instead of guessing one', async () => {
+        // The pre-migration shape: `claimedByWorkflowRunId` set, `claimedByWorkflowId` NULL.
+        // Nothing may derive `task-<taskId>` for it — that guess is what N7 released a live
+        // claim with — and doubt is not evidence, so the row is skipped. It stays stranded,
+        // which is the documented cost of the fail-closed answer.
+        const fixture = await tenant('n7-legacy');
+        const execution = randomUUID();
+        const reservation = await reservedTask(fixture, 'n7-legacy-run');
+
+        await client.executionAttempt.update({
+          where: { id: reservation.attemptId },
+          data: {
+            claimedByWorkflowId: null,
+            claimedByWorkflowRunId: execution,
+            claimedAt: new Date(Date.now() - INTERVAL_MS * 4),
+          },
+        });
+
+        // The probe must not be consulted at all: there is no pair to ask about.
+        const asked: string[] = [];
+        const result = await runClaimReleasePass({
+          prisma: client,
+          probe: {
+            execution: async (workflowId, workflowRunId) => {
+              asked.push(`${workflowId}/${workflowRunId}`);
+              return 'absent';
+            },
+          },
+          intervalMs: INTERVAL_MS,
+          batchSize: 200,
+        });
+
+        expect(
+          result.actions.find((entry) => entry.attemptId === reservation.attemptId),
+        ).toMatchObject({ outcome: 'skipped_unknown', workflowId: null });
+
+        expect(asked).not.toContain(`task-${reservation.taskId}/${execution}`);
+
+        const row = await attemptRow(reservation.attemptId);
+
+        expect(row.status).toBe('queued');
+        expect(row.claimedByWorkflowId).toBeNull();
+        expect(row.claimedByWorkflowRunId).toBe(execution);
+      }, 60_000);
     });
+  },
+);
+
+describe.skipIf(!temporalEnabled)('N8 — the pre-dispatch arm may only record a refusal', () => {
+  it('refuses `succeeded` for a task with no attempts and no AgentRun', async () => {
+    if (harness === undefined) throw new Error('suite not initialised');
+
+    const fixture = await tenant('n8-succeeded');
+    // `queued`, which is the state `POST /run` leaves behind and the only non-terminal state
+    // `completeTask` will write. A `ready` fixture would make this test blind: the write
+    // would be a no-op for a reason unrelated to authority, and the refusal would appear to
+    // hold even if the arm let `succeeded` through.
+    const reservation = await reservedTask(fixture, 'n8-succeeded', { status: 'queued' });
+
+    // No claim anywhere, and the caller *is* this task's own execution — so the only thing
+    // that can refuse the write is the status itself.
+    const session = await harness.session({ workflowId: `task-${reservation.taskId}` });
+
+    try {
+      await expect(
+        session.call({
+          op: 'complete',
+          input: { taskId: reservation.taskId, orgId: fixture.orgId, status: 'succeeded' },
+        }),
+      ).rejects.toMatchObject({ type: 'EXECUTION_CLAIM_REFUSED', nonRetryable: true });
+    } finally {
+      await session.stop();
+    }
+
+    // Nothing was written. A task that never executed cannot be a success, and the run that
+    // would have carried the success did not move either.
+    const task = await client.task.findUniqueOrThrow({
+      where: { id: reservation.taskId },
+      select: { status: true },
+    });
+
+    expect(task.status).toBe('queued');
+
+    const run = await client.workflowRun.findUniqueOrThrow({
+      where: { id: reservation.workflowRunId },
+      select: { status: true, error: true, finishedAt: true },
+    });
+
+    expect(run.status).toBe('queued');
+    expect(run.error).toBeNull();
+    expect(run.finishedAt).toBeNull();
+
+    expect(await client.agentRun.count({ where: { orgId: fixture.orgId } })).toBe(0);
+    expect((await attemptRow(reservation.attemptId)).status).toBe('queued');
+  }, 60_000);
+});
+
+/**
+ * N4, the class rather than the instance — Phase 6, AG-604.
+ *
+ * `persistResultActivity` and `completeTaskActivity` were authority-checked in AG-603, but
+ * `emitEventActivity` and `recordStartActivity` were still dispatchable by name with no
+ * authority at all: the reviewer wrote a valid `task.succeeded.v1` and moved a task
+ * `queued → running` from **standalone** activities. AG-604 makes the event the durable
+ * record of a refused run, which raises what forging it is worth, so both now go through
+ * the same two arms as completion.
+ *
+ * Every test below is the reviewer's shape: dispatch by name, from an execution that is
+ * not entitled to the write, and assert that nothing was written.
+ */
+describe.skipIf(!temporalEnabled)(
+  'N4 residual — the event writer and the start record require authority',
+  () => {
+    /** A well-formed envelope, since a malformed one would fail for the wrong reason. */
+    function taskEvent(
+      reservation: Reservation,
+      eventType: string,
+      idempotencyKey: string,
+    ): Record<string, unknown> {
+      return {
+        eventId: randomUUID(),
+        eventType,
+        schemaVersion: 1,
+        tenantId: reservation.orgId,
+        projectId: reservation.projectId,
+        aggregateId: reservation.taskId,
+        occurredAt: new Date().toISOString(),
+        actor: { type: 'agent', id: AGENT_ACTOR_ID },
+        correlationId: randomUUID(),
+        causationId: null,
+        idempotencyKey,
+        payload: { taskId: reservation.taskId },
+      };
+    }
+
+    async function auditsFor(reservation: Reservation, eventType: string): Promise<number> {
+      return client.auditEvent.count({
+        where: { orgId: reservation.orgId, aggregateId: reservation.taskId, eventType },
+      });
+    }
+
+    it('refuses a `task.succeeded.v1` written by a standalone activity', async () => {
+      if (harness === undefined) throw new Error('suite not initialised');
+
+      const fixture = await tenant('n4-emit-standalone');
+      const reservation = await reservedTask(fixture, 'emit-standalone', { status: 'queued' });
+
+      await expect(
+        harness.executeStandalone('emitEventActivity', [
+          { event: taskEvent(reservation, 'task.succeeded.v1', `n4-${randomUUID()}`) },
+        ]),
+      ).rejects.toMatchObject({ type: 'EXECUTION_IDENTITY_UNAVAILABLE', nonRetryable: true });
+
+      expect(await auditsFor(reservation, 'task.succeeded.v1')).toBe(0);
+    }, 60_000);
+
+    it('refuses a `task.succeeded.v1` written by a workflow that is not this task’s execution', async () => {
+      if (harness === undefined) throw new Error('suite not initialised');
+
+      const fixture = await tenant('n4-emit-rogue');
+      const reservation = await reservedTask(fixture, 'emit-rogue', { status: 'queued' });
+
+      // A real execution, random id, no claim: it knows the task id and nothing else.
+      const session = await harness.session();
+
+      try {
+        await expect(
+          session.call({
+            op: 'emit',
+            input: { event: taskEvent(reservation, 'task.succeeded.v1', `n4-${randomUUID()}`) },
+          }),
+        ).rejects.toMatchObject({ type: 'EXECUTION_CLAIM_REFUSED', nonRetryable: true });
+      } finally {
+        await session.stop();
+      }
+
+      expect(await auditsFor(reservation, 'task.succeeded.v1')).toBe(0);
+
+      const task = await client.task.findUniqueOrThrow({
+        where: { id: reservation.taskId },
+        select: { status: true },
+      });
+
+      expect(task.status).toBe('queued');
+    }, 60_000);
+
+    it('refuses a `task.succeeded.v1` from this task’s own execution when it holds no claim', async () => {
+      if (harness === undefined) throw new Error('suite not initialised');
+
+      const fixture = await tenant('n4-emit-canonical-no-claim');
+      const reservation = await reservedTask(fixture, 'emit-canonical', { status: 'queued' });
+
+      // Identity alone is not authority: a run that never claimed anything may record a
+      // refusal, and a success is not one.
+      const session = await harness.session({ workflowId: `task-${reservation.taskId}` });
+
+      try {
+        await expect(
+          session.call({
+            op: 'emit',
+            input: { event: taskEvent(reservation, 'task.succeeded.v1', `n4-${randomUUID()}`) },
+          }),
+        ).rejects.toMatchObject({ type: 'EXECUTION_CLAIM_REFUSED', nonRetryable: true });
+      } finally {
+        await session.stop();
+      }
+
+      expect(await auditsFor(reservation, 'task.succeeded.v1')).toBe(0);
+    }, 60_000);
+
+    it('refuses the refusal event from a workflow that is not this task’s execution', async () => {
+      if (harness === undefined) throw new Error('suite not initialised');
+
+      const fixture = await tenant('n4-emit-foreign-refusal');
+      const reservation = await reservedTask(fixture, 'emit-foreign-refusal', { status: 'queued' });
+
+      // `task.failed.v1` is the one event the pre-dispatch arm admits — but only from this
+      // task's **own** execution. A workflow started under `task-<id>-direct` (or any other
+      // id) is not it, so its refusal is not its to record on the task. This is the shape
+      // `approval-attempt-binding`'s direct-start fixture used to carry, and it is refused
+      // here rather than silently: the run's own result and history are the record.
+      const session = await harness.session({ workflowId: `task-${reservation.taskId}-direct` });
+
+      try {
+        await expect(
+          session.call({
+            op: 'emit',
+            input: { event: taskEvent(reservation, 'task.failed.v1', `n4-${randomUUID()}`) },
+          }),
+        ).rejects.toMatchObject({ type: 'EXECUTION_CLAIM_REFUSED', nonRetryable: true });
+      } finally {
+        await session.stop();
+      }
+
+      expect(await auditsFor(reservation, 'task.failed.v1')).toBe(0);
+    }, 60_000);
+
+    it('allows the refusal event the pre-dispatch failure path exists to write', async () => {
+      if (harness === undefined) throw new Error('suite not initialised');
+
+      const fixture = await tenant('n4-emit-refusal');
+      const reservation = await reservedTask(fixture, 'emit-refusal', { status: 'queued' });
+
+      // The state `runTaskWorkflow` is in when validation refuses: no claim, this task's own
+      // execution, and `task.failed.v1` is the only durable record the refusal will get. If
+      // this stopped working, every approval refusal would become invisible.
+      const session = await harness.session({ workflowId: `task-${reservation.taskId}` });
+      const event = taskEvent(reservation, 'task.failed.v1', `n4-refusal-${randomUUID()}`);
+
+      try {
+        const emitted = await session.call<Record<string, unknown>>({
+          op: 'emit',
+          input: { event, attemptId: reservation.attemptId },
+        });
+
+        expect(emitted).toMatchObject({ eventId: event['eventId'], created: true });
+      } finally {
+        await session.stop();
+      }
+
+      expect(await auditsFor(reservation, 'task.failed.v1')).toBe(1);
+
+      // The attempt is forwarded and holds no claim; the arm did not need one. It also did
+      // not spend anything: `failed` recorded, reservation untouched.
+      expect((await attemptRow(reservation.attemptId)).claimedByWorkflowRunId).toBeNull();
+    }, 60_000);
+
+    it('refuses a start recorded by a standalone activity', async () => {
+      if (harness === undefined) throw new Error('suite not initialised');
+
+      const fixture = await tenant('n4-start-standalone');
+      const reservation = await reservedTask(fixture, 'start-standalone', { status: 'queued' });
+
+      // The reviewer's probe: move a task `queued → running` by dispatching the activity by
+      // name, with no workflow and no claim.
+      await expect(
+        harness.executeStandalone('recordStartActivity', [
+          {
+            taskId: reservation.taskId,
+            orgId: fixture.orgId,
+            workflowRunId: randomUUID(),
+            attemptId: reservation.attemptId,
+          },
+        ]),
+      ).rejects.toMatchObject({ type: 'EXECUTION_IDENTITY_UNAVAILABLE', nonRetryable: true });
+
+      const task = await client.task.findUniqueOrThrow({
+        where: { id: reservation.taskId },
+        select: { status: true },
+      });
+
+      expect(task.status).toBe('queued');
+    }, 60_000);
+
+    it('refuses a start recorded by a workflow that holds no claim', async () => {
+      if (harness === undefined) throw new Error('suite not initialised');
+
+      const fixture = await tenant('n4-start-no-claim');
+      const reservation = await reservedTask(fixture, 'start-no-claim', { status: 'queued' });
+
+      // Canonical id, no claim: the pre-dispatch arm has no case for a start, because the
+      // claim is granted *before* the transition this activity writes.
+      const session = await harness.session({ workflowId: `task-${reservation.taskId}` });
+
+      try {
+        await expect(
+          session.call({
+            op: 'start',
+            input: {
+              taskId: reservation.taskId,
+              orgId: fixture.orgId,
+              workflowRunId: randomUUID(),
+              attemptId: reservation.attemptId,
+            },
+          }),
+        ).rejects.toMatchObject({ type: 'EXECUTION_CLAIM_REFUSED', nonRetryable: true });
+      } finally {
+        await session.stop();
+      }
+
+      const task = await client.task.findUniqueOrThrow({
+        where: { id: reservation.taskId },
+        select: { status: true },
+      });
+
+      expect(task.status).toBe('queued');
+    }, 60_000);
+
+    it('allows the start the claim authorises, so the normal path still records it', async () => {
+      if (harness === undefined) throw new Error('suite not initialised');
+
+      const fixture = await tenant('n4-start-claimed');
+      const reservation = await reservedTask(fixture, 'start-claimed', { status: 'queued' });
+      const session = await claimedSession(reservation);
+
+      try {
+        const started = await session.call<Record<string, unknown>>({
+          op: 'start',
+          input: {
+            taskId: reservation.taskId,
+            orgId: fixture.orgId,
+            // The Temporal run id is what `recordStartActivity` adopts the run row by.
+            workflowRunId: session.runId,
+            attemptId: reservation.attemptId,
+          },
+        });
+
+        expect(started).toMatchObject({ started: true, taskStatus: 'running' });
+      } finally {
+        await session.stop();
+      }
+
+      const task = await client.task.findUniqueOrThrow({
+        where: { id: reservation.taskId },
+        select: { status: true },
+      });
+
+      expect(task.status).toBe('running');
+    }, 60_000);
   },
 );
 

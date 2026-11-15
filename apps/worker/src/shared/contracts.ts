@@ -94,6 +94,17 @@ export interface RecordStartActivityInput {
    * this is what lets the worker adopt that row instead of creating a second one.
    */
   readonly workflowRunId: string;
+  /**
+   * Phase 6 re-review N4 (residual class). The attempt whose claim authorises this write.
+   *
+   * `recordStartActivity` is registered and dispatched by name, so before AG-604 any
+   * workflow on the worker's task queue could move a task `queued → running` without ever
+   * validating it. The activity now requires the claim, and this names it. Not trusted —
+   * `requireStartAuthority` checks the claim against the run id in the activity context,
+   * which is the half a caller cannot choose — and there is no pre-dispatch case: every
+   * legitimate call happens after `validateTaskActivity` granted the claim.
+   */
+  readonly attemptId?: string;
 }
 
 export interface RecordStartActivityResult {
@@ -169,6 +180,17 @@ export interface PersistResultActivityResult {
 
 export interface EmitEventActivityInput {
   readonly event: EventEnvelope;
+  /**
+   * Phase 6 re-review N4 (residual class). The attempt whose claim authorises this write,
+   * forwarded by the workflow when it holds one.
+   *
+   * The envelope has no attempt in it, so it has to be an input. It is not trusted: it
+   * selects the arm, and `requireEventAuthority` then checks the claim against the run id
+   * from the activity context. A `task.*` event may only be written by an execution that
+   * holds the task's claim, or — with no claim anywhere — by the task's own execution, and
+   * then only for the two refusal events.
+   */
+  readonly attemptId?: string;
 }
 
 export interface EmitEventActivityResult {

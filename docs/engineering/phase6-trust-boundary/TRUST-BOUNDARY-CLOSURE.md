@@ -82,10 +82,11 @@ to start manually is already returned by `POST /run` in its `202` body.
 ### F4 — a vanished workflow's claim is released, and only then
 
 `apps/worker/src/claim-release.ts` — `runClaimReleasePass()`, called from the reaper's tick
-(`reaper.ts:735`). Candidates are `queued` + claimed + older than two reaper intervals;
+(`reaper.ts:788`). Candidates are `queued` + claimed + older than two reaper intervals;
 that age filter selects candidates and never decides a release. The release requires the
-probe's answer for **that specific run** (`WorkflowLivenessProbe.execution`, backed by
-`describeWorkflowExecution` with the workflow id *and* run id):
+probe's answer for **that specific execution** (`WorkflowLivenessProbe.execution`, backed by
+`describeWorkflowExecution` with the **recorded pair** — workflow id *and* run id, never a
+workflow id derived from the task; see AG-604):
 
 | Temporal | Outcome |
 |---|---|
@@ -95,11 +96,11 @@ probe's answer for **that specific run** (`WorkflowLivenessProbe.execution`, bac
 | unreachable / anything else | skip |
 
 The release itself is one conditional `updateMany` (still `queued`, still claimed by *that*
-run) inside a transaction with an `execution.claim_released.v1` audit row carrying the
-liveness evidence. The row becomes `failed` / `ATTEMPT_ABANDONED` / `terminationReason:
-'crashed'`, and both claim columns go NULL — keeping `NULL` meaning "never claimed", with
-the release recorded in the audit trail instead of disguised as an unclaimed row carrying a
-suspicious timestamp.
+pair) inside a transaction with an `execution.claim_released.v1` audit row carrying the
+liveness evidence and both ids. The row becomes `failed` / `ATTEMPT_ABANDONED` /
+`terminationReason: 'crashed'`, and all three claim columns go NULL — keeping `NULL` meaning
+"never claimed", with the release recorded in the audit trail instead of disguised as an
+unclaimed row carrying a suspicious timestamp.
 
 The module is imported by the reaper and by tests, and by nothing under `src/activities/`.
 `test/execution-boundary.test.ts` asserts that structurally, so a future import cannot
@@ -139,3 +140,11 @@ quietly hand an execution the ability to release its own claim.
    there is nothing to reap — but if the claim was committed and `startAttempt` succeeded
    before the crash, the attempt is `running`, not `queued`, and the pre-existing reaper
    path applies instead.
+5. **A claim that records no workflow id is never released** (AG-604). Rows written before
+   `claimedByWorkflowId` existed, and any claim written without workflow context, cannot be
+   probed exactly: deriving `task-<taskId>` is what released a live claim (N7). They are
+   skipped (`unknown`) and stay stranded. Fail-closed on purpose; the cost is availability,
+   and the alternative cost is a destroyed run.
+6. **A pre-Phase-6 `running` attempt wedges its task** (N9/N11, AG-604). The exact row
+   shape and the reason the predicate is not relaxed are in
+   `AG-604-CLAIM-IDENTITY-AND-WRITE-AUTHORITY.md` §4 and in `activities/claim.ts`.

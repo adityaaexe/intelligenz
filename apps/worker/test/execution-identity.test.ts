@@ -699,6 +699,20 @@ describe('N3 — drive-run.ts refuses a start without an attempt id', () => {
     expect(failure.stdout).toBe('');
   }, 60_000);
 
+  it('refuses an attempt id that was supplied but is empty, with its own message', async () => {
+    // A different mistake from an omitted argument — `$ATTEMPT_ID` unset, or `""` from a
+    // script — and a different guard. This test exists so removing *that* guard alone fails
+    // something: before AG-604 the two guards shared one message and one of them could be
+    // deleted with the suite still green.
+    const failure = await runDriveRun(['start', `task-${randomUUID()}`, 'org-1', '   ']);
+
+    expect(failure.code).toBe(2);
+    expect(failure.stderr).toContain('the attempt id is empty');
+    // Not the missing-argument message: the two refusals must be tellable apart.
+    expect(failure.stderr).not.toContain('an attempt id is required');
+    expect(failure.stdout).toBe('');
+  }, 60_000);
+
   it('keeps the usage line honest for a start that names only a task', async () => {
     const failure = await runDriveRun(['start', `task-${randomUUID()}`]);
 

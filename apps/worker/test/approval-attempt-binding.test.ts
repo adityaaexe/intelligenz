@@ -576,9 +576,16 @@ describe.skipIf(!temporalEnabled)('a direct Temporal start with no attempt id', 
 
     try {
       // No API, no attempt id. The grant is live and reserved — by someone else.
+      //
+      // The **canonical** id, because that is the shape the refusal path can still record:
+      // since AG-604 the audit event is authority-checked too, so a run started under an id
+      // that is not this task's own may not write `task.failed.v1` for it (asserted in
+      // `execution-boundary.test.ts`, "refuses the refusal event from a workflow that is not
+      // this task's execution"). AG-603 already refused such a run's *terminal* write; this
+      // fixture now matches the id production uses and the refusal stays visible.
       const handle = await temporal.workflow.start('runTaskWorkflow', {
         taskQueue,
-        workflowId: `task-${reservation.taskId}-direct`,
+        workflowId: `task-${reservation.taskId}`,
         args: [
           {
             taskId: reservation.taskId,

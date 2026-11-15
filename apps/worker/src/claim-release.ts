@@ -22,9 +22,10 @@ import { workerLogger } from './log';
  *
  * ## When it may release, and when it may not
  *
- * **Only when the claim's workflow run is provably gone.** The age of the claim selects
+ * **Only when the claim's execution is provably gone.** The age of the claim selects
  * *candidates*; it never decides a release. For every candidate, Temporal is asked about
- * that specific execution (`describeWorkflowExecution`, by workflow id **and** run id):
+ * that specific execution, by the **pair the claim recorded**
+ * (`claimedByWorkflowId` + `claimedByWorkflowRunId`), through `describeWorkflowExecution`:
  *
  * | Temporal says | Outcome |
  * |---|---|
@@ -34,6 +35,22 @@ import { workerLogger } from './log';
  * | unreachable / other error | **skip** — doubt is not evidence |
  *
  * A timer alone is never sufficient: a slow workflow is not an absent one.
+ *
+ * ## The pair is asked about, not a derived id — Phase 6 re-review N7
+ *
+ * `describeWorkflowExecution` is keyed by workflow id **and** run id. An earlier revision
+ * probed `task-<taskId>` plus the holder's run id: for a claim written by a workflow
+ * started under *any other* id, the server answers NOT_FOUND — "no such run under that
+ * workflow id" — and the release pass freed a claim held by a **live** execution, whose
+ * next terminal write was then refused. That was a fail-open release, the one thing this
+ * module must never do, produced by a *correct* fix to the classifier beside it.
+ *
+ * Both ids are therefore **recorded at claim time** (`activities/claim.ts`) and read back
+ * here. A claim that records no workflow id — every row written before the column existed,
+ * and any claim written without workflow context — cannot be asked about exactly, so it is
+ * **skipped**, not released (`skipped_unknown`). A stranded claim costs availability; a
+ * released live claim costs work. The classifier is untouched: it was right, its input was
+ * wrong.
  *
  * ## What a release does to the row, and why it is not just "clear the column"
  *
@@ -48,6 +65,15 @@ import { workerLogger } from './log';
  * meaning — "never claimed" — with the release recorded in the audit trail instead of
  * disguised as an unclaimed row with a suspicious timestamp.
  *
+ * ## What this pass deliberately does not reach (residual, N9/N11)
+ *
+ * Only `queued` rows are candidates. An attempt that a pre-Phase-6 execution adopted is
+ * `running` with `claimedByWorkflowRunId IS NULL`; it is not stranded in the sense this
+ * pass repairs (nothing was reserved, something ran), it is not released here, and the
+ * completion arm treats it as foreign to everyone. See the residual block in
+ * `activities/claim.ts` for the exact row shape and why relaxing the predicate is worse
+ * than the wedge.
+ *
  * ## Why this is not reachable from the launch path
  *
  * This module is imported by the reaper and by tests, and by nothing under
@@ -59,7 +85,11 @@ import { workerLogger } from './log';
 
 /** The two answers this pass needs from the orchestrator. Structurally the reaper's probe. */
 export interface ClaimReleaseProbe {
-  execution(taskId: string, workflowRunId: string): Promise<WorkflowLivenessLike>;
+  /**
+   * Liveness of the execution named by the claim's **recorded pair**. Both ids come from
+   * the row, never from the task: see the module header (N7).
+   */
+  execution(workflowId: string, workflowRunId: string): Promise<WorkflowLivenessLike>;
 }
 
 /** Mirrors `WorkflowLiveness`; declared here so this module does not import the reaper. */
@@ -79,6 +109,8 @@ export type ClaimReleaseOutcome =
 export interface ClaimReleaseAction {
   readonly attemptId: string;
   readonly taskId: string;
+  /** The workflow id the claim recorded, or `null` for a claim written without one. */
+  readonly workflowId: string | null;
   readonly workflowRunId: string;
   readonly outcome: ClaimReleaseOutcome;
   readonly reason: string;
@@ -117,6 +149,7 @@ export async function runClaimReleasePass(deps: ClaimReleaseDeps): Promise<Claim
       id: true,
       orgId: true,
       taskId: true,
+      claimedByWorkflowId: true,
       claimedByWorkflowRunId: true,
       claimedAt: true,
     },
@@ -127,19 +160,39 @@ export async function runClaimReleasePass(deps: ClaimReleaseDeps): Promise<Claim
 
   for (const candidate of candidates) {
     const workflowRunId = candidate.claimedByWorkflowRunId;
+    const workflowId = candidate.claimedByWorkflowId;
 
     // Narrowed by the query's `not: null`, restated for the type system rather than with
     // a non-null assertion: a schema change that admitted null here would be a bug, not
     // a reason to crash a reaper pass.
     if (workflowRunId === null) continue;
 
+    // A claim with no recorded workflow id cannot be probed exactly. Deriving one
+    // (`task-<taskId>`) is what released a live claim in N7 — the derived id and the run
+    // id would then name different executions, and the server's NOT_FOUND would be read as
+    // "gone". Doubt is not evidence, so this is a skip: fail closed, on purpose.
+    if (workflowId === null) {
+      actions.push({
+        attemptId: candidate.id,
+        taskId: candidate.taskId,
+        workflowId: null,
+        workflowRunId,
+        outcome: 'skipped_unknown',
+        reason:
+          'the claim records no workflow id (written before the column existed, or without ' +
+          'workflow context); an exact probe is impossible, so it is not released',
+      });
+      continue;
+    }
+
     try {
-      const liveness = await deps.probe.execution(candidate.taskId, workflowRunId);
+      const liveness = await deps.probe.execution(workflowId, workflowRunId);
 
       if (liveness === 'active') {
         actions.push({
           attemptId: candidate.id,
           taskId: candidate.taskId,
+          workflowId,
           workflowRunId,
           outcome: 'skipped_live',
           reason: `workflow run ${workflowRunId} is still running; the claim may still be adopted`,
@@ -151,6 +204,7 @@ export async function runClaimReleasePass(deps: ClaimReleaseDeps): Promise<Claim
         actions.push({
           attemptId: candidate.id,
           taskId: candidate.taskId,
+          workflowId,
           workflowRunId,
           outcome: 'skipped_unknown',
           reason: 'Temporal did not answer; refusing to release a claim on doubt',
@@ -163,6 +217,7 @@ export async function runClaimReleasePass(deps: ClaimReleaseDeps): Promise<Claim
         attemptId: candidate.id,
         orgId: candidate.orgId,
         taskId: candidate.taskId,
+        workflowId,
         workflowRunId,
         liveness,
         claimedAt,
@@ -173,11 +228,12 @@ export async function runClaimReleasePass(deps: ClaimReleaseDeps): Promise<Claim
         actions.push({
           attemptId: candidate.id,
           taskId: candidate.taskId,
+          workflowId,
           workflowRunId,
           outcome: 'released',
           reason:
             liveness === 'absent'
-              ? `Temporal reports no execution for run ${workflowRunId}`
+              ? `Temporal reports no execution ${workflowId}/${workflowRunId}`
               : `Temporal reports run ${workflowRunId} finished without adopting the attempt`,
         });
       } else {
@@ -186,6 +242,7 @@ export async function runClaimReleasePass(deps: ClaimReleaseDeps): Promise<Claim
         actions.push({
           attemptId: candidate.id,
           taskId: candidate.taskId,
+          workflowId,
           workflowRunId,
           outcome: 'lost_race',
           reason: 'the attempt changed after it was read; no release was written',
@@ -197,6 +254,7 @@ export async function runClaimReleasePass(deps: ClaimReleaseDeps): Promise<Claim
         {
           attemptId: candidate.id,
           taskId: candidate.taskId,
+          workflowId,
           workflowRunId,
           err: error instanceof Error ? error.message : String(error),
         },
@@ -212,8 +270,8 @@ export async function runClaimReleasePass(deps: ClaimReleaseDeps): Promise<Claim
  * The release itself: one conditional write, the audit row in the same transaction.
  *
  * The predicate is the whole safety argument. It requires the row to still be `queued`
- * and still be claimed *by the run we just proved absent* — so a claim that moved, or an
- * attempt that was adopted between the read and this write, is a no-op rather than a
+ * and still be claimed by **the exact pair we just proved absent** — so a claim that moved,
+ * or an attempt that was adopted between the read and this write, is a no-op rather than a
  * release of somebody else's authority.
  */
 async function releaseClaim(
@@ -222,6 +280,7 @@ async function releaseClaim(
     readonly attemptId: string;
     readonly orgId: string;
     readonly taskId: string;
+    readonly workflowId: string;
     readonly workflowRunId: string;
     readonly liveness: 'absent' | 'finished';
     readonly claimedAt: Date;
@@ -235,6 +294,9 @@ async function releaseClaim(
         orgId: input.orgId,
         taskId: input.taskId,
         status: 'queued',
+        // The identity we proved gone, not merely the run id: a row whose workflow id
+        // changed has a different holder, and this release is not about it.
+        claimedByWorkflowId: input.workflowId,
         claimedByWorkflowRunId: input.workflowRunId,
       },
       data: {
@@ -251,6 +313,7 @@ async function releaseClaim(
             'it. Recorded by the reaper; no agent process was started.',
           retryable: false,
         },
+        claimedByWorkflowId: null,
         claimedByWorkflowRunId: null,
         claimedAt: null,
       },
@@ -274,9 +337,12 @@ async function releaseClaim(
         payload: {
           taskId: input.taskId,
           attemptId: input.attemptId,
+          // The pair the probe asked about, recorded because "the reaper decided so" is
+          // not an audit trail: an operator must be able to re-run the same question.
+          workflowId: input.workflowId,
           workflowRunId: input.workflowRunId,
-          // The evidence for the release, recorded because "the reaper decided so" is not
-          // an audit trail. `absent` and `finished` are the only two admitted here.
+          // The evidence for the release. `absent` and `finished` are the only two
+          // admitted here.
           liveness: input.liveness,
           claimedAt: input.claimedAt.toISOString(),
           heldForMs: Math.max(0, input.now.getTime() - input.claimedAt.getTime()),
@@ -296,6 +362,7 @@ async function releaseClaim(
       {
         attemptId: input.attemptId,
         taskId: input.taskId,
+        workflowId: input.workflowId,
         workflowRunId: input.workflowRunId,
         liveness: input.liveness,
       },

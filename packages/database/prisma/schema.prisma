@@ -638,6 +638,21 @@ model ExecutionAttempt {
   /// `status = 'queued'` and this column NULL, so a second claimant gets count 0
   /// instead of a second grant.
   claimedByWorkflowRunId String?
+  /// The **workflow id** the claiming execution was started under, read from
+  /// `Context.current().info.workflowExecution.workflowId` at claim time and written in
+  /// the same conditional UPDATE as the run id above.
+  ///
+  /// Recorded, never derived (Phase 6 re-review N7). A run id alone does not identify an
+  /// execution: Temporal's `describeWorkflowExecution` is keyed by workflow id **and**
+  /// run id, so asking about `task-<taskId>` plus somebody else's run id answers
+  /// NOT_FOUND for a perfectly live execution — and the release pass would free a claim
+  /// that is still held. This column is what makes the probe exact instead of assumed.
+  ///
+  /// NULL means the claim predates this column. Those rows cannot be probed exactly, so
+  /// the release pass skips them (`unknown`, fail closed) rather than guessing a workflow
+  /// id for them. Never back-filled: a fabricated id would be indistinguishable from an
+  /// observed one.
+  claimedByWorkflowId    String?
   /// When the claim was granted. NULL means never claimed — never back-filled, because
   /// a fabricated timestamp would make an unclaimed row indistinguishable from a
   /// claimed one.

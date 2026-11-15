@@ -774,3 +774,573 @@ caveats: (a) the single workspace-wide failure was my own probe residue, reprodu
 and re-run green — not attributable to the commit; (b) `cpu-budget`'s three enforcement tests
 skip on this host because the kernel refuses cgroup migration, so CPU enforcement was not
 re-observed in this review, only confirmed unchanged by the diff.
+
+---
+
+# Addendum — SEC-603 re-review of `a75f121`
+
+**Commit reviewed:** `a75f1217b49b1eb1fdae953076ecc8739f7ebf82`
+**Parent:** `74207f04257a9b20ba2a50a992aa50ff237f5e21`
+**Branch:** `phase-6/trust-boundary-closure`
+**Reviewer:** Security Architect (independent; authored none of the three commits)
+**Date:** 2026-11-15
+**Method:** read the full diff and every changed module; re-ran both N1 reproductions with new
+fixtures and four candidate identity field names; dispatched activities against real Temporal
+1.32.2 and real PostgreSQL 18.6 through the **production** activity registry; ran the
+production workflow bundle to establish what the shipped registry can actually reach; ran the
+committed suites (worker 239/251, Phase 5 123/126); reverted five behaviours one at a time in
+a scratch copy (`/tmp/scratch/r3`, repository untouched) to check the new tests fail pre-fix.
+Every probe lives outside the repository in `/tmp/opencode/`. No repository file was modified
+except this one.
+
+---
+
+## Verdict
+
+**PASS for approval-to-attempt (O1) — the gate this phase is about.
+FAIL for the commit as a whole — two defects in the boundary this commit owns.**
+
+This is the third pass over the same control and the first where the control holds against
+the adversary it was defined against. N1 is closed by construction, not by assertion: the
+identity has no input field left, a standalone activity is refused before it reads a row, and
+I could not produce a second execution or a single new attempt in either variant of the
+reproduction that broke the previous commit. N2, N3 and the two activities N4 named are
+closed, and the N2 fix is better than what I asked for — it exercises the shipped probe
+against a real server and adds a negative control.
+
+The FAIL is two specific things, neither of which is a "the fix does not work" claim:
+
+1. **N7 — the N2 classifier fix converted a fail-closed case into a fail-open one.** A claim
+   whose holder is a *live* execution started under a workflow id other than `task-<taskId>`
+   is now classified `absent` and **released while it runs**. Before this commit that case
+   answered `unknown` and was skipped; I recorded that skip in SEC-602 as the fail-closed
+   protection. It is the one thing `claim-release.ts` says the module must never do.
+2. **N8 — the new pre-dispatch completion arm does not constrain the terminal status.** A
+   workflow started under `task-<taskId>` can write `status: 'succeeded'` for a task with no
+   attempt, no claim and no `AgentRun`. Through the shipped registry only `failed` is
+   reachable (I verified that), but the *control* does not enforce that bound — the registry
+   does. A one-line narrowing makes the control match its own comment.
+
+| Question | Answer |
+|---|---|
+| N1 — standalone activity naming a victim's run id | **Closed.** Refused `EXECUTION_IDENTITY_UNAVAILABLE` in both variants, zero new attempts, zero side effects, identity fields deleted from the contract. |
+| N2 — `absent` classification, and whether the coverage is real | **Closed.** The shipped probe is now tested against a real server, with a malformed-id negative control; reverting the classifier fails three tests. |
+| N3 — `drive-run.ts start` with no attempt id | **Closed.** Exit 2, a message that names what to supply, before any Temporal connection. |
+| N4 — `persistResultActivity` / `completeTaskActivity` without a claim | **Closed for the two named activities; the class is not.** `emitEventActivity` and `recordStartActivity` remain unguarded by name, and this commit *increases* the audit event's authority. |
+| Is the launch-site identity forgeable any more? | **No.** Not by input, not by a standalone activity, not by a rogue workflow (it gets its own run id). |
+| Is the release path fail-closed? | **No longer.** N7. |
+| Do the new tests fail pre-fix? | **Yes** — five independent reverts, five failures. |
+| Is Phase 5 regressed? | **No.** |
+| Can approval-to-attempt be marked PASS? | **Yes**, with the boundary in the last section. |
+
+---
+
+## 1. N1 — closed
+
+I re-ran both variants of my SEC-602 reproduction (`/tmp/opencode/r3-probe.mts`, section A),
+with a real standalone activity (`Client.activity`) on a real worker built from the
+**production** activity registry. The input carried **four** candidate identity field names at
+once — `executionRunId`, `claimedByWorkflowRunId`, `runId`, `temporalRunId` — all set to the
+victim's claim holder, because a fix that merely renames the field would pass a test that
+supplies only the old name.
+
+Victim not yet adopted (the variant that used to *spend* the reservation):
+
+```
+verdict:        EXECUTION_IDENTITY_UNAVAILABLE, nonRetryable=true
+attemptsBefore: [{1, queued, claimedBy=execution-victim-3b43…}]
+attemptsAfter:  [{1, queued, claimedBy=execution-victim-3b43…}]   newAttempts=0
+agentRuns=0     taskStatus=ready
+```
+
+Victim already adopted (the variant that used to create attempt 2 and run concurrently):
+
+```
+verdict:        EXECUTION_IDENTITY_UNAVAILABLE, nonRetryable=true
+attemptsBefore: [{1, running, claimedBy=execution-victim-e73f…}]
+attemptsAfter:  [{1, running, claimedBy=execution-victim-e73f…}]  newAttempts=0
+agentRuns=0     taskStatus=ready
+```
+
+**The identity fields are deleted, not ignored.** `ExecuteAgentActivityInput.executionRunId`
+and `ValidateTaskActivityInput.workflowRunId` are gone from `shared/contracts.ts`; the
+`ValidateTaskActivityInput` field was also the field that carried a *database* run id into a
+*Temporal* run-id parameter, so its removal closes an id-space confusion as well. The refusal
+is emitted before the first database read (`claim.ts:444`, `claim.ts:594`), so there is no
+window in which a row is touched.
+
+**No test seam supplies an identity.** `executionIdentity()` takes no parameter and reads only
+`Context.current()` (`claim.ts:164-176`); `executionWorkflowId()` is the same shape
+(`claim.ts:184-195`). The harness starts a real workflow and reads the run id *back* from
+`handle.firstExecutionRunId` (`execution-harness.ts:152-158`); the probe workflow takes no
+arguments, so nothing a test passes can influence it. `requireExecutionClaim` still takes the
+identity as an argument, and that is correct: it is an internal guard whose production callers
+derive the value from the context, and the dispatch-level proof is the standalone group, which
+I re-ran rather than trusting.
+
+**Residual in the fix, not a defect:** an activity retry inside a workflow keeps the same run
+id, so a Temporal retry of `executeAgentActivity` is still admitted — that is the crash-retry
+property, and the `retry after adoption` test plus the `attempt 2 under the same claim` test
+both pass in my run.
+
+## 2. N2 — closed, and the coverage is the shipped probe
+
+My finding was that `absent` was unreachable because `WorkflowNotFoundError` carries no `code`
+and no coded `cause`, so the classifier answered `unknown` and the release could only fire for
+*terminal* runs.
+
+- **Classifier:** `classifyProbeError` (`reaper.ts:91-101`) now walks the error chain and
+  recognises the error by identity (`instanceof`, `name`, and the SDK's `Symbol.for`
+  marker) before falling back to gRPC 5.
+- **Reachability:** the two `N2 — the shipped probe against a real server` tests call
+  `createTemporalProbe().execution()` — the shipped function — and only *scope* which rows the
+  pass may act on, so the classification itself is real. I re-ran them: `released` with
+  `liveness: 'absent'` for a never-seen UUID run id, `skipped_unknown` for a malformed one,
+  `skipped_live` for a running one.
+- **Independent check of the error shape** (`/tmp/opencode/r3-probe2.mts`, section I): a real
+  `describe()` of an existing run under a *different* workflow id throws
+  `{ name: 'WorkflowNotFoundError', code: null, hasCodedCause: false, marker: true }`. The
+  parent's classifier expression answers `unknown` for that object; the current one answers
+  `absent`. So N2 is fixed — and see N7 for what that fix broke.
+- **Coverage is not a stub.** `reaper.test.ts:252-288` constructs the real error type, a
+  coded `cause`, a foreign-realm copy carrying the marker, and the two `unknown` controls.
+  Reverting `classifyProbeError` to the parent's `grpcStatus(error) === 5` form fails three
+  tests: the end-to-end absent-release and both pure classifier assertions.
+
+## 3. N3 — closed
+
+`drive-run.ts start <taskId> <orgId>` (no attempt id) exits **2** with a message that names
+the missing argument, says why it is required, and tells the operator that `POST /run`
+returns it — before `TemporalTaskClient.connect()` is called:
+
+```
+drive-run.ts start: an attempt id is required.
+… Supply the queued attempt id that POST /run returned in its 202 body:
+  drive-run.ts start <taskId> <orgId> <attemptId> [correlationId]
+```
+
+`start <taskId>` alone still exits 2 with the usage block. `cancel` / `describe` / `wait` are
+unchanged. The usage string, the module header and the code agree.
+
+One test-quality note: the pre-flight guard is duplicated by an in-switch guard, so deleting
+*either one alone* still leaves the test green (I checked: removing the pre-flight leaves the
+switch guard, and the test passes). Removing **both** — the true pre-fix state — fails the
+test (`expected 1 to be 2`). The behaviour is safe; the test is one revert less sensitive than
+it looks.
+
+## 4. N4 — closed for the two activities it named, not for the class
+
+`persistResultActivity` requires the claim before it delegates (`persist-result.ts:60-68`), and
+`completeTaskActivity` requires authority before its first read (`complete-task.ts:42-52`).
+Both refusals come before any write, and the inner writers (`persistResult`, `completeTask`)
+are not in the activity registry, so they cannot be dispatched by name.
+
+Re-ran, by name, from a real workflow (`/tmp/opencode/r3-probe.mts` sections D and E, plus the
+committed N4 group):
+
+| Call | Result |
+|---|---|
+| `persistResultActivity`, canonical-id workflow, no claim | `EXECUTION_CLAIM_REFUSED`, `agentRuns=0`, run still `queued` |
+| `completeTaskActivity`, standalone activity | `EXECUTION_IDENTITY_UNAVAILABLE`, task and run untouched |
+| `completeTaskActivity`, foreign claim | `EXECUTION_ALREADY_CLAIMED`, task stays `ready` |
+| `completeTaskActivity`, non-canonical workflow id, no claim | `EXECUTION_CLAIM_REFUSED` |
+| full legitimate path (validate → execute → persist → complete) | `authority: 'execution-claim'`, task `succeeded`, one `AgentRun`, claim intact |
+| retry of the same execution (two executes, one session) | attempt 1 and attempt 2 both `succeeded`, both stamped with the session's run id |
+| reaper's own writes | direct database statements, not activities; release + audit + `skipped_live` all observed live in my own pass |
+
+The class is **not** closed. `emitEventActivity` and `recordStartActivity` are registered
+activities that read no claim and take no identity. I dispatched both as **standalone
+activities** with no workflow context at all:
+
+```
+L: emitEventActivity  → created a task.succeeded.v1 AuditEvent for a task that never ran
+                        (task still `queued`, zero attempts, zero AgentRuns)
+M: recordStartActivity → moved a Task queued → running and a WorkflowRun → running,
+                        with no claim, no attempt and no execution
+```
+
+Both predate this commit. They matter *more* after it, because `failBeforeExecution` and
+`recordUnexpectedFailure` now deliberately let the terminal write be refused and tell the
+reader that "the event below is the record" (`run-task.ts:268-283`, `run-task.ts:388-400`).
+That makes an unauthenticated event writer the authoritative record of a refused execution.
+Register it as **N10**, not as a regression.
+
+## 5. The pre-dispatch arm (request 5) — bounded, but not by the control
+
+`requireCompletionAuthority` (`claim.ts:623-685`) permits a terminal write with no claim when
+the activity's workflow id equals `task-<taskId>` and no attempt of the task is running or
+claimed. I tested exactly the attack described.
+
+**It works.** A workflow started under `task-<victimTaskId>` that calls `completeTaskActivity`
+with no attempt id, no claim, on a task with no attempt at all:
+
+```
+B:pre-dispatch-no-attempt-succeeded
+  verdict:  [{ changed: true, previousStatus: 'queued', status: 'succeeded',
+               authority: 'pre-dispatch' }]
+  taskStatus: succeeded     runStatus: succeeded     finishedAt: set
+  attempts: []              agentRuns: 0
+```
+
+That is the literal N4 sentence — "terminal state for a task that never executed" — still
+true for `succeeded`. Now the bounds, measured rather than assumed:
+
+- **The workflow id must be canonical.** A workflow under `rogue-<uuid>` is refused
+  `EXECUTION_CLAIM_REFUSED` (section C). The id is `task-` + a task UUID, so it is guessable,
+  not secret — but it is the *only* thing standing between a workflow and this write.
+- **REJECT_DUPLICATE is real.** With a live execution holding `task-<taskId>`, a second start
+  under that id fails with `WorkflowExecutionAlreadyStartedError` (probe 3), so the arm cannot
+  be used against a task that has a live run. That is the strongest part of the design and it
+  holds.
+- **The shipped registry cannot reach `succeeded`.** `main.ts:143` registers exactly one
+  workflow module, `workflows/run-task`, and `runTaskWorkflow` never calls
+  `completeTaskActivity` with `succeeded` and no attempt: the success path reaches completion
+  only after `persistResultActivity`, which requires the claim. I ran the **production**
+  workflow bundle with no attempt id and the only reachable outcome is:
+
+```
+H:production-registry-no-attempt
+  result:     { status: 'failed', summary: 'EXECUTION_CLAIM_REFUSED: …' }
+  taskStatus: failed   runStatus: failed   run.error: EXECUTION_CLAIM_REFUSED
+  attempts: 0          agentRuns: 0
+```
+
+So the reachable residual through the shipped worker is: **any Temporal client can force any
+non-terminal task to `failed`, without executing it, whenever no execution is live for it** —
+by starting `runTaskWorkflow` under `task-<taskId>` with no attempt id. That is a denial of the
+task, plus a fabricated failure reason on `WorkflowRun.error`. It is also *pre-existing in
+kind* (before this commit the same caller could write any status), and it is the price of
+letting a refused run record its refusal.
+
+**Verdict on the arm: bounded, so a residual rather than a break — but two things should
+change.** The comment at `claim.ts:629-634` says "A run that never claimed a reservation may
+only record a **refusal** for the task it was started for." The code does not say that; it
+says "any terminal status". Narrowing the arm to `failed` and `cancelled` — the only statuses
+either legitimate pre-dispatch call site uses — makes the code match the sentence at the cost
+of one condition, and closes the `succeeded` case for every future workflow type. **N8.**
+
+Second, the test that covers this arm (`execution-boundary.test.ts:932-960`) uses a task in
+`ready`, which `completeTask` refuses to write (`status IN (queued, running, verifying)`), so
+the fixture can only ever observe `changed: false`; it asserts the *refusal*, which is right,
+but it would not have shown the write. My probe used `queued`, which is the production state
+after `POST /run`, and showed the write.
+
+## 6. Regression from removing the fallback (request 6)
+
+Every consumer of a supplied identity was enumerated and checked. What is now unreachable:
+
+| Path | State | Intended? | Documented? |
+|---|---|---|---|
+| Any standalone / direct activity call naming an attempt | refused `EXECUTION_IDENTITY_UNAVAILABLE` | yes | `claim.ts` header, `contracts.ts`, AG-603 §5 |
+| `drive-run.ts start` without an attempt id | refused, exit 2 | yes | script usage + AG-603 §5 |
+| Direct function-call tests | replaced by real executions | yes | AG-603 §5, suite headers |
+| A hand-started workflow under a **non-canonical** id writing terminal state before a claim | refused | yes | AG-603 §5 "Deliberate consequence" |
+| `validateTaskActivity` accepting a database `WorkflowRun.id` as an execution identity | refused (the field is gone) | yes — it was an id-space bug | diff, `contracts.ts` |
+
+**One legitimate path is now unreachable and is not documented.** An `ExecutionAttempt` that
+is `running` with `claimedByWorkflowRunId IS NULL` can never be completed by anyone:
+
+- the claim arm cannot apply (no claim exists),
+- the pre-dispatch arm treats it as foreign to *everyone*, including the execution that owns
+  it: `row.status === 'running' ? row.claimedByWorkflowRunId !== executionRunId` is
+  `null !== runId` → `true` (`claim.ts:656-660`),
+- the reaper only considers `status: 'queued'` (`claim-release.ts:106`).
+
+Such a row exists for every attempt adopted before the Phase 6 column was added, and the
+column is explicitly never back-filled. AG-603 documents the *launch*-site consequence of an
+in-flight execution ("refused at the launch site"), not this completion-site wedge: a task that
+was mid-run at deploy time keeps its terminal write refused forever, and the refusal is
+swallowed with a log line (`run-task.ts:279-284`). Fail-closed, but a stuck task. **N11.**
+
+No other legitimate path is lost: the approval gate's *accepting* case is preserved in a
+Temporal-gated block (`approval-grant.test.ts`), the retry case passes, and `cancel` /
+`describe` / `wait` are untouched.
+
+## 7. The release predicate (request 7) — uses the run, and it is still not safe
+
+The predicate is the specific run: the candidate is probed as
+`probe.execution(taskId, candidate.claimedByWorkflowRunId)` (`claim-release.ts:137`), the probe
+passes that run id to `getHandle(workflowId, runId)` (`reaper.ts:158`), and the release write
+requires `status: 'queued'` **and** `claimedByWorkflowRunId: input.workflowRunId`
+(`claim-release.ts:236-239`). Naming a different dead run cannot release a live one; I ran it:
+
+```
+F: live holder + a *dead* sibling run under the same workflow id
+   action: { outcome: 'skipped_live' }      row: queued, claim = the live run
+```
+
+**But the same test shows the hole in the other direction.** The probe is asked about the
+canonical workflow id (`task-<taskId>`) with an arbitrary run id. When the holder's run id
+belongs to a workflow with a *different* id, `describe` answers NOT_FOUND — which the N2 fix
+now turns into `absent` — and the claim is released **while the holder is running**:
+
+```
+G: live holder under `probe-<uuid>` (the harness's own default id)
+   liveStatus: RUNNING        canonicalDescribeFound: false
+   action: { outcome: 'released',
+             reason: 'Temporal reports no execution for run 01a1de39-0288…' }
+   row:    failed, claim = NULL, terminationReason 'crashed'
+```
+
+Before this commit the same shape produced `unknown` → `skipped_unknown` (SEC-602 §7). The
+classification is now *right about the pair it asked about* and *wrong about the claim*: the
+question the release path needs answered is "does this run id exist anywhere in the namespace",
+not "does it exist under the id I derived from the task". **N7.**
+
+## 8. Do the new tests fail on the pre-fix code? — Yes, five reverts, five failures
+
+Scratch copy at `/tmp/scratch/r3` (`git archive a75f121`), one behaviour reverted at a time:
+
+| Reverted behaviour | Test(s) | Result |
+|---|---|---|
+| `executionIdentity()` fallback restored in `execute-agent.ts` (input field used when no context) | N1 standalone ×2 + in-workflow identity ×1 | **3 fail** — the standalone executor resolves with `status: 'succeeded'`; the reproduction runs again |
+| `classifyProbeError` back to `grpcStatus(error) === 5` | absent-release E2E + 2 pure classifier tests | **3 fail** — `expected 'unknown' to be 'absent'`, E2E `skipped_unknown` |
+| `requireExecutionClaim` removed from `persistResultActivity` | N4 "refuses persistence … no claim" | **fails** — promise resolved, `AgentRun` written |
+| workflow-id check removed from the pre-dispatch arm | N4 "refuses a pre-dispatch completion from a workflow that is not this task's execution" | **fails** — the rogue completion resolves |
+| both `drive-run` guards removed (true pre-fix state) | N3 "names the missing attempt id and exits 2" | **fails** — `expected 1 to be 2` |
+
+No weakened assertions, no sleeps used as synchronisation, no test seam supplying an identity.
+
+## 9. Phase 5 regression — none found
+
+The diff touches no isolation, volume, cgroup, budget, output-cap or resource source file. The
+only Phase 5-adjacent change is `isolation-gate.test.ts`, which now reserves and claims an
+attempt so the activity can reach the gate under test; `reserveAndClaim` goes through
+`claimExecution`, the production writer.
+
+| Suite | Result |
+|---|---|
+| `apps/worker` full | **239 passed, 12 skipped, 0 failed** (22 files) |
+| `packages/workspace-manager` + `isolation-gate` + `cpu-budget` + `isolation` | **123 passed, 3 skipped** |
+| volumes: leases, ownership, containment (`..`, symlink, forged lease), reclaim, ENOSPC | **17/17 passed** |
+| output cap / io limits | pass; the measured-throughput test skips (see below) |
+| CPU budget arithmetic + sampler | **12/12 passed**; the three cgroup *kill* tests skip |
+| VM fail-closed (`isolation-gate`) | **4/4 passed** — vm refused, forged env ignored, forged input cannot downgrade, restricted tier proceeds |
+| cgroup probe | **6/6 tier-limit tests passed** (superblock magic, delegation, read-back) |
+
+The 12 skips are this host's kernel refusing cgroup delegation and the io throughput
+measurement — unchanged from the previous two reviews, and not attributable to the diff.
+
+## 10. New bypasses across the three commits
+
+- **N7** is new in `a75f121` and is a fail-open release (below).
+- **N8** is new in `a75f121` (the arm did not exist before) and is bounded by the registry.
+- Nothing new from `3aed33d` or `74207f0` beyond what SEC-601/SEC-602 already recorded; the
+  F1/F2/F3 paths they opened are now closed at the launch site, and I re-confirmed there is
+  still exactly one `runtime.execute` call site and one workflow call site for the executor.
+- The `claimExecution` write is unchanged: one conditional `updateMany` inside a transaction,
+  `count === 1` is the grant, no read-then-write.
+
+---
+
+## New findings
+
+### N7 — Medium (High impact, conditional reachability) — the release pass reaps a live claim whose workflow id is not `task-<taskId>`
+
+**Where:** `reaper.ts:151-165` (`execution()` probes `task-<taskId>` + run id),
+`reaper.ts:91-115` (`classifyProbeError` now maps that NOT_FOUND to `absent`),
+`claim-release.ts:137` and `:236-239` (release follows the classification).
+
+A claim's holder is identified by **run id only**. `describe` is keyed by **workflow id and run
+id**. When the two ids belong to different executions — i.e. the claim was written by a
+workflow started under any id other than `task-<taskId>` — the probe's NOT_FOUND means "no such
+run *under that workflow id*", and the classifier reads it as "no such execution". The claim is
+then released on a live run:
+
+```
+liveStatus: RUNNING → action: released → attempt: failed, claim NULL, terminationReason 'crashed'
+```
+
+The execution is not dead; it is now unauthorised. Its next `persistResultActivity` or
+`completeTaskActivity` is refused `EXECUTION_CLAIM_REFUSED`, so the run cannot record its
+result. `claim-release.ts:29-34` says a release "destroys work" and is the thing the pass must
+never do; it does it here.
+
+**Reachability.** Not through the shipped worker: `main.ts:143` registers `runTaskWorkflow`
+only, and every client that starts it uses `task-<taskId>` (`client.ts:77`, API
+`orchestrator.service.ts:145`). It becomes reachable the moment a claim is written by any other
+workflow id — a back-office or replay workflow, a second workflow type on the queue, or the
+repository's own test harness (`probe-<uuid>`, `execution-harness.ts:146`), which is exactly
+the shape AG-603 contemplates when it says a hand-started suffixed-id workflow "must be
+cancelled through `POST /cancel`". A staging environment that runs the suite against the same
+Temporal namespace and has the reaper enabled will release live test claims.
+
+**Fix, in order of preference:** record the workflow id with the claim (it is server-set
+context, equally unforgeable — `executionWorkflowId()` already exists) and probe that pair;
+or treat `absent` as `absent` only when the holder's workflow id is the canonical one and
+`unknown` otherwise. The first makes the probe exact; the second restores the fail-closed
+behaviour at the cost of the wedge N2 was opened for.
+
+**Regression, not a pre-existing defect:** the parent answered `unknown` for this shape. I
+verified the parent's decision for the same error object (`/tmp/opencode/r3-probe2.mts`,
+section I: `parentClassifierAnswer: 'unknown'`, `currentClassifierAnswer: 'absent'`), and I
+recorded the skip as a fail-closed protection in SEC-602 §7.
+
+### N8 — Medium (latent) — the pre-dispatch completion arm permits `succeeded`, not only a refusal
+
+**Where:** `claim.ts:623-685`. The arm checks identity and the absence of a foreign attempt; it
+never checks `input.status`.
+
+Reproduction: start any workflow under `task-<victimTaskId>` and dispatch
+`completeTaskActivity({taskId, orgId, status: 'succeeded'})` with no attempt id. On a task with
+no attempts and a `queued` workflow run:
+
+```
+{ changed: true, status: 'succeeded', authority: 'pre-dispatch' }
+task → succeeded, run → succeeded, attempts 0, AgentRuns 0
+```
+
+Bounded today by the registry (only `runTaskWorkflow`, which reaches this arm only with
+`failed`/`cancelled`) and by `REJECT_DUPLICATE` (no live run). Not bounded by the control: any
+additional registered workflow type widens it to `succeeded`, and the comment at
+`claim.ts:629-634` already claims the narrower behaviour.
+
+**Fix:** in the pre-dispatch arm, require `status` to be `failed` or `cancelled`. Both
+legitimate call sites use only those (`run-task.ts:268`, `:323`, `:388`).
+
+### N9 — Low — the `foreign` predicate treats an unclaimed `running` attempt as foreign to its owner
+
+**Where:** `claim.ts:656-660`. `row.status === 'running' ? row.claimedByWorkflowRunId !==
+executionRunId : …` evaluates `null !== runId` → `true` for a running row with no claim, so the
+execution that adopted such a row cannot complete its task; and the reaper will not release it
+(`claim-release.ts:106` selects `status: 'queued'` only). Same root as N11.
+
+### N11 — Low (upgrade window) — a pre-Phase-6 `running` attempt wedges its task permanently
+
+Every attempt adopted before `claimedByWorkflowRunId` existed has `NULL` there (the column is
+deliberately never back-filled). Such a row can be neither claimed (`classifyLostClaim`
+refuses), nor adopted (`attempts.ts:233` requires the claim), nor completed (N9), nor reaped.
+A task that was mid-run at deploy time therefore never reaches a terminal state; the refused
+completion is logged and swallowed (`run-task.ts:279-284`) while `task.failed.v1` is still
+emitted, so the task and the audit trail disagree. AG-603 documents the launch-site consequence
+of in-flight executions; this is the completion-site one.
+
+### N10 — Low (pre-existing) — two by-name activities still write execution state with no authority, and this commit leans on one of them
+
+`emitEventActivity` and `recordStartActivity` are in the registry (`activities/index.ts`), read
+no claim and take no identity (probe sections L and M: a standalone activity wrote a valid
+`task.succeeded.v1` for a task that never ran, and moved a task `queued → running`).
+`a75f121` makes the audit event the durable record of a refused execution
+(`run-task.ts:268-283`, `run-task.ts:388-400`), which raises what forging it is worth. N4's
+class is one third closed.
+
+---
+
+## Can approval-to-attempt be marked PASS?
+
+**Yes — for the boundary the register calls O1.** The criterion in
+`docs/engineering/phase5-recovery/REMEDIATION-REGISTER.md:18` is that the claim is "written by
+validation **and honoured by the execution path**". That is now true, and I could not break it:
+
+- **One reservation, one execution, for every dispatch shape I can produce.** Standalone
+  activity: refused before the first read. Rogue workflow with a borrowed attempt id: refused
+  with its own run id in context. Rogue workflow with no attempt: refused. Duplicate canonical
+  start: blocked by `REJECT_DUPLICATE`. Retry of the same execution: admitted, under the same
+  claim, as attempt N+1.
+- **Identity is not an input.** No activity input carries a run id; `executionIdentity()` and
+  `executionWorkflowId()` read only the server-set context; the test seam that used to supply
+  one is gone and its replacement supplies nothing.
+- **Approval is enforced at the launch site**, through the same shared function validation
+  uses, and re-checked after the claim.
+- **The terminal writes are authority-checked** for the two activities that write execution
+  results, and adoption is conditional on the claim.
+
+**The exact boundary of what is now guaranteed:**
+
+> A task is executed only by an execution that holds a `queued` `ExecutionAttempt` claimed
+> under the run id the Temporal server assigned to it, for a task whose approval gate passes at
+> launch, and no second execution can hold that attempt. Nothing reachable through an activity
+> input, a borrowed run id, or a rogue workflow can produce that state or bypass it.
+
+**What that boundary does not cover, and therefore what must not be claimed:**
+
+1. **It is not "no caller can alter task state."** Any Temporal caller can force any idle task
+   to `failed` (probe H), can pre-empt a task's single execution slot by claiming its attempt
+   under its own run id, and can forge the audit event that describes the outcome (N10).
+2. **It is not "a task cannot be reported succeeded without executing."** True through the
+   shipped registry, not true of the control (N8).
+3. **It is not "a stranded claim is released safely."** It is released on a live run when the
+   holder's workflow id is not canonical (N7). The register's O1 sentence — "released by the
+   reaper only when Temporal reports its run absent or terminal" — is technically true and
+   materially misleading until N7 is fixed.
+
+**So: mark O1 PASS, with N7/N8/N9/N11 recorded as open defects, and do not close F4.** The
+distinction matters: O1 asks whether the approval-to-attempt boundary holds, and it does. F4
+asks whether a stranded claim is released only when it is provably dead, and the answer just
+became "almost".
+
+## What still cannot be guaranteed
+
+1. **That a live claim is never released.** N7 — demonstrated, not argued.
+2. **That the terminal status written without a claim is only a refusal.** N8.
+3. **That the audit trail is authoritative.** N10 — it is the record the refusal path now
+   depends on, and it is writable by name without authority.
+4. **That every in-flight execution can finish across the upgrade.** N11.
+5. **That CI covers the identity boundary.** The Temporal-gated tests (54 of them at the
+   previous count) skip without a server; with `TEMPORAL_ADDRESS` closed this package reports
+   `197 passed, 54 skipped, 0 failed`. A skipped test is not a failing one, and the property
+   that matters most is in the skipped set.
+6. **Tenant isolation of the release pass.** `runClaimReleasePass` scans every tenant's
+   candidates; the probe is scoped by task and run id, and the write by `orgId`, `taskId` and
+   the holder — that part is sound — but a single reaper sweep acts across tenants, which the
+   multi-tenant gap (O4) leaves unexercised.
+
+## What I would refuse to ship
+
+1. **A release pass that can reap a live claim** (N7). If the fix cannot land in this change,
+   gate the pass on the holder's workflow id being canonical, or leave the pass disabled, and
+   correct `claim-release.ts:29-34` and the register's O1 sentence in the meantime.
+2. **The sentence "a run that never claimed a reservation may only record a refusal"** while
+   the code accepts `succeeded` (N8). Either narrow the arm or fix the comment — the comment is
+   what the next reviewer will believe.
+3. **"N4 is closed"** as written. Two of the three by-name writers that finding named are
+   closed; the event writer is not, and it is now load-bearing (N10).
+4. **"F4 is closed."** It was PARTIAL for the `absent` arm and is now PARTIAL for a different
+   and worse reason.
+
+## What I tried and could not do
+
+- **Reach `succeeded` through the shipped worker.** I started the production workflow bundle
+  (`main.ts:143`'s module) under `task-<taskId>` with no attempt id. Every path ends in
+  `failed`. That is the bound that keeps N8 a latent finding rather than a live bypass, and I
+  could not widen it without registering a workflow type the worker does not ship.
+- **Produce a second execution, or a single new attempt, from a standalone activity.** Both
+  variants of the SEC-602 reproduction now refuse before any row is read. I also supplied four
+  candidate identity field names at once and added a third shape (`validateTaskActivity`
+  standalone); all refused, zero attempts.
+- **Release a live canonical claim by naming a dead run.** `skipped_live`; the claim and its
+  timestamp are intact.
+- **Run the cgroup kill and io-throughput tests.** This host refuses cgroup delegation for the
+  full tier; 12 tests skip, as in the previous two reviews. CPU enforcement was therefore not
+  re-observed, only confirmed unchanged by the diff — the diff touches no resource file.
+
+---
+
+## Test and probe evidence gathered during this addendum
+
+| Item | Command / artefact | Result |
+|---|---|---|
+| `apps/worker` full | `npx vitest run apps/worker/test` | **239 passed, 12 skipped, 0 failed** |
+| `execution-identity.test.ts` | verbose, real Temporal | **18/18 passed**; N1 standalone ×3 and N3 ×2 executed, not skipped |
+| `execution-boundary.test.ts` | verbose, real Temporal + PostgreSQL | **24/24 passed**; N2 real-probe ×3 executed |
+| `reaper.test.ts` | — | 17 passed (5 of them `classifyProbeError`: the real error type, a bare gRPC code, a coded `cause`, `unknown` controls, and a foreign-realm copy carrying the marker) |
+| Phase 5 (`workspace-manager`, `isolation-gate`, `cpu-budget`, `isolation`) | verbose | **123 passed, 3 skipped** |
+| `io-limits` + `cgroup` | verbose | **13 passed, 9 skipped** (host refuses the full cgroup tier) |
+| N1 re-run, both variants, four field names | `/tmp/opencode/r3-probe.mts` §A | `EXECUTION_IDENTITY_UNAVAILABLE`, `newAttempts=0`, `agentRuns=0` |
+| pre-dispatch arm, `succeeded` and `failed` | §B | **written**, `authority: 'pre-dispatch'`, 0 attempts, 0 AgentRuns |
+| non-canonical workflow id | §C | refused `EXECUTION_CLAIM_REFUSED` |
+| standalone complete / canonical persist | §D, §E | `EXECUTION_IDENTITY_UNAVAILABLE` / `EXECUTION_CLAIM_REFUSED` |
+| release: live holder + dead sibling | §F | `skipped_live`, claim intact |
+| release: live non-canonical holder | §G | **`released`** while `liveStatus: RUNNING` |
+| production workflow bundle, no attempt | `/tmp/opencode/r3-probe2.mts` §H | task `failed`, 0 attempts, 0 AgentRuns |
+| parent vs current classifier on a real error | §I | `parent: unknown`, `current: absent` |
+| REJECT_DUPLICATE while live | `/tmp/opencode/r3-probe3.mts` | `WorkflowExecutionAlreadyStartedError` |
+| forged audit event / forged run start | `/tmp/opencode/r3-probe4.mts` | both **written** from standalone activities |
+| pre-fix sensitivity | `/tmp/scratch/r3` (five reverts) | 5/5 corresponding tests failed |
+| `drive-run.ts` | `tsx scripts/drive-run.ts start <task> <org>` | exit **2**, message names the attempt id |
+
+Verification status: **verified** for every command and probe result quoted here. Honest
+caveats: (a) the production-registry bound in §H is established by reading `main.ts:143` and
+by running that module, not by inspecting a deployed worker; (b) the cgroup kill and
+io-throughput suites could not run on this host, so Phase 5 enforcement is confirmed by absence
+of change rather than by re-observation.

@@ -41,7 +41,7 @@ import type * as activitiesModule from '../../src/activities';
 
 /** One activity dispatch. `input` is passed through unchanged. */
 export interface ProbeStep {
-  readonly op: 'validate' | 'execute' | 'persist' | 'complete';
+  readonly op: 'validate' | 'execute' | 'persist' | 'complete' | 'emit' | 'start';
   readonly input: Record<string, unknown>;
   /**
    * Attach the previous step's result to `input` under this key.
@@ -80,12 +80,18 @@ export const finishSignal = defineSignal('finish');
  * legitimate-path tests exercise through the real workflow, so re-testing it here would
  * only make a refusal slow.
  */
-const { validateTaskActivity, executeAgentActivity, persistResultActivity, completeTaskActivity } =
-  proxyActivities<typeof activitiesModule.activities>({
-    startToCloseTimeout: '4m',
-    scheduleToCloseTimeout: '10m',
-    retry: { maximumAttempts: 1 },
-  });
+const {
+  validateTaskActivity,
+  executeAgentActivity,
+  persistResultActivity,
+  completeTaskActivity,
+  emitEventActivity,
+  recordStartActivity,
+} = proxyActivities<typeof activitiesModule.activities>({
+  startToCloseTimeout: '4m',
+  scheduleToCloseTimeout: '10m',
+  retry: { maximumAttempts: 1 },
+});
 
 export async function probeExecution(): Promise<ProbeRun> {
   setHandler(runStepsUpdate, async (steps: readonly ProbeStep[]) => {
@@ -128,5 +134,9 @@ function dispatch(step: ProbeStep, previous: unknown): Promise<unknown> {
       return persistResultActivity(input as unknown as Parameters<typeof persistResultActivity>[0]);
     case 'complete':
       return completeTaskActivity(input as unknown as Parameters<typeof completeTaskActivity>[0]);
+    case 'emit':
+      return emitEventActivity(input as unknown as Parameters<typeof emitEventActivity>[0]);
+    case 'start':
+      return recordStartActivity(input as unknown as Parameters<typeof recordStartActivity>[0]);
   }
 }

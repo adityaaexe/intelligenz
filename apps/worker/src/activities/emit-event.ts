@@ -6,6 +6,7 @@ import type {
   EmitEventActivityInput,
   EmitEventActivityResult,
 } from '../shared/contracts';
+import { executionIdentity, requireEventAuthority } from './claim';
 import { db, nonRetryable } from './support';
 
 /**
@@ -57,6 +58,28 @@ export async function emitEventActivity(
   // would corrupt the one table that is supposed to be trustworthy.
   const event = EventEnvelope.parse(input.event);
   const aggregateType = aggregateTypeFor(event.eventType);
+
+  // ── Authority before the first read, let alone the first write — N4 residual ──
+  //
+  // This activity is dispatched by name. Before AG-604 any workflow on the task queue
+  // could write a `task.succeeded.v1` for a task that never ran, and AG-604 makes the
+  // event the durable record of a *refused* run — so forging it is worth more now, not
+  // less. Same arms as completion: the claim decides when one exists, otherwise only this
+  // task's own execution (`task-<taskId>`) and only the refusal events.
+  //
+  // `Task` is the only aggregate the workflow emits through this activity. Other
+  // aggregates have no task to authorise against, and the API writes its events in the
+  // transaction that changes the row rather than through here.
+  if (aggregateType === 'Task') {
+    await requireEventAuthority({
+      orgId: event.tenantId,
+      taskId: event.aggregateId,
+      attemptId: input.attemptId,
+      executionRunId: executionIdentity(),
+      eventType: event.eventType,
+    });
+  }
+
   const prisma = db();
 
   const existingByKey = await prisma.auditEvent.findFirst({

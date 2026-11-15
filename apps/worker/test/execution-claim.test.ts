@@ -767,17 +767,37 @@ describe.skipIf(!enabled)('a direct Temporal start cannot join a claimed executi
     expect(claimedAfter.status).toBe('queued');
 
     // The refusal is on the record with its specific code.
-    const failures = await client.auditEvent.findMany({
+    //
+    // Since AG-604 it is recorded on the **attempt**, not on the task: this execution holds
+    // no claim, and the attempt it named belongs to another execution, so neither the
+    // terminal write nor `task.failed.v1` is its to write. `claimExecution` writes the
+    // durable row before it throws — that is the record, and it names the holder.
+    const duplicates = await client.auditEvent.findMany({
       where: {
         orgId: fixture.orgId,
-        aggregateId: reservation.taskId,
-        eventType: 'task.failed.v1',
+        aggregateId: reservation.attemptId,
+        eventType: 'execution.claim_duplicate.v1',
       },
       select: { payload: true },
     });
 
-    expect(failures.length).toBeGreaterThan(0);
-    expect(failures[0]?.payload).toMatchObject({ code: 'EXECUTION_ALREADY_CLAIMED' });
+    expect(duplicates.length).toBeGreaterThan(0);
+    expect(duplicates[0]?.payload).toMatchObject({
+      code: 'EXECUTION_ALREADY_CLAIMED',
+      claimedByWorkflowRunId: owner,
+    });
+
+    // And it did not write to the task aggregate: a duplicate execution does not get to
+    // declare the task failed underneath the execution that owns it.
+    expect(
+      await client.auditEvent.count({
+        where: {
+          orgId: fixture.orgId,
+          aggregateId: reservation.taskId,
+          eventType: 'task.failed.v1',
+        },
+      }),
+    ).toBe(0);
   }, 120_000);
 });
 

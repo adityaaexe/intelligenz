@@ -1,6 +1,7 @@
 import { Context } from '@temporalio/activity';
 import type { Prisma } from '@intelligenz/database';
 
+import type { CompleteTaskActivityInput } from '../shared/contracts';
 import { WORKFLOW_ID_PREFIX } from '../config';
 import { workerLogger } from '../log';
 import { AGENT_ACTOR_ID } from '../shared/actors';
@@ -130,6 +131,15 @@ export interface ClaimIdentity {
   readonly attemptId: string;
   /** Temporal's run id. See `executionIdentity` for where this must come from. */
   readonly workflowRunId: string;
+  /**
+   * Temporal's **workflow id** for the same execution. See `executionWorkflowId`.
+   *
+   * Recorded beside the run id so the release pass can ask about the exact execution
+   * (Phase 6 re-review N7). Optional only because a test or a back-office caller can
+   * legitimately construct a claim without a workflow context; a NULL is then recorded,
+   * and the release pass treats such a claim as doubt rather than releasing it.
+   */
+  readonly workflowId?: string | undefined;
   readonly correlationId: string;
 }
 
@@ -308,6 +318,11 @@ export async function claimExecution(identity: ClaimIdentity): Promise<Execution
       },
       data: {
         claimedByWorkflowRunId: identity.workflowRunId,
+        // The identity, recorded rather than derived (Phase 6 re-review N7). Written in
+        // this same conditional UPDATE, so a claim cannot exist whose release probe has
+        // to guess which workflow id it belongs to. `null` when the caller had no
+        // workflow context — see `ClaimIdentity.workflowId`.
+        claimedByWorkflowId: identity.workflowId ?? null,
         claimedAt,
       },
     });
@@ -539,17 +554,58 @@ export interface HeldExecutionClaim {
 }
 
 /**
- * Which control authorised a terminal write. Recorded (in the activity's return value and
- * its audit trail) so "this was written by the execution that held the claim" is never
- * confused with "this was written by the execution that was refused before any claim
- * existed".
+ * Which control authorised a write that changes execution state. Recorded (in the
+ * activity's return value and its audit trail) so "this was written by the execution
+ * that held the claim" is never confused with "this was written by the execution that was
+ * refused before any claim existed".
  */
 export type CompletionAuthority = 'execution-claim' | 'pre-dispatch';
 
 /**
- * Authority to write a task's terminal state — Phase 6 re-review N4.
+ * What a caller intends to write, in the vocabulary the pre-dispatch arm understands —
+ * Phase 6 re-review N4 (residual class) and N8.
  *
- * ## Why `completeTaskActivity` needs this and `persistResultActivity` does not
+ * The arm exists because a refused-before-dispatch run has no claim *by construction*,
+ * so a claim check can never authorise its writes. The arm must therefore be narrow enough
+ * that "no claim" does not become "any write": it names the exact writes that path
+ * legitimately performs, and everything else is refused.
+ */
+export type WriteIntent =
+  | { readonly kind: 'terminal'; readonly status: CompleteTaskActivityInput['status'] }
+  | { readonly kind: 'start' }
+  | { readonly kind: 'event'; readonly eventType: string };
+
+/**
+ * The only terminal statuses a run that never held a claim may write — N8.
+ *
+ * Both legitimate pre-dispatch call sites write a **refusal**: `failed` from
+ * `failBeforeExecution` / `recordUnexpectedFailure`, `cancelled` from
+ * `recordCancellation` when the cancellation landed before validation claimed anything.
+ * `succeeded` is not a refusal, and a run that never executed cannot produce one: before
+ * AG-604 the arm accepted it, so a workflow under `task-<taskId>` could mark a task with
+ * zero attempts and zero `AgentRun` rows `succeeded`. Bounded only by the shipped registry
+ * happening to emit `failed` — a bound that belongs in the control, not in the caller.
+ */
+const PRE_DISPATCH_TERMINAL_STATUSES: ReadonlySet<string> = new Set(['failed', 'cancelled']);
+
+/**
+ * The only audit events a run that never held a claim may write — N4 (residual class).
+ *
+ * `task.failed.v1` is the durable record of a refusal (`failBeforeExecution`,
+ * `recordUnexpectedFailure`, both of which exist because the terminal write itself may be
+ * refused); `task.cancelled.v1` is the cancellation record when the cancellation won the
+ * race against validation. `task.status_changed.v1` and `task.succeeded.v1` are not
+ * refusals and are written only by a run that holds the claim.
+ */
+const PRE_DISPATCH_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'task.failed.v1',
+  'task.cancelled.v1',
+]);
+
+/**
+ * Authority to write execution state — Phase 6 re-review N4, extended by AG-604.
+ *
+ * ## Why `completeTaskActivity` needs two arms and `persistResultActivity` does not
  *
  * `persistResultActivity` is only ever reached *after* a run, so a claim must exist and
  * it requires one unconditionally. `completeTaskActivity` is also reached **before**
@@ -566,12 +622,22 @@ export type CompletionAuthority = 'execution-claim' | 'pre-dispatch';
  * | Case | Control |
  * |---|---|
  * | the named attempt carries a claim | `requireExecutionClaim` — the holder, and only the holder |
- * | no attempt carries a claim | the caller must be **the** execution for this task (`task-<taskId>`), and no attempt of this task may be running or claimed by anybody else |
+ * | no attempt carries a claim | the caller must be **the** execution for this task (`task-<taskId>`), **and** write only what that path legitimately writes, **and** no attempt of this task may be running or claimed by anybody else |
  *
  * The pre-dispatch arm is not a relaxation of the claim check — there is nothing for it to
  * relax. Before AG-603 this path had **no** check at all: any workflow on the worker's task
- * queue could mark any task terminal by name. Both of its conditions are read from the
- * server-set activity context, and neither is expressible as an activity input.
+ * queue could mark any task terminal by name. Its conditions are read from the server-set
+ * activity context and from the caller's intent, and neither is expressible as a weaker
+ * activity input than the write it authorises.
+ *
+ * ## The intent condition — N8 and the N4 residual class
+ *
+ * AG-604 made the audit event load-bearing (it is the durable record of a refused run) and
+ * left `emitEventActivity` / `recordStartActivity` dispatchable by name with no authority
+ * at all. Both now come through here, and the pre-dispatch arm admits only the writes the
+ * refusal path actually performs: `failed`/`cancelled` terminal statuses, `task.failed.v1`
+ * / `task.cancelled.v1` events, and **no** start. `succeeded` and `task.status_changed.v1`
+ * are refused, because neither is a refusal and only an execution that ran may write them.
  *
  * ## Why the workflow id, and why it only applies here
  *
@@ -582,12 +648,13 @@ export type CompletionAuthority = 'execution-claim' | 'pre-dispatch';
  * proof than a workflow id, and applying both would refuse a legitimate execution whose
  * activity was replayed into a workflow started under a test or back-office id.
  */
-export async function requireCompletionAuthority(input: {
+async function requireExecutionWriteAuthority(input: {
   readonly orgId: string;
   readonly taskId: string;
   readonly attemptId: string | undefined;
   readonly executionRunId: string | undefined;
   readonly workflowRunId?: string | undefined;
+  readonly intent: WriteIntent;
 }): Promise<{ readonly authority: CompletionAuthority; readonly executionRunId: string }> {
   const { executionRunId } = input;
 
@@ -627,10 +694,10 @@ export async function requireCompletionAuthority(input: {
   if (workflowId !== expected) {
     throw nonRetryableWithDetails(
       EXECUTION_CLAIM_REFUSED,
-      `Task ${input.taskId} was asked to complete without a claim by an execution that is ` +
-        `not this task's own (workflow id ${workflowId ?? 'none'}, expected ${expected}). ` +
-        'A run that never claimed a reservation may only record a refusal for the task it ' +
-        'was started for.',
+      `Task ${input.taskId} was asked to ${describeWrite(input.intent)} without a claim by ` +
+        `an execution that is not this task's own (workflow id ${workflowId ?? 'none'}, ` +
+        `expected ${expected}). A run that never claimed a reservation may only record a ` +
+        'refusal for the task it was started for.',
       {
         reason: 'execution_completion',
         code: EXECUTION_CLAIM_REFUSED,
@@ -640,9 +707,55 @@ export async function requireCompletionAuthority(input: {
     );
   }
 
+  // The intent gate: identity alone does not authorise a write this path never performs.
+  const refusal = refuseIntent(input.intent);
+
+  if (refusal !== undefined) {
+    throw nonRetryableWithDetails(
+      EXECUTION_CLAIM_REFUSED,
+      `Task ${input.taskId} was asked to ${describeWrite(input.intent)} without a claim. ` +
+        `A run that never claimed a reservation may only record a refusal, and ${refusal}. ` +
+        'Only an execution that holds the claim may write anything else.',
+      {
+        reason: 'execution_completion',
+        code: EXECUTION_CLAIM_REFUSED,
+        taskId: input.taskId,
+        workflowId,
+        ...intentDetail(input.intent),
+      },
+    );
+  }
+
   // Something may be executing under a claim even though the attempt named here has none:
   // a retry, or a second reservation of the same task. Completing the task underneath it
   // would end a run that is still working.
+  //
+  // ## Residual (N9/N11) — an unclaimed `running` attempt is foreign to its own execution
+  //
+  // `row.status === 'running'` with `claimedByWorkflowRunId IS NULL` makes the predicate
+  // below true for **every** caller, including the execution that adopted the row. Such a
+  // row is the exact shape left by every attempt adopted before this phase added the claim
+  // columns:
+  //
+  //   ExecutionAttempt {
+  //     status                   = 'running'
+  //     claimedByWorkflowRunId   = NULL        -- never back-filled, on purpose
+  //     claimedAt                = NULL
+  //     claimedByWorkflowId      = NULL
+  //     agentRunId               = <set>       -- it did run
+  //   }
+  //
+  // It can be neither claimed (`classifyLostClaim` refuses: `running` needs a claim it does
+  // not have), nor adopted (`adoptReservedAttempt` requires `status = 'queued'`), nor
+  // completed through this arm, nor reaped (`claim-release.ts` only considers `queued`).
+  // Its task therefore never reaches a terminal state, and the refusal is swallowed with a
+  // log line — the audit event still says the task failed, so task and history disagree.
+  //
+  // This is **fail-closed and migration-window-only**: the row can only exist for an
+  // execution that was mid-run when the column was added. The predicate is deliberately
+  // not relaxed to "an unclaimed running attempt belongs to whoever asks" — that would hand
+  // every duplicate execution the ability to complete a task somebody else is running,
+  // which is the hole this arm exists to close. Recorded as a residual rather than fixed.
   const attempts = await db().executionAttempt.findMany({
     where: {
       orgId: input.orgId,
@@ -678,6 +791,105 @@ export async function requireCompletionAuthority(input: {
   }
 
   return { authority: 'pre-dispatch', executionRunId };
+}
+
+/**
+ * Authority for the terminal task write — `completeTaskActivity`.
+ *
+ * The `status` is part of the guard, not decoration: see `PRE_DISPATCH_TERMINAL_STATUSES`
+ * (N8). The claim arm ignores it deliberately — the holder of the claim is authorised for
+ * all three statuses, and `completeTask`'s own transition guard decides which is legal.
+ */
+export async function requireCompletionAuthority(input: {
+  readonly orgId: string;
+  readonly taskId: string;
+  readonly attemptId: string | undefined;
+  readonly executionRunId: string | undefined;
+  readonly workflowRunId?: string | undefined;
+  readonly status: CompleteTaskActivityInput['status'];
+}): Promise<{ readonly authority: CompletionAuthority; readonly executionRunId: string }> {
+  return requireExecutionWriteAuthority({ ...input, intent: { kind: 'terminal', status: input.status } });
+}
+
+/**
+ * Authority for the audit write — `emitEventActivity`, Phase 6 re-review N4 residual.
+ *
+ * `emitEventActivity` is registered and dispatched by name, so before AG-604 any workflow
+ * on the worker's task queue could write a `task.succeeded.v1` for a task that never ran.
+ * AG-604 made that event the *durable record* of a refused run, which raised what forging
+ * it is worth. The same two arms as completion apply: the claim decides when one exists,
+ * otherwise only this task's own execution may write — and only the refusal events.
+ *
+ * `attemptId` is the claim the execution holds, forwarded by the workflow. It has to be an
+ * input for this activity (the envelope carries no attempt), and it is not trusted: it
+ * selects the arm, and `requireExecutionClaim` then checks the claim against the run id
+ * from the activity context, which is the part a caller cannot choose.
+ */
+export async function requireEventAuthority(input: {
+  readonly orgId: string;
+  readonly taskId: string;
+  readonly attemptId: string | undefined;
+  readonly executionRunId: string | undefined;
+  readonly eventType: string;
+}): Promise<{ readonly authority: CompletionAuthority; readonly executionRunId: string }> {
+  return requireExecutionWriteAuthority({
+    ...input,
+    intent: { kind: 'event', eventType: input.eventType },
+  });
+}
+
+/**
+ * Authority for `recordStartActivity`, Phase 6 re-review N4 residual.
+ *
+ * There is no pre-dispatch case here, on purpose: every legitimate call happens *after*
+ * `validateTaskActivity` granted the claim, so the claim arm is the only one that can
+ * succeed. Before AG-604 the activity was dispatchable by name and moved a task
+ * `queued → running` from a standalone activity; without a claim there is now no way to
+ * write that transition at all. `intent: { kind: 'start' }` is never admitted by the
+ * pre-dispatch arm, which is what makes that true rather than asserted.
+ */
+export async function requireStartAuthority(input: {
+  readonly orgId: string;
+  readonly taskId: string;
+  readonly attemptId: string | undefined;
+  readonly executionRunId: string | undefined;
+}): Promise<{ readonly authority: CompletionAuthority; readonly executionRunId: string }> {
+  return requireExecutionWriteAuthority({ ...input, intent: { kind: 'start' } });
+}
+
+/** Why the pre-dispatch arm refuses this intent, or `undefined` when it admits it. */
+function refuseIntent(intent: WriteIntent): string | undefined {
+  if (intent.kind === 'terminal') {
+    return PRE_DISPATCH_TERMINAL_STATUSES.has(intent.status)
+      ? undefined
+      : `"${intent.status}" is a success, and a run that never held a claim never ran anything`;
+  }
+
+  if (intent.kind === 'event') {
+    return PRE_DISPATCH_EVENT_TYPES.has(intent.eventType)
+      ? undefined
+      : `"${intent.eventType}" is not a refusal event`;
+  }
+
+  // `start` has no pre-dispatch case: the claim is granted *before* the start is recorded,
+  // so a start without one is not the refusal path — it is a second execution.
+  return 'moving the task to running is not a refusal; it needs the claim that authorises it';
+}
+
+/** The intent, in words an operator can act on. Used in every refusal message. */
+function describeWrite(intent: WriteIntent): string {
+  if (intent.kind === 'terminal') return `record status "${intent.status}"`;
+  if (intent.kind === 'event') return `emit "${intent.eventType}"`;
+
+  return 'record the start of this task';
+}
+
+/** The intent as audit detail, so a refusal says which write was refused. */
+function intentDetail(intent: WriteIntent): Record<string, unknown> {
+  if (intent.kind === 'terminal') return { status: intent.status };
+  if (intent.kind === 'event') return { eventType: intent.eventType };
+
+  return { write: 'start' };
 }
 
 /** The subset of the client an audit write needs — satisfied by the client and by a transaction. */

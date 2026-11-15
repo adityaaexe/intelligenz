@@ -45,6 +45,9 @@ export async function completeTaskActivity(
     attemptId: input.attemptId,
     executionRunId: executionIdentity(),
     workflowRunId: input.workflowRunId,
+    // N8: the status is part of the guard. The pre-dispatch arm admits only the two
+    // statuses a refusal path legitimately writes; `succeeded` without a claim is refused.
+    status: input.status,
   });
 
   // The arm that authorised the write goes back to the caller: "this execution held the

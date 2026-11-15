@@ -120,6 +120,17 @@ export async function startAttempt(input: {
    * A default of `undefined` would silently restore exactly that, so there is no default.
    */
   readonly executionRunId: string;
+  /**
+   * The workflow id the same execution was started under, recorded beside the run id on a
+   * **newly allocated** attempt (Phase 6 re-review N7).
+   *
+   * Optional because a claim written through this path is already complete without it —
+   * this is the audit pair a release would need, and these rows are created `running`, so
+   * the release pass never considers them. Stamping it anyway keeps one meaning for
+   * `claimedByWorkflowId`: "the workflow id this claim was granted under", never "null
+   * because nobody wrote it".
+   */
+  readonly executionWorkflowId?: string | undefined;
 }): Promise<AttemptRef> {
   const prisma = db();
 
@@ -154,6 +165,9 @@ export async function startAttempt(input: {
           // this task's claim (`requireExecutionClaim`), so stamping it asserts nothing
           // that was not already verified.
           claimedByWorkflowRunId: input.executionRunId,
+          // The other half of the recorded identity (N7). Same reason: a claim without it
+          // could never be probed exactly if this row were ever left stranded.
+          claimedByWorkflowId: input.executionWorkflowId ?? null,
           claimedAt: input.startedAt,
         },
         select: { id: true, attemptNumber: true },

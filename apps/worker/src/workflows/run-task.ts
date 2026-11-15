@@ -125,6 +125,10 @@ export async function runTaskWorkflow(input: RunTaskWorkflowInput): Promise<RunT
       taskId,
       orgId,
       workflowRunId: runId,
+      // Phase 6 re-review N4 (residual): the claim that authorises a `queued → running`
+      // transition. Validation has just granted it, so this names it rather than skipping
+      // the check — the activity is dispatched by name and cannot assume it.
+      ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
     });
 
     if (isTerminal(started.taskStatus)) {
@@ -136,7 +140,8 @@ export async function runTaskWorkflow(input: RunTaskWorkflowInput): Promise<RunT
       };
     }
 
-    await taskActivities.emitEventActivity({
+    await emit({
+      attemptId: input.attemptId,
       event: envelope({
         eventType: 'task.status_changed.v1',
         tenantId: orgId,
@@ -183,7 +188,8 @@ export async function runTaskWorkflow(input: RunTaskWorkflowInput): Promise<RunT
     const finalStatus = outcomeOf(result.status);
     const eventType = terminalEventType(finalStatus);
 
-    await taskActivities.emitEventActivity({
+    await emit({
+      attemptId: input.attemptId,
       event: envelope({
         eventType,
         tenantId: orgId,
@@ -264,6 +270,13 @@ async function failBeforeExecution(
   // direct start under a non-standard workflow id, or a task another execution is holding.
   // The audit event is the durable record either way, so it is emitted independently of
   // whether the status write landed.
+  //
+  // Since AG-604 the event is authority-checked as well, and it takes the *same* arms: a
+  // refusal from this task's own execution with no claim is recorded (`task.failed.v1` is
+  // one of the two events the pre-dispatch arm admits), while a duplicate execution holding
+  // somebody else's attempt gets neither write. Its refusal is recorded by
+  // `claimExecution` as `execution.claim_duplicate.v1` on the attempt, and in its own
+  // workflow result — not on a task it does not own.
   await taskActivities
     .completeTaskActivity({
       taskId: input.taskId,
@@ -283,7 +296,8 @@ async function failBeforeExecution(
     });
 
   if (validation.projectId !== undefined) {
-    await taskActivities.emitEventActivity({
+    await emit({
+      attemptId: input.attemptId,
       event: envelope({
         eventType: 'task.failed.v1',
         tenantId: input.orgId,
@@ -333,7 +347,8 @@ async function recordCancellation(
       // worker confirms rather than duplicates.
       if (!completion.changed) return;
 
-      await taskActivities.emitEventActivity({
+      await emit({
+        attemptId,
         event: envelope({
           eventType: 'task.cancelled.v1',
           tenantId: orgId,
@@ -382,8 +397,9 @@ async function recordUnexpectedFailure(
     await CancellationScope.nonCancellable(async () => {
       // Same reasoning as `failBeforeExecution`: the terminal write is authority-checked and
       // may be refused (this is the duplicate-execution case, where the attempt belongs to
-      // somebody else). The refusal still belongs on the record, so the event does not
-      // depend on the write.
+      // somebody else). The event does not depend on the write — but since AG-604 it is
+      // authority-checked too, so a duplicate execution gets neither, and its refusal lives
+      // in `execution.claim_duplicate.v1` (written by `claimExecution`) and its own result.
       await taskActivities
         .completeTaskActivity({
           taskId: input.taskId,
@@ -401,7 +417,8 @@ async function recordUnexpectedFailure(
 
       if (projectId === undefined) return;
 
-      await taskActivities.emitEventActivity({
+      await emit({
+        attemptId: input.attemptId,
         event: envelope({
           eventType: 'task.failed.v1',
           tenantId: input.orgId,
@@ -446,6 +463,28 @@ async function recordUnexpectedFailure(
  */
 function now(): Date {
   return new Date(workflowInfo().unsafe.now());
+}
+
+/**
+ * The audit write, with the claim that authorises it — Phase 6 re-review N4 (residual).
+ *
+ * Every `task.*` event the workflow writes goes through here so no call site can forget
+ * the attempt and silently fall back to the pre-dispatch arm. `attemptId` being absent is
+ * not an error: a run refused before dispatch legitimately has none, and the activity's
+ * arm decides whether the event is one that path may write (`task.failed.v1`,
+ * `task.cancelled.v1`).
+ *
+ * It stays a thin wrapper rather than logic because the workflow must remain deterministic
+ * — the decision belongs to the activity, which reads its own context.
+ */
+async function emit(input: {
+  readonly attemptId: string | undefined;
+  readonly event: EventEnvelope;
+}): Promise<void> {
+  await taskActivities.emitEventActivity({
+    event: input.event,
+    ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
+  });
 }
 
 interface EnvelopeInput {

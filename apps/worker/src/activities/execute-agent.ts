@@ -69,7 +69,7 @@ import {
   startAttempt,
 } from './attempts';
 import { executionWorkspaceIdFor } from './ids';
-import { requireExecutionClaim, executionIdentity } from './claim';
+import { requireExecutionClaim, executionIdentity, executionWorkflowId } from './claim';
 import { workerIdentity } from '../identity';
 import { workerLogger } from '../log';
 import { db, nonRetryable, retryable } from './support';
@@ -295,6 +295,7 @@ export async function executeAgentActivity(
       // The claim this activity verified on entry. `startAttempt` adopts only a row
       // carrying it, so even this retirement path cannot take another execution's row.
       executionRunId: claim.executionRunId,
+      executionWorkflowId: executionWorkflowId(),
     });
 
     await finalizeAttempt({
@@ -409,6 +410,9 @@ export async function executeAgentActivity(
     // The same execution that passed the entry check. Adoption is conditional on the
     // attempt carrying this claim (F2).
     executionRunId: claim.executionRunId,
+    // N7: the workflow id beside the run id, so the claim record on a newly allocated
+    // attempt can be probed exactly rather than guessed.
+    executionWorkflowId: executionWorkflowId(),
   });
 
   let lease: WorkspaceLease | undefined;
