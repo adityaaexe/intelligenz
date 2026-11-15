@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - name: CLI smoke test
+        run: |
+          node dist/src/cli.js --version
+          node --input-type=module -e "
+            import { Journal } from './dist/src/index.js';
+            const j = Journal.create('smoke.jsonl', { force: true });
+            j.append('run.start', { ok: true });
+          "
+          node dist/src/cli.js verify smoke.jsonl
+          node dist/src/cli.js tail smoke.jsonl 1
