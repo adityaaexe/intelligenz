@@ -119,3 +119,16 @@ export function repositoryPath(rootPath: string): string {
 export function artifactsPath(rootPath: string): string {
   return join(rootPath, 'artifacts');
 }
+
+/**
+ * Host-owned manifests, digests and snapshots for one attempt.
+ *
+ * A sibling of `repo` and `artifacts`, and for the same reason `artifacts` is one: the
+ * sandbox binds exactly one host directory, `<rootPath>/repo`, at `/workspace`. A mount
+ * table that does not name `evidence/` is the whole containment argument — the agent
+ * cannot see, read or rewrite the record of what it changed, so it cannot write the
+ * evidence that is used to judge it.
+ */
+export function evidencePath(rootPath: string): string {
+  return join(rootPath, 'evidence');
+}

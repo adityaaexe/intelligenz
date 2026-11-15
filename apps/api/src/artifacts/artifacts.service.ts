@@ -143,6 +143,9 @@ export class ArtifactsService {
         uri: true,
         checksum: true,
         sizeBytes: true,
+        evidenceSource: true,
+        authoritative: true,
+        manifestDigest: true,
         createdAt: true,
       },
     });

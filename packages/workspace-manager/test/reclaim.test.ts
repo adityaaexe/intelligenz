@@ -46,9 +46,34 @@ describe('reclaimWorkspace', () => {
     const result = await reclaimWorkspace({ root, ids, recordedRootPath: path });
 
     expect(result.artifactsKept).toBe(true);
+    expect(result.evidenceKept).toBe(false);
     expect(result.removed).toBe(false);
     expect(await readdir(path)).toEqual(['artifacts']);
     expect(await readdir(join(path, 'artifacts'))).toEqual(['report.md']);
+  });
+
+  /**
+   * The reaper is the unattended cleanup path, so it is the one where "evidence disappeared
+   * but the digest stayed in the row" would go unnoticed longest. A workspace whose adapter
+   * reported nothing still has host evidence, and the old `exists(artifacts)` guard would
+   * have removed it with the checkout.
+   */
+  it('keeps evidence/ when there are no artifacts, and preserves nothing else', async () => {
+    const { root, ids } = await fixture();
+    const path = workspacePath(root, ids);
+
+    await mkdir(join(path, 'repo', 'src'), { recursive: true });
+    await mkdir(join(path, 'evidence'), { recursive: true });
+    await writeFile(join(path, 'repo', 'src', 'index.ts'), 'export {};');
+    await writeFile(join(path, 'evidence', 'change-manifest.json'), '{"digest":"d"}');
+
+    const result = await reclaimWorkspace({ root, ids, recordedRootPath: path });
+
+    expect(result.artifactsKept).toBe(false);
+    expect(result.evidenceKept).toBe(true);
+    expect(result.removed).toBe(false);
+    expect(await readdir(path)).toEqual(['evidence']);
+    expect(await readdir(join(path, 'evidence'))).toEqual(['change-manifest.json']);
   });
 
   it('removes everything when asked to keep nothing', async () => {

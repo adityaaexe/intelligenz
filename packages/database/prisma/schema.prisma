@@ -430,6 +430,32 @@ model Artifact {
   /// "which bytes came out of this directory" survives that.
   workspaceId String?
 
+  // ─── Phase 6: is this evidence authority, or a report? ───────────────────
+  // An artifact's checksum proves the bytes have not changed since the worker wrote
+  // them. It says nothing about **who decided what the bytes mean**: a `diff.patch`
+  // produced by `git diff` inside the workspace is a claim by a program the agent can
+  // configure, and `git add` made that claim empty for a fully rewritten tree.
+  //
+  // Three columns, all additive and all defaulted, so every existing row keeps its
+  // current meaning without a back-fill:
+  /// `host-snapshot` — bytes produced by a host walk, not by a repository.
+  /// `git-in-sandbox` — a git report. Display-only; never authority.
+  /// NULL — predates the distinction, so it is neither.
+  evidenceSource        String?
+  /// True only when a host process measured these bytes and the measurement was
+  /// complete. Default false: an artifact written before this column existed was never
+  /// authority, and saying otherwise after the fact is exactly the rewrite this
+  /// column exists to prevent.
+  authoritative         Boolean @default(false)
+  /// For a `change-manifest`: the digest of its canonical body. Equal to `checksum` by
+  /// construction, and recorded separately so a row whose two values disagree is
+  /// detectable rather than merely suspicious.
+  manifestDigest        String?
+  /// The two snapshot digests the manifest compares, denormalised so "which trees did
+  /// this describe" is answerable without parsing the artifact.
+  initialManifestDigest String?
+  finalManifestDigest   String?
+
   organization       Organization        @relation(fields: [orgId], references: [id], onDelete: Cascade)
   task               Task                @relation(fields: [taskId], references: [id], onDelete: Cascade)
   // SetNull, not Cascade: an artifact is content-addressed evidence and outlives the
@@ -543,6 +569,26 @@ model ExecutionWorkspace {
   /// The reaper's failure detail, separate from `error` above: `error` is why the run
   /// did not work, this is why the bytes are still on disk. `{ stage, message, code }`.
   cleanupError    Json?
+
+  // ─── Phase 6: host-owned evidence ────────────────────────────────────────
+  // The agent used to be the author of the evidence used to judge it: the patch an
+  // approver read came from `git diff` run against a repository the agent could
+  // configure, and `git add`/`git commit` made that patch empty while changing every
+  // byte. These columns record what a **host** walk measured instead.
+  //
+  // All three are nullable and deliberately not back-filled. A row written before the
+  // walk existed has no digest, and NULL says that; a synthesised value would be
+  // indistinguishable from a measurement.
+  /// SHA-256 of the snapshot taken immediately after the lease, before the agent
+  /// process exists. This is the baseline a change is measured against.
+  initialManifestDigest String?
+  /// SHA-256 of the snapshot taken after the run ended — on success, failure and
+  /// cancellation alike. NULL means the final walk never completed.
+  finalManifestDigest   String?
+  /// When the baseline was captured. The *final* instant lives inside the manifest
+  /// body rather than in a second column: one column and one body beat two columns
+  /// that can disagree.
+  snapshotAt            DateTime?
 
   organization Organization @relation(fields: [orgId], references: [id], onDelete: Restrict)
   // Cascade: the directory is owned by the task; if the task is deleted the

@@ -4,7 +4,13 @@ import { LOCAL_SIMULATED_ID, type ExecutionResult } from '@intelligenz/agent-run
 import type { PersistResultActivityInput, PersistResultActivityResult } from '../shared/contracts';
 import { RUN_STATUS } from './attempts';
 import { executionIdentity, requireExecutionClaim } from './claim';
-import { agentRunIdFor, artifactIdFor, evidenceIdFor } from './ids';
+import {
+  CHANGE_MANIFEST_KIND,
+  EVIDENCE_SOURCE_GIT_IN_SANDBOX,
+  EVIDENCE_SOURCE_HOST_SNAPSHOT,
+  verifyManifestFile,
+} from './evidence';
+import { agentRunIdFor, artifactIdFor, evidenceIdFor, executionWorkspaceIdFor } from './ids';
 import { db, nonRetryable } from './support';
 
 /**
@@ -80,6 +86,24 @@ export async function persistResult(
     );
   }
 
+  /**
+   * Verify the manifest against the bytes before writing anything.
+   *
+   * Outside the transaction on purpose: file I/O inside a database transaction is a lock
+   * held for the duration of a read. The claim and the bytes are separate facts, and this
+   * is the only place both are available.
+   */
+  if (result.evidence !== undefined) {
+    const problem = await verifyManifestFile(result.evidence);
+
+    if (problem !== null) {
+      throw nonRetryable(
+        'EVIDENCE_INTEGRITY_FAILED',
+        `Refusing to persist a change manifest that does not describe its own bytes: ${problem}.`,
+      );
+    }
+  }
+
   return db().$transaction(async (transaction) => {
     const task = await transaction.task.findFirst({
       // Tenant scoping.
@@ -130,10 +154,15 @@ export async function persistResult(
     const agentRunId =
       attempt.agentRunId ?? agentRunIdFor(run.id, result.runtimeId, attempt.attemptNumber);
 
+    // The directory this attempt leased, from the database only. `result.providerMeta` is
+    // adapter output and is deliberately not consulted: it used to carry a `workspaceId`
+    // that was accepted if it named *any* workspace of this task, which let an adapter
+    // attribute its artifacts to a sibling attempt's directory.
     const workspaceId = await resolveWorkspaceId(transaction, {
       orgId,
       taskId,
-      candidate: result.providerMeta?.['workspaceId'],
+      workflowRunId: run.id,
+      attemptNumber: attempt.attemptNumber,
     });
 
     const invocations = normaliseInvocations(result);
@@ -226,9 +255,36 @@ export async function persistResult(
     const artifactIds: string[] = [];
     const evidenceIds: string[] = [];
 
+    /**
+     * `change-manifest` is a reserved kind.
+     *
+     * `result.artifacts` is adapter output. If an adapter can name this kind, it can make
+     * its own file look like the host's evidence — the exact inversion this gate removes.
+     * The only way in is `result.evidence`, which `executeAgentActivity` writes after the
+     * adapter returns. A refusal here is cheap and the alternative is a forged authority
+     * record, so it is a hard failure rather than a skip.
+     */
+    const reserved = result.artifacts.find((artifact) => artifact.kind === CHANGE_MANIFEST_KIND);
+
+    if (reserved !== undefined) {
+      throw nonRetryable(
+        'EVIDENCE_KIND_RESERVED',
+        `Artifact kind "${CHANGE_MANIFEST_KIND}" may only be produced by the worker's host snapshot, not by "${result.runtimeId}".`,
+      );
+    }
+
     for (const artifact of result.artifacts) {
       const artifactId = artifactIdFor(taskId, artifact.kind, artifact.checksum);
       const sizeBytes = BigInt(artifact.sizeBytes);
+
+      /**
+       * `diff` is what `git diff` said, inside a sandbox, against a repository the agent
+       * can configure. `git add` makes it empty for a fully rewritten tree; a `clean`
+       * filter makes it empty for a rewritten file; a commit makes it empty for
+       * everything. It is kept — it is still the most readable view of a change — and it
+       * is labelled so no consumer can mistake it for the answer.
+       */
+      const isGitReport = artifact.kind === 'diff';
 
       await transaction.artifact.upsert({
         where: { id: artifactId },
@@ -241,10 +297,23 @@ export async function persistResult(
           uri: artifact.uri,
           checksum: artifact.checksum,
           sizeBytes,
+          ...(isGitReport
+            ? { evidenceSource: EVIDENCE_SOURCE_GIT_IN_SANDBOX, authoritative: false }
+            : {}),
         },
         // `uri` can legitimately move (a different artifact root); the checksum is what
         // identifies the content, and it is part of the id.
-        update: { uri: artifact.uri, sizeBytes },
+        //
+        // The demotion is re-asserted on update: a row that once carried a different
+        // label must not keep it after this code is deployed, and `false` is the only
+        // value this column may hold for a git report.
+        update: {
+          uri: artifact.uri,
+          sizeBytes,
+          ...(isGitReport
+            ? { evidenceSource: EVIDENCE_SOURCE_GIT_IN_SANDBOX, authoritative: false }
+            : {}),
+        },
         select: { id: true },
       });
 
@@ -264,6 +333,76 @@ export async function persistResult(
           producedBy: result.runtimeId,
         },
         update: { uri: artifact.uri },
+        select: { id: true },
+      });
+
+      evidenceIds.push(evidenceId);
+    }
+
+    // ── The host manifest, bound to the worker's own context ───────────────────
+    //
+    // `attemptId` is the attempt row the worker opened (resolved from the workflow run,
+    // not from the result), and `workspaceId` is the tenant-scoped workspace this
+    // execution leased. Neither is copied from `result.artifacts`, and `result.evidence`
+    // is the only way a `change-manifest` reaches this point — so a forged artifact list
+    // cannot claim provenance, and an adapter cannot point evidence at another attempt's
+    // workspace.
+    //
+    // `authoritative` is `evidence.authoritative && workspaceId !== null`: a manifest that
+    // cannot be bound is not authority, because nobody can say which tree it describes.
+    // `authoritative` defaults to false in the schema, so the failure direction is always
+    // "less claim", never more.
+    if (result.evidence !== undefined) {
+      const evidence = result.evidence;
+      const artifactId = artifactIdFor(taskId, evidence.kind, evidence.manifestDigest);
+      const sizeBytes = BigInt(evidence.artifact.sizeBytes);
+      const authoritative = evidence.authoritative && workspaceId !== null;
+
+      await transaction.artifact.upsert({
+        where: { id: artifactId },
+        create: {
+          id: artifactId,
+          orgId,
+          taskId,
+          // The adapter whose run this describes; the producer is `evidenceSource`.
+          runtimeId: result.runtimeId,
+          kind: evidence.kind,
+          uri: evidence.artifact.uri,
+          checksum: evidence.artifact.checksum,
+          sizeBytes,
+          attemptId: attempt.id,
+          ...(workspaceId === null ? {} : { workspaceId }),
+          evidenceSource: EVIDENCE_SOURCE_HOST_SNAPSHOT,
+          authoritative,
+          manifestDigest: evidence.manifestDigest,
+          initialManifestDigest: evidence.initialManifestDigest,
+          finalManifestDigest: evidence.finalManifestDigest,
+        },
+        // Deliberately **not** rebinding on update. The id is content-addressed, so a
+        // second attempt that produced byte-identical evidence reaches this row; moving
+        // the attempt link would re-attribute history to the newest run. `uri` may move
+        // legitimately (a different workspace root), so it is refreshed.
+        update: { uri: evidence.artifact.uri, sizeBytes },
+        select: { id: true },
+      });
+
+      artifactIds.push(artifactId);
+
+      const evidenceId = evidenceIdFor(taskId, evidence.kind, evidence.manifestDigest);
+
+      await transaction.evidence.upsert({
+        where: { id: evidenceId },
+        create: {
+          id: evidenceId,
+          orgId,
+          taskId,
+          kind: 'change_manifest',
+          uri: evidence.artifact.uri,
+          // `host-snapshot` is the producer, and it is not an adapter name on purpose:
+          // this claim came from a walk, not from a runtime.
+          producedBy: EVIDENCE_SOURCE_HOST_SNAPSHOT,
+        },
+        update: { uri: evidence.artifact.uri },
         select: { id: true },
       });
 
@@ -327,14 +466,49 @@ function normaliseInvocations(result: ExecutionResult): {
   return { rows, total: all.length };
 }
 
+/**
+ * The directory attempt *N* of run *R* leased — resolved from the database, and nothing
+ * else.
+ *
+ * `result.providerMeta` used to be an input here. It accepted any string that named an
+ * `ExecutionWorkspace` row in the same `orgId` + `taskId`, so an adapter could attribute
+ * its artifacts to a **sibling** workspace of the same task — a previous attempt's
+ * directory — and the row would say those bytes came from there. No cross-tenant read, but
+ * the agent deciding the provenance Gate G exists to establish, which is the inversion this
+ * gate removes.
+ *
+ * The routing key is therefore the attempt's own identity, not a value anyone can propose:
+ * `executionWorkspaceIdFor(workflowRunId, attemptNumber)` is derived from the `WorkflowRun`
+ * row and the `ExecutionAttempt` row read in this transaction, and both of those are the
+ * worker's own record of what it started. `execute-agent.ts` leases the directory under the
+ * same derivation, from the same pair, so the mapping is 1:1 by construction
+ * (`activities/ids.ts`). The row is looked up scoped to `orgId` and `taskId`, so a
+ * same-named row under another tenant or task is not this attempt's.
+ *
+ * The *recorded* links (`AgentRun.workspaceId`, `ExecutionWorkspace.agentRunId`) cannot
+ * answer this on the first pass: `persistResult` is what writes them, below, so they are
+ * empty exactly when the answer is first needed. They remain the read path for "[which
+ * directory did this run use]" once this transaction has committed.
+ *
+ * `null` is a real answer, not a missing one: no row means no directory was leased for this
+ * attempt (a runtime that needs none, a provisioning failure, a row written before Phase 3).
+ * The caller turns that into `authoritative = false` — less claim, never more.
+ */
 async function resolveWorkspaceId(
   transaction: Prisma.TransactionClient,
-  input: { readonly orgId: string; readonly taskId: string; readonly candidate: unknown },
+  input: {
+    readonly orgId: string;
+    readonly taskId: string;
+    readonly workflowRunId: string;
+    readonly attemptNumber: number;
+  },
 ): Promise<string | null> {
-  if (typeof input.candidate !== 'string' || input.candidate.length === 0) return null;
-
   const workspace = await transaction.executionWorkspace.findFirst({
-    where: { id: input.candidate, orgId: input.orgId, taskId: input.taskId },
+    where: {
+      id: executionWorkspaceIdFor(input.workflowRunId, input.attemptNumber),
+      orgId: input.orgId,
+      taskId: input.taskId,
+    },
     select: { id: true },
   });
 

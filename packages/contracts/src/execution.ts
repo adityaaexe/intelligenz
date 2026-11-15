@@ -180,6 +180,24 @@ export const ExecutionArtifactSummary = z
     checksum: z.string().regex(/^[a-f0-9]{64}$/, 'checksum must be lowercase hex SHA-256'),
     sizeBytes: z.number().int().nonnegative(),
     integrity: ArtifactIntegrity,
+    /**
+     * Which mechanism produced the bytes, or `null` when the row predates the distinction.
+     *
+     * `host-snapshot` — a host walk measured them. `git-in-sandbox` — a `git diff` report
+     * against a workspace the agent can configure: display-only.
+     */
+    evidenceSource: z.string().min(1).nullable(),
+    /**
+     * True only for evidence a host process measured, completely, and bound to an attempt
+     * and a workspace. False for every row written before the column existed, because
+     * "it was always authority" is the claim this field was added to stop.
+     */
+    authoritative: z.boolean(),
+    /** For a change manifest: the digest of its canonical body. `null` otherwise. */
+    manifestDigest: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/, 'manifestDigest must be lowercase hex SHA-256')
+      .nullable(),
     createdAt: z.string().min(1),
   })
   .strict();

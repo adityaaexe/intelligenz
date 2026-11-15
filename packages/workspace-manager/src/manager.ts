@@ -8,6 +8,7 @@ import { ContainmentError, WorkspaceError } from './errors';
 import {
   artifactsPath,
   assertContained,
+  evidencePath,
   repositoryPath,
   resolveWorkspaceRoot,
   safeSegment,
@@ -37,6 +38,7 @@ const execFileAsync = promisify(execFile);
  * <root>/<orgId>/<taskId>/<workspaceId>   rootPath     0700, the lease
  *          .../repo                       repositoryPath  the checkout a run writes
  *          .../artifacts                  artifactsPath   survives cleanup
+ *          .../evidence                   evidencePath    host snapshots; survives cleanup
  * ```
  *
  * ## Rules this class enforces
@@ -135,6 +137,15 @@ export interface CleanupResult {
   readonly removed: boolean;
   /** True when `artifacts/` survived, which is the default. */
   readonly artifactsKept: boolean;
+  /**
+   * True when `evidence/` survived.
+   *
+   * Reported separately from `artifactsKept` because the two answer different questions:
+   * `artifacts/` holds what the adapter said it produced, `evidence/` holds the host's own
+   * manifests. A cleanup that kept one and dropped the other is a fact an operator needs
+   * to see, not a detail to infer from `removed: false`.
+   */
+  readonly evidenceKept: boolean;
 }
 
 export interface WorkspaceManagerOptions {
@@ -587,7 +598,13 @@ export function createWorkspaceManager(options: WorkspaceManagerOptions = {}): W
       handle.state === 'cleaned' ||
       handle.state === 'cleanup_failed'
     ) {
-      return { workspaceId: handle.id, rootPath: resolved, removed: false, artifactsKept: false };
+      return {
+        workspaceId: handle.id,
+        rootPath: resolved,
+        removed: false,
+        artifactsKept: false,
+        evidenceKept: false,
+      };
     }
 
     const current = handles.get(handle.id) ?? handle;
@@ -597,12 +614,31 @@ export function createWorkspaceManager(options: WorkspaceManagerOptions = {}): W
     }
 
     const artifacts = artifactsPath(resolved);
+    const evidence = evidencePath(resolved);
     let artifactsKept = false;
+    let evidenceKept = false;
 
-    if (keepArtifacts && (await exists(artifacts))) {
+    /**
+     * `artifacts/` and `evidence/` are both siblings of `repo`, and both outlive the
+     * checkout: the artifact holds what the adapter *said* it produced, the evidence holds
+     * the digests of what the host *measured*. Dropping `evidence/` here would leave
+     * `ExecutionWorkspace.finalManifestDigest` pointing at bytes that no longer exist —
+     * a digest that can never be checked again is worse than no digest, because it looks
+     * like one.
+     *
+     * The condition tests both directories: a workspace whose adapter produced nothing
+     * still has evidence, and the previous `exists(artifacts)` guard would have deleted
+     * it along with everything else.
+     */
+    if (keepArtifacts && ((await exists(artifacts)) || (await exists(evidence)))) {
       for (const entry of await readdir(resolved)) {
         if (entry === 'artifacts') {
           artifactsKept = true;
+          continue;
+        }
+
+        if (entry === 'evidence') {
+          evidenceKept = true;
           continue;
         }
 
@@ -643,7 +679,14 @@ export function createWorkspaceManager(options: WorkspaceManagerOptions = {}): W
       }
     }
 
-    return { workspaceId: handle.id, rootPath: resolved, removed: !artifactsKept, artifactsKept };
+    return {
+      workspaceId: handle.id,
+      rootPath: resolved,
+      // "Nothing was preserved" — evidence alone is still something preserved.
+      removed: !artifactsKept && !evidenceKept,
+      artifactsKept,
+      evidenceKept,
+    };
   }
 
   function adopt(handle: WorkspaceHandle): WorkspaceHandle {

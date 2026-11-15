@@ -87,6 +87,22 @@ export function getAgentRuntime(config: WorkerConfig = loadWorkerConfig()): Agen
 }
 
 /**
+ * Test seam: install an adapter without going through `AGENT_RUNTIME`.
+ *
+ * Needed because the evidence tests have to observe the executor **from inside** the
+ * adapter — "was the baseline already recorded when `execute()` was called?" is a question
+ * only the called process can answer. Constructing an adapter from configuration would
+ * mean spawning `opencode`, a provider and a sandbox for a test about ordering.
+ *
+ * `resetAgentRuntime()` already exists and clears the instance, so this pairs with it the
+ * same way. It is not exported from any public surface, and production never calls it.
+ */
+export function setAgentRuntime(runtime: AgentRuntime): void {
+  instance = runtime;
+  if (!runtimes.has(runtime.id)) runtimes.register(runtime);
+}
+
+/**
  * Whether an adapter needs a leased directory to execute in.
  *
  * Only the real adapter does. Provisioning a git clone for `local-simulated` would

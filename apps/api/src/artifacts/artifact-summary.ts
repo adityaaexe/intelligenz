@@ -23,6 +23,13 @@ export interface ArtifactRecord {
   readonly uri: string;
   readonly checksum: string;
   readonly sizeBytes: bigint;
+  /**
+   * Phase 6 provenance. `null` means the row predates the distinction — reported as
+   * unknown, never guessed from `kind`.
+   */
+  readonly evidenceSource: string | null;
+  readonly authoritative: boolean;
+  readonly manifestDigest: string | null;
   readonly createdAt: Date;
 }
 
@@ -53,6 +60,12 @@ export async function summariseArtifact(
     // the two may disagree.
     sizeBytes: verified.sizeBytes ?? Number(record.sizeBytes),
     integrity: verified.integrity,
+    // Phase 6, verbatim from the row. Not derived from `kind`: a `diff` is not authority
+    // because of what it is called, and a legacy row is not authority because of when it
+    // was written.
+    evidenceSource: record.evidenceSource,
+    authoritative: record.authoritative,
+    manifestDigest: record.manifestDigest,
     createdAt: record.createdAt.toISOString(),
   });
 

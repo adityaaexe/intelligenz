@@ -13,7 +13,11 @@ export type WorkspaceErrorCode =
   | 'WORKSPACE_SOURCE_INVALID'
   | 'SANDBOX_UNAVAILABLE'
   | 'SANDBOX_ENV_REJECTED'
-  | 'SANDBOX_COMMAND_INVALID';
+  | 'SANDBOX_COMMAND_INVALID'
+  | 'SNAPSHOT_ROOT_INVALID'
+  | 'SNAPSHOT_PATH_ESCAPE'
+  | 'SNAPSHOT_LIMITS_INVALID'
+  | 'SNAPSHOT_INCOMPLETE';
 
 export class WorkspaceError extends Error {
   readonly code: WorkspaceErrorCode;
@@ -66,5 +70,26 @@ export class IllegalTransitionError extends WorkspaceError {
     this.name = 'IllegalTransitionError';
     this.from = from;
     this.to = to;
+  }
+}
+
+/**
+ * Raised when a snapshot cannot be taken at all — an invalid root, a path that escaped it,
+ * or nonsensical limits.
+ *
+ * Bounds exhaustion is **not** an error: a truncated snapshot is still evidence of what
+ * was seen, and it is returned with `complete: false`. Only a snapshot that cannot
+ * describe the tree is thrown.
+ */
+export class SnapshotError extends WorkspaceError {
+  constructor(
+    code: Extract<
+      WorkspaceErrorCode,
+      'SNAPSHOT_ROOT_INVALID' | 'SNAPSHOT_PATH_ESCAPE' | 'SNAPSHOT_LIMITS_INVALID' | 'SNAPSHOT_INCOMPLETE'
+    >,
+    message: string,
+  ) {
+    super(code, message);
+    this.name = 'SnapshotError';
   }
 }

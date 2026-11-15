@@ -17,6 +17,7 @@ export {
   UnsafeSegmentError,
   ContainmentError,
   IllegalTransitionError,
+  SnapshotError,
   type WorkspaceErrorCode,
 } from './errors';
 
@@ -28,7 +29,43 @@ export {
   workspacePath,
   repositoryPath,
   artifactsPath,
+  evidencePath,
 } from './paths';
+
+export {
+  DEFAULT_MAX_ENTRIES,
+  DEFAULT_MAX_TOTAL_BYTES,
+  GIT_DIRECTORY,
+  SNAPSHOT_VERSION,
+  serialiseSnapshot,
+  snapshotDigest,
+  takeWorkspaceSnapshot,
+  type SnapshotDigestInput,
+  type SnapshotEntry,
+  type SnapshotEntryKind,
+  type SnapshotGitMetadata,
+  type SnapshotHook,
+  type SnapshotLimits,
+  type SnapshotStopReason,
+  type TakeSnapshotOptions,
+  type WorkspaceSnapshot,
+} from './snapshot';
+
+export {
+  DEFAULT_MAX_CHANGES,
+  MANIFEST_VERSION,
+  buildChangeManifest,
+  manifestCounts,
+  manifestDigest,
+  serialiseManifest,
+  type ChangeEntry,
+  type ChangeManifest,
+  type ChangeStatus,
+  type EntryFingerprint,
+  type ManifestDigestInput,
+  type ManifestSide,
+  type ManifestStopReason,
+} from './manifest';
 
 export {
   WORKSPACE_STATES,

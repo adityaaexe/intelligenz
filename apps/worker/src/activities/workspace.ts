@@ -10,6 +10,7 @@ import {
 import type { PrismaClient } from '@intelligenz/database';
 
 import type { WorkerConfig } from '../config';
+import { workerLogger } from '../log';
 import { db } from './support';
 
 /**
@@ -174,6 +175,59 @@ export async function markExecuting(lease: WorkspaceLease, orgId: string): Promi
 export async function markPreserving(lease: WorkspaceLease, orgId: string): Promise<void> {
   await advance(lease, 'preserving');
   await setState(db(), orgId, lease.id, 'preserving');
+}
+
+/**
+ * Record the baseline digest on the workspace row.
+ *
+ * Written immediately after the snapshot, not at the end of the attempt: if the worker
+ * dies mid-run, the row must still say what tree the attempt started from. `snapshotAt` is
+ * the baseline instant — the *final* instant lives inside the manifest body, so the two
+ * facts cannot drift into two columns that disagree.
+ *
+ * A failure here is logged rather than thrown. The manifest carries both digests anyway;
+ * this column exists so "which baseline did attempt 3 use" is answerable without parsing
+ * an artifact.
+ */
+export async function recordInitialSnapshot(input: {
+  readonly orgId: string;
+  readonly workspaceId: string;
+  readonly digest: string;
+  readonly capturedAt: string;
+}): Promise<void> {
+  try {
+    await db().executionWorkspace.updateMany({
+      where: { id: input.workspaceId, orgId: input.orgId },
+      data: {
+        initialManifestDigest: input.digest,
+        snapshotAt: new Date(input.capturedAt),
+      },
+    });
+  } catch (error) {
+    workerLogger().warn(
+      { workspaceId: input.workspaceId, reason: error instanceof Error ? error.message : String(error) },
+      'Could not record the initial manifest digest on the workspace row',
+    );
+  }
+}
+
+/** Record the digest of the tree the run left behind. Same non-fatal contract. */
+export async function recordFinalSnapshot(input: {
+  readonly orgId: string;
+  readonly workspaceId: string;
+  readonly digest: string;
+}): Promise<void> {
+  try {
+    await db().executionWorkspace.updateMany({
+      where: { id: input.workspaceId, orgId: input.orgId },
+      data: { finalManifestDigest: input.digest },
+    });
+  } catch (error) {
+    workerLogger().warn(
+      { workspaceId: input.workspaceId, reason: error instanceof Error ? error.message : String(error) },
+      'Could not record the final manifest digest on the workspace row',
+    );
+  }
 }
 
 /**

@@ -2,7 +2,7 @@ import { cp, lstat, readdir, realpath, rm, rmdir } from 'node:fs/promises';
 import { join, sep } from 'node:path';
 
 import { ContainmentError, UnsafeSegmentError, WorkspaceError } from './errors';
-import { artifactsPath, assertContained, safeSegment, workspacePath } from './paths';
+import { artifactsPath, assertContained, evidencePath, safeSegment, workspacePath } from './paths';
 
 /**
  * Reclaiming a workspace directory whose owner is gone.
@@ -50,6 +50,14 @@ export interface ReclaimResult {
   readonly removed: boolean;
   /** True when `<rootPath>/artifacts` was found and kept. */
   readonly artifactsKept: boolean;
+  /**
+   * True when `<rootPath>/evidence` was found and kept.
+   *
+   * Reported separately from `artifactsKept` for the same reason `cleanup` reports it: the
+   * host's manifests and the adapter's output are different things, and a sweep that kept
+   * one and dropped the other is a fact an operator should see rather than infer.
+   */
+  readonly evidenceKept: boolean;
   /** True when there was nothing to remove. Idempotent, not an error. */
   readonly alreadyAbsent: boolean;
 }
@@ -183,6 +191,7 @@ export async function reclaimWorkspace(request: ReclaimRequest): Promise<Reclaim
       resolvedPath: resolvedExpected,
       removed: true,
       artifactsKept: false,
+      evidenceKept: false,
       alreadyAbsent: true,
     };
   }
@@ -191,9 +200,17 @@ export async function reclaimWorkspace(request: ReclaimRequest): Promise<Reclaim
   const artifacts = artifactsPath(resolvedExpected);
   const artifactsPresent = keepArtifacts && (await exists(artifacts));
 
-  if (artifactsPresent) {
+  // `evidence/` is preserved on the same terms, and its presence alone is enough to take
+  // the preserve branch. Without this, a reaped workspace whose adapter produced no
+  // artifacts would lose the manifests while `finalManifestDigest` stayed in the row —
+  // a digest pointing at bytes nothing can produce again.
+  const evidence = evidencePath(resolvedExpected);
+  const evidencePresent = keepArtifacts && (await exists(evidence));
+  const preserved = artifactsPresent || evidencePresent;
+
+  if (preserved) {
     for (const entry of await readdir(resolvedExpected)) {
-      if (entry === 'artifacts') continue;
+      if (entry === 'artifacts' || entry === 'evidence') continue;
 
       await rm(join(resolvedExpected, entry), { recursive: true, force: true });
     }
@@ -205,14 +222,15 @@ export async function reclaimWorkspace(request: ReclaimRequest): Promise<Reclaim
   // accumulates one directory per attempt forever. `rmdir` is non-recursive and fails on
   // a non-empty directory, which is exactly the guard wanted here: a sibling that still
   // exists stops the sweep.
-  if (!artifactsPresent) {
+  if (!preserved) {
     await rmdir(walked.taskDir).catch(() => undefined);
   }
 
   return {
     resolvedPath: resolvedExpected,
-    removed: !artifactsPresent,
+    removed: !preserved,
     artifactsKept: artifactsPresent,
+    evidenceKept: evidencePresent,
     alreadyAbsent: false,
   };
 }

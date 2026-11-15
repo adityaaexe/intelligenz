@@ -179,6 +179,7 @@ const MEDIA_TYPES: Readonly<Record<string, string>> = {
   diff: 'text/x-diff',
   report: 'text/markdown; charset=utf-8',
   patch: 'text/x-diff',
+  'change-manifest': 'application/json',
 };
 
 export function mediaTypeForArtifact(kind: string): string {

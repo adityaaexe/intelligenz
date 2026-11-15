@@ -61,6 +61,7 @@ import { getAgentRuntime, runtimeRequiresWorkspace } from '../runtime';
 import type { ExecuteAgentActivityInput, ExecuteAgentActivityResult } from '../shared/contracts';
 import { classifyTermination, type TerminationReason } from '../termination';
 import { materializeArtifacts } from './artifacts';
+import { captureFinalEvidence, captureInitialEvidence, type EvidenceSummary } from './evidence';
 import {
   RUN_STATUS,
   finalizeAttempt,
@@ -77,6 +78,8 @@ import {
   leaseWorkspace,
   markExecuting,
   markPreserving,
+  recordFinalSnapshot,
+  recordInitialSnapshot,
   releaseWorkspace,
   startWorkspaceHeartbeat,
   workspaceArtifactsDirectory,
@@ -420,6 +423,17 @@ export async function executeAgentActivity(
   let attemptFinalized = false;
   let attemptError: unknown;
 
+  // ── Host evidence (Gate G) ────────────────────────────────────────────────────
+  //
+  // `initialEvidence` is the baseline taken the instant the lease is granted, and
+  // `finalEvidence` is the manifest built from it after the run. Both are declared here
+  // because every exit path below — success, resource kill, thrown error — has to be able
+  // to attach what it measured. `null` means "no manifest", which is a different and
+  // honest statement from "an empty manifest": the agent never gets to make the absence
+  // look like a clean bill of health.
+  let initialEvidence: Awaited<ReturnType<typeof captureInitialEvidence>> = null;
+  let finalEvidence: EvidenceSummary | null = null;
+
   // ── Per-attempt enforcement state ─────────────────────────────────────────────
   // `cgroup` is created after the lease (the cgroup is named after the workspace) and
   // removed in `finally`. `usage` is read once the process tree is gone; every value
@@ -469,6 +483,19 @@ export async function executeAgentActivity(
         terminationReason: termination,
       },
     });
+  }
+
+  /**
+   * Attach the host manifest to the result the workflow persists.
+   *
+   * The manifest travels as a worker-authored field beside `ExecutionResult`, never inside
+   * it: `ExecutionResult` is `.strict()`, so an adapter that tries to smuggle an `evidence`
+   * key fails validation rather than being trusted, and `persistResult` refuses a
+   * `change-manifest` artifact that arrived through `artifacts[]`. The provenance this
+   * carries — attempt, workspace, digests — is therefore not adapter-reachable.
+   */
+  function attachEvidence(value: ExecutionResult): ExecuteAgentActivityResult {
+    return finalEvidence === null ? value : { ...value, evidence: finalEvidence };
   }
 
   if (task.status === 'cancelled') {
@@ -570,6 +597,34 @@ export async function executeAgentActivity(
 
       lease = leased.lease;
 
+      // ── The baseline, before the agent exists ─────────────────────────────────
+      //
+      // Not "early" — **first**. This is the first statement after the lease is granted
+      // and it precedes the cgroup (named after the workspace, so it has to follow the
+      // lease), the heartbeat, `markExecuting`, the broker and `runtime.execute`. Anything
+      // that runs before it is something the agent could have touched, and a baseline
+      // taken after the agent's first write is not a baseline: it would report that write
+      // as pre-existing.
+      //
+      // A reused workspace is expected and correct here. This is a *per-attempt* baseline,
+      // so a previous attempt's committed mess appears as pre-existing state — which is
+      // exactly what the next approver needs to know before reading a manifest that says
+      // "only these paths changed".
+      initialEvidence = await captureInitialEvidence(lease.handle);
+
+      if (initialEvidence === null) {
+        workerLogger().warn(
+          { taskId: input.taskId, workspaceId: lease.id },
+          'No initial workspace snapshot: this attempt can produce no change manifest',
+        );
+      } else {
+        await recordInitialSnapshot({
+          orgId: input.orgId,
+          workspaceId: lease.id,
+          digest: initialEvidence.digest,
+          capturedAt: initialEvidence.capturedAt,
+        });
+      }
       // ── Enforce, before the process exists ────────────────────────────────────
       //
       // The cgroup is created and its limits written *before* the adapter is called, so
@@ -686,6 +741,49 @@ export async function executeAgentActivity(
     });
 
     const raw = await runtime.execute(request, controller.signal);
+
+    // ── The final snapshot, the moment the process tree is gone ────────────────
+    //
+    // Taken here, before the result is even validated, and on every path that reaches
+    // this line — succeeded, failed, timed out, cancelled. It has to be before
+    // `materializeArtifacts` (which writes into `artifacts/`, a sibling of the checkout,
+    // so it would not change the answer, but "as the agent left it" is a cleaner instant).
+    //
+    // `captureFinalEvidence` cannot throw: an evidence failure must not replace a real
+    // run's result with an infrastructure error. A `null` result means no manifest, and
+    // an absent manifest is visible as absent; an empty one would be a claim.
+    if (lease !== undefined) {
+      finalEvidence = await captureFinalEvidence({
+        handle: lease.handle,
+        initial: initialEvidence,
+      });
+
+      if (finalEvidence === null) {
+        workerLogger().warn(
+          { taskId: input.taskId, workspaceId: lease.id },
+          'No change manifest for this attempt',
+        );
+      } else {
+        await recordFinalSnapshot({
+          orgId: input.orgId,
+          workspaceId: lease.id,
+          digest: finalEvidence.finalManifestDigest,
+        });
+
+        workerLogger().info(
+          {
+            taskId: input.taskId,
+            workspaceId: lease.id,
+            changeCount: finalEvidence.changeCount,
+            counts: finalEvidence.counts,
+            authoritative: finalEvidence.authoritative,
+            ...(finalEvidence.stopReason === null ? {} : { stopReason: finalEvidence.stopReason }),
+          },
+          'Host change manifest captured',
+        );
+      }
+    }
+
     const parsed = ExecutionResult.safeParse(raw);
 
     if (!parsed.success) {
@@ -892,17 +990,40 @@ export async function executeAgentActivity(
           ? 'cancelled'
           : 'failed';
 
-    return verdict.overridesAdapter
-      ? {
-          ...result,
-          status: finalStatus,
-          summary: resourceKillSummary(verdict.reason),
-          ...(finalError === undefined ? {} : { error: finalError }),
-        }
-      : result;
+    return attachEvidence(
+      verdict.overridesAdapter
+        ? {
+            ...result,
+            status: finalStatus,
+            summary: resourceKillSummary(verdict.reason),
+            ...(finalError === undefined ? {} : { error: finalError }),
+          }
+        : result,
+    );
   } catch (error) {
     attemptError = error;
     const normalised = toExecutionError(error);
+
+    // ── The final snapshot on the thrown path ─────────────────────────────────
+    //
+    // A throw is a failure outcome, not an exemption from evidence. This runs before the
+    // resource verdict and before `finalize`, so the tree is measured as the crash left
+    // it. `finalEvidence` is left alone when the success path already captured it: two
+    // snapshots of one instant would only make "which one is the manifest" a question.
+    if (lease !== undefined && finalEvidence === null) {
+      finalEvidence = await captureFinalEvidence({
+        handle: lease.handle,
+        initial: initialEvidence,
+      });
+
+      if (finalEvidence !== null) {
+        await recordFinalSnapshot({
+          orgId: input.orgId,
+          workspaceId: lease.id,
+          digest: finalEvidence.finalManifestDigest,
+        });
+      }
+    }
 
     // A throw can also be a resource kill: the adapter reports a non-zero exit as a
     // thrown error in some paths, and the cgroup files are the tie-breaker. Read them
@@ -971,17 +1092,19 @@ export async function executeAgentActivity(
     // own failure, and it cannot see the resource decision; rethrowing here would hand
     // the run straight back to Temporal for another budget.
     if (verdict.reason === 'cpu_budget') {
-      return bannerResult(runtime.id, {
-        status: 'failed',
-        summary: resourceKillSummary('cpu_budget'),
-        error: resourceKillError(verdict.reason, usage, effectiveLimits, {
-          profile,
-          budgetSample,
-          diskFreeBytes,
+      return attachEvidence(
+        bannerResult(runtime.id, {
+          status: 'failed',
+          summary: resourceKillSummary('cpu_budget'),
+          error: resourceKillError(verdict.reason, usage, effectiveLimits, {
+            profile,
+            budgetSample,
+            diskFreeBytes,
+          }),
+          simulated: simulatedAdapter,
+          isolation,
         }),
-        simulated: simulatedAdapter,
-        isolation,
-      });
+      );
     }
 
     if (normalised.retryable) {
@@ -991,13 +1114,15 @@ export async function executeAgentActivity(
 
     // Deterministic rejection: the task failed, and that is data to persist, not an
     // exception to retry.
-    return bannerResult(runtime.id, {
-      status: 'failed',
-      summary: `Execution failed before it could start: ${normalised.message}`,
-      error: normalised,
-      simulated: simulatedAdapter,
-      isolation,
-    });
+    return attachEvidence(
+      bannerResult(runtime.id, {
+        status: 'failed',
+        summary: `Execution failed before it could start: ${normalised.message}`,
+        error: normalised,
+        simulated: simulatedAdapter,
+        isolation,
+      }),
+    );
   } finally {
     activityCancellation.removeEventListener('abort', abort);
     stopHeartbeat?.();

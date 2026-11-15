@@ -1,6 +1,8 @@
 import type { ExecutionResult } from '@intelligenz/agent-runtime';
 import type { EventEnvelope, RiskClass, TaskStatus } from '@intelligenz/contracts';
 
+import type { EvidenceSummary } from './evidence';
+
 /**
  * The workflow ↔ activity wire types (contract §16).
  *
@@ -147,15 +149,34 @@ export interface ExecuteAgentActivityInput {
   readonly attemptId?: string;
 }
 
-/** The normalised result, exactly as the port defines it. */
-export type ExecuteAgentActivityResult = ExecutionResult;
+/**
+ * The normalised result, exactly as the port defines it, plus the host's own evidence.
+ *
+ * `evidence` is **not** part of `ExecutionResult` and cannot be: that schema is `.strict()`
+ * and is parsed from whatever the adapter returned, so a field on it would be adapter
+ * input. This type is the worker's return envelope, and `evidence` is written by
+ * `executeAgentActivity` after the adapter has finished — from the lease, the attempt row
+ * and the host walk, none of which the adapter can reach.
+ */
+export type ExecuteAgentActivityResult = ExecutionResult & {
+  readonly evidence?: EvidenceSummary;
+};
 
 // ─── persistResultActivity ───────────────────────────────────────────────────
 
 export interface PersistResultActivityInput {
   readonly taskId: string;
   readonly orgId: string;
-  readonly result: ExecutionResult;
+  /**
+   * The result to persist, including the host evidence when one was captured.
+   *
+   * Typed with the envelope rather than `ExecutionResult` so persistence can read
+   * `evidence` without a cast. It is still untrusted input in the ordinary sense — the
+   * activity is dispatched by name — which is why `persistResultActivity` requires the
+   * execution claim before its first write, and why the evidence path additionally checks
+   * the manifest digest it is given against the bytes it can see.
+   */
+  readonly result: ExecuteAgentActivityResult;
   /**
    * Phase 6 re-review N4. The attempt this execution holds. `persistResultActivity` is
    * only ever reached **after** a run, so a claim necessarily exists and the activity
