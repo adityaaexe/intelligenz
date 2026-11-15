@@ -6,8 +6,8 @@ the fastest route to a merged change is a focused one.
 ## Getting started
 
 ```bash
-git clone https://github.com/adityaaexe/intelligenz.git
-cd intelligenz
+git clone https://github.com/adityaaexe/run-journal.git
+cd run-journal
 npm ci
 npm test
 ```
@@ -48,7 +48,7 @@ than forgotten).
 
 ## Reporting bugs
 
-Open an issue with the version (`intelligenz --version`), the smallest journal
+Open an issue with the version (`run-journal --version`), the smallest journal
 that reproduces it, and the command you ran. A redacted three-line journal is
 worth more than a paragraph of description.
 

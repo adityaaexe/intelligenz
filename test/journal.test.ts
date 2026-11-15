@@ -8,7 +8,7 @@ import { canonical, GENESIS_HASH } from '../src/hash.js';
 import { Journal, parseJournal, verifyJournal } from '../src/journal.js';
 
 function tempPath(name = 'run.jsonl'): string {
-  return join(mkdtempSync(join(tmpdir(), 'intelligenz-')), name);
+  return join(mkdtempSync(join(tmpdir(), 'run-journal-')), name);
 }
 
 function buildJournal(count = 3): Journal {

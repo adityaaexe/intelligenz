@@ -3,12 +3,24 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] — 2026-11-15
+
+### Changed
+
+- **Package renamed from `intelligenz` to `run-journal` before first publish.**
+  The name `intelligenz` is already occupied on npm by an unrelated package in a
+  similar domain, which would have made the two indistinguishable. Nothing had
+  been published under the old name, so no consumer is affected.
+- CLI binary is now `run-journal`.
+- `package.json` gained `repository`, `bugs`, `homepage`, `author`, and
+  `sideEffects: false` for correct npm-page linking and tree-shaking.
+
 ## [0.2.0] — 2026-11-15
 
 ### Added
 
 - **Anchors.** `createAnchor`, `readAnchor`, `verifyAnchor`, and the
-  `intelligenz anchor` CLI command produce a small document committing to a
+  `run-journal anchor` CLI command produce a small document committing to a
   journal's head (`{ version, entries, head, at }`).
 - `verify --anchor <file>` checks a journal against an anchor. It accepts entries
   appended after anchoring and rejects a rewritten or truncated prefix.

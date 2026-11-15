@@ -9,7 +9,7 @@ import { replay } from '../src/replay.js';
 import type { JournalEntry } from '../src/events.js';
 
 function seeded(): Journal {
-  const path = join(mkdtempSync(join(tmpdir(), 'intelligenz-replay-')), 'run.jsonl');
+  const path = join(mkdtempSync(join(tmpdir(), 'run-journal-replay-')), 'run.jsonl');
   const journal = Journal.create(path);
   journal.append('run.start', { goal: 'demo' }, '2026-01-01T00:00:00.000Z');
   journal.append('agent.spawn', { agent: 'researcher' }, '2026-01-01T00:00:01.000Z');

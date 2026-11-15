@@ -1,4 +1,4 @@
-# intelligenz
+# run-journal
 
 Deterministic, tamper-evident run journals for multi-agent systems.
 
@@ -18,7 +18,7 @@ log file: unstructured, mutable, and impossible to trust when it matters — dur
 an incident, a review, or a regression hunt. If the record can be edited
 silently, it cannot settle a disagreement.
 
-`intelligenz` writes an append-only journal where every entry commits to the one
+`run-journal` writes an append-only journal where every entry commits to the one
 before it. Editing any field invalidates that entry; deleting or reordering an
 entry breaks the chain; replay refuses to trust a journal that fails
 verification. A published **anchor** extends that guarantee to the whole file,
@@ -27,7 +27,7 @@ so a fully re-chained forgery is still caught.
 ## Install
 
 ```bash
-npm install intelligenz
+npm install run-journal
 ```
 
 Requires Node 22 or newer.
@@ -35,7 +35,7 @@ Requires Node 22 or newer.
 ## Quick start
 
 ```js
-import { Journal, replay, verifyJournal } from 'intelligenz';
+import { Journal, replay, verifyJournal } from 'run-journal';
 
 const journal = Journal.create('run.jsonl');
 
@@ -70,7 +70,7 @@ anchor is what closes that gap. Publish it somewhere the attacker does not
 control — a Git commit, a release asset, a transparency log.
 
 ```js
-import { createAnchor, verifyAnchor } from 'intelligenz';
+import { createAnchor, verifyAnchor } from 'run-journal';
 
 const anchor = createAnchor('run.jsonl');
 // { version: 1, entries: 5, head: '71f4…', at: '2026-11-15T17:27:00.503Z' }
@@ -87,22 +87,29 @@ This is the difference in practice. Given a journal whose entry 1 was edited and
 whose remaining four hashes were recomputed to match:
 
 ```
-$ intelligenz verify run.jsonl
+$ run-journal verify run.jsonl
 OK 5 entries, chain intact
 
-$ intelligenz verify run.jsonl --anchor anchor.json
+$ run-journal verify run.jsonl --anchor anchor.json
 ANCHOR MISMATCH: anchored prefix was rewritten: entry 3 hashes to 07f9…
 ```
 
 ## CLI
 
 ```bash
-intelligenz verify <journal> [--anchor <file>]   # exit 1 if broken or mismatched
-intelligenz anchor <journal> [--out <file>]      # emit a publishable head anchor
-intelligenz head <journal> [n]                   # first n entries (default 10)
-intelligenz tail <journal> [n]                   # last n entries (default 10)
-intelligenz replay <journal>                     # re-drive and print a summary
+run-journal verify <journal> [--anchor <file>]
+run-journal anchor <journal> [--out <file>]
+run-journal head   <journal> [n]
+run-journal tail   <journal> [n]
+run-journal replay <journal>
 ```
+
+| Command | Does |
+|---|---|
+| `verify` | Recompute the chain; with `--anchor`, also check the anchored prefix. Exits `1` on failure. |
+| `anchor` | Emit a publishable head anchor. `--out` writes it to a file instead of stdout. |
+| `head` / `tail` | Print the first / last `n` entries (default 10). |
+| `replay` | Re-drive the journal in order and print a summary. |
 
 Exit codes: `0` success, `1` verification failure, `2` usage error. `verify` is
 meant for CI — a non-zero exit is a usable gate, and there is no flag to disable

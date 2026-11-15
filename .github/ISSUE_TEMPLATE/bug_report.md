@@ -21,7 +21,7 @@ Smallest journal that reproduces it (three lines is plenty):
 
 ## Environment
 
-- `intelligenz --version`:
+- `run-journal --version`:
 - Node version (`node -v`):
 - OS:
 

@@ -31,10 +31,10 @@ Verified behaviour, from the test suite and the CLI:
 
 ```
 # attacker edits entry 1 and recomputes 4 hashes
-$ intelligenz verify run.jsonl
+$ run-journal verify run.jsonl
 OK 5 entries, chain intact          ← the chain cannot know
 
-$ intelligenz verify run.jsonl --anchor anchor.json
+$ run-journal verify run.jsonl --anchor anchor.json
 ANCHOR MISMATCH: anchored prefix was rewritten: entry 3 hashes to 07f9…  ← caught
 ```
 

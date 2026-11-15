@@ -6,21 +6,21 @@ import { parseJournal, verifyJournal } from './journal.js';
 import { replay } from './replay.js';
 import { VERSION } from './version.js';
 
-const USAGE = `intelligenz ${VERSION}
+const USAGE = `run-journal ${VERSION}
 
 Deterministic, tamper-evident run journals for multi-agent systems.
 
 Usage:
-  intelligenz verify <journal> [--anchor <file>]
+  run-journal verify <journal> [--anchor <file>]
                                      Recompute the chain; exit 1 if broken
                                      or if it disagrees with the anchor
-  intelligenz anchor <journal> [--out <file>]
+  run-journal anchor <journal> [--out <file>]
                                      Print (or write) a publishable head anchor
-  intelligenz head <journal> [n]     Print the first n entries (default 10)
-  intelligenz tail <journal> [n]     Print the last n entries (default 10)
-  intelligenz replay <journal>       Re-drive a journal and print a summary
-  intelligenz --version
-  intelligenz --help
+  run-journal head <journal> [n]     Print the first n entries (default 10)
+  run-journal tail <journal> [n]     Print the last n entries (default 10)
+  run-journal replay <journal>       Re-drive a journal and print a summary
+  run-journal --version
+  run-journal --help
 
 Exit codes:
   0  success

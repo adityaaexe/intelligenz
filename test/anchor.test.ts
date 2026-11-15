@@ -8,7 +8,7 @@ import { createAnchor, readAnchor, verifyAnchor } from '../src/anchor.js';
 import { Journal } from '../src/journal.js';
 
 function tempDir(): string {
-  return mkdtempSync(join(tmpdir(), 'intelligenz-anchor-'));
+  return mkdtempSync(join(tmpdir(), 'run-journal-anchor-'));
 }
 
 function seeded(count = 3): Journal {

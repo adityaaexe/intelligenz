@@ -8,7 +8,7 @@ Use GitHub's private vulnerability reporting on this repository:
 **Security → Report a vulnerability**. That opens a private advisory visible only
 to the maintainer.
 
-Include the version (`intelligenz --version`), a minimal reproducing journal or
+Include the version (`run-journal --version`), a minimal reproducing journal or
 script, and what an attacker gains. A proof of concept is welcome.
 
 ## Scope

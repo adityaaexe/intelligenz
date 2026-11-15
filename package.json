@@ -1,14 +1,15 @@
 {
-  "name": "intelligenz",
-  "version": "0.2.0",
+  "name": "run-journal",
+  "version": "0.2.1",
   "description": "Deterministic, tamper-evident run journals for multi-agent systems.",
   "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=22"
   },
+  "sideEffects": false,
   "bin": {
-    "intelligenz": "./dist/src/cli.js"
+    "run-journal": "./dist/src/cli.js"
   },
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
@@ -16,7 +17,8 @@
     ".": {
       "types": "./dist/src/index.d.ts",
       "default": "./dist/src/index.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist/src",
@@ -25,6 +27,29 @@
     "CHANGELOG.md",
     "LICENSE"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adityaaexe/run-journal.git"
+  },
+  "bugs": {
+    "url": "https://github.com/adityaaexe/run-journal/issues"
+  },
+  "homepage": "https://github.com/adityaaexe/run-journal#readme",
+  "author": "adityaaexe",
+  "keywords": [
+    "agents",
+    "llm",
+    "observability",
+    "replay",
+    "audit",
+    "audit-log",
+    "provenance",
+    "hash-chain",
+    "integrity",
+    "ndjson",
+    "jsonl",
+    "typescript"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "pretest": "npm run build",
@@ -32,15 +57,6 @@
     "example": "npm run build && node examples/record-and-verify.mjs",
     "prepublishOnly": "npm test"
   },
-  "keywords": [
-    "agents",
-    "llm",
-    "observability",
-    "replay",
-    "audit",
-    "provenance",
-    "hash-chain"
-  ],
   "devDependencies": {
     "@types/node": "^22.20.5",
     "typescript": "^5.9.0"
