@@ -48,9 +48,12 @@ import { workerLogger } from './log';
  * Both ids are therefore **recorded at claim time** (`activities/claim.ts`) and read back
  * here. A claim that records no workflow id — every row written before the column existed,
  * and any claim written without workflow context — cannot be asked about exactly, so it is
- * **skipped**, not released (`skipped_unknown`). A stranded claim costs availability; a
- * released live claim costs work. The classifier is untouched: it was right, its input was
- * wrong.
+ * never released. Such rows are also **excluded from candidacy** (N12): they are
+ * unreleasable, and letting them fill the oldest slots starved the pass of every genuine
+ * candidate behind them. The loop still skips one if it is ever read (a read-time race),
+ * so the predicate is an optimisation and the skip remains the control. A stranded claim
+ * costs availability; a released live claim costs work. The classifier is untouched: it
+ * was right, its input was wrong.
  *
  * ## What a release does to the row, and why it is not just "clear the column"
  *
@@ -137,6 +140,17 @@ export async function runClaimReleasePass(deps: ClaimReleaseDeps): Promise<Claim
       // Only the stranded shape: reserved, never adopted, still holding a claim.
       status: 'queued',
       claimedByWorkflowRunId: { not: null },
+      // A claim with no recorded workflow id can never be released (it cannot be probed
+      // exactly — see the loop below), so it must not occupy a batch slot either. With
+      // `batchSize` such rows present and ordered first by age, the batch filled entirely
+      // with unreleasable legs and no genuine candidate was ever scanned: the pass returned
+      // `skipped_unknown` for ever while a releasable claim waited behind it (N12).
+      //
+      // This is a candidate filter, not a decision: the `workflowId === null` skip below
+      // stays, because a row read under this predicate can still lose the column to a
+      // concurrent write between the SELECT and the loop. The predicate is an optimisation;
+      // the skip is the control.
+      claimedByWorkflowId: { not: null },
       // A candidate filter, not a decision. A claim younger than two reaper intervals is
       // not even looked at, because the workflow that holds it may not have reached
       // `startAttempt` yet and `describe` on a brand-new execution is not evidence either
@@ -171,6 +185,10 @@ export async function runClaimReleasePass(deps: ClaimReleaseDeps): Promise<Claim
     // (`task-<taskId>`) is what released a live claim in N7 — the derived id and the run
     // id would then name different executions, and the server's NOT_FOUND would be read as
     // "gone". Doubt is not evidence, so this is a skip: fail closed, on purpose.
+    //
+    // The candidate query excludes these rows (N12), so a pass cannot starve on them. This
+    // arm remains for the one case the predicate cannot cover: the column cleared between
+    // that SELECT and this loop.
     if (workflowId === null) {
       actions.push({
         attemptId: candidate.id,

@@ -852,6 +852,55 @@ describe.skipIf(!temporalEnabled)('the legitimate path and its retry', () => {
 });
 
 /**
+ * N13 — the writer half of N7, driven by the shipped validation path.
+ *
+ * Every N7 assertion above follows a claim a test wrote by hand (`holdClaim`), so deleting
+ * the line in `claimForExecution` that records `claimedByWorkflowId` left the suite green
+ * (51/51): the failure it would hide is a claim with a NULL workflow id, which is
+ * unreleasable by design — and, before N12, able to starve the release pass. The claim here
+ * is created by `validateTaskActivity` inside a real workflow, and the assertion is that
+ * both ids are the ones the Temporal server put in the activity context.
+ *
+ * The workflow id is deliberately **not** `task-<taskId>`: a value read back here cannot
+ * have been derived from the task, so the test is about the context, not a convention.
+ */
+describe.skipIf(!temporalEnabled)('N13 — validation records the execution that claimed', () => {
+  it('writes both ids from the activity context when validation grants the claim', async () => {
+    if (harness === undefined) throw new Error('suite not initialised');
+
+    const fixture = await tenant('n13-writer');
+    const reservation = await reservedTask(fixture, 'n13-writer');
+    const workflowId = `probe-${randomUUID()}`;
+    const session = await harness.session({ workflowId });
+
+    try {
+      const validated = await session.call<Record<string, unknown>>({
+        op: 'validate',
+        input: {
+          taskId: reservation.taskId,
+          orgId: fixture.orgId,
+          attemptId: reservation.attemptId,
+          correlationId: randomUUID(),
+        },
+      });
+
+      expect(validated).toMatchObject({ runnable: true });
+    } finally {
+      await session.stop();
+    }
+
+    const row = await attemptRow(reservation.attemptId);
+
+    // Both from context: the run id the server minted for this execution, and the workflow
+    // id it was started under. Remove the writer at `validate-task.ts:259` and the first
+    // of these is `null` while this test fails.
+    expect(row.claimedByWorkflowId).toBe(workflowId);
+    expect(row.claimedByWorkflowRunId).toBe(session.runId);
+    expect(row.claimedAt).not.toBeNull();
+  }, 60_000);
+});
+
+/**
  * N4 — a terminal write is authority-checked, from the re-review's addendum.
  *
  * `persistResultActivity` and `completeTaskActivity` are registered activities, so they are
@@ -1202,6 +1251,105 @@ describe.skipIf(!enabled)(
       expect(row.claimedByWorkflowRunId).toBe(execution);
     }, 30_000);
 
+    /**
+     * N12 — an unreleasable claim must not consume a batch slot.
+     *
+     * The pass takes the **oldest** `batchSize` candidates. A claim with no recorded
+     * workflow id can never be released (N7: there is no exact pair to ask about), so with
+     * `batchSize` of them present and older than everything else they filled every slot and
+     * a genuine candidate was never scanned — silently, because the only visible outcome
+     * was `skipped_unknown`. The reviewer's reproduction: ten legacy claims with
+     * `batchSize` 5; five is already enough to fill the batch, so the real candidate is
+     * never reached. The candidate query now excludes them.
+     */
+    it('does not let claims with no workflow id starve a releasable claim out of the batch', async () => {
+      const fixture = await tenant('f4-starvation');
+      const batchSize = 5;
+
+      // Older than every row this suite — or a concurrent one — writes. Without the
+      // predicate these five are the first five candidates and the releasable row below is
+      // never read at all.
+      const legacy: Reservation[] = [];
+
+      for (let index = 0; index < batchSize; index += 1) {
+        const reservation = await reservedTask(fixture, `starve-legacy-${index}`);
+
+        await client.executionAttempt.update({
+          where: { id: reservation.attemptId },
+          data: {
+            claimedByWorkflowId: null,
+            claimedByWorkflowRunId: `execution-legacy-${randomUUID()}`,
+            claimedAt: new Date('2000-01-01T00:00:00.000Z'),
+          },
+        });
+
+        legacy.push(reservation);
+      }
+
+      // One day newer, so the ordering is unambiguous: with the legacy rows excluded this
+      // is the first releasable candidate in the table.
+      const genuineExecution = `execution-starvation-${randomUUID()}`;
+      const genuineWorkflowId = `task-starvation-${randomUUID()}`;
+      const genuine = await reservedTask(fixture, 'starve-genuine');
+
+      await client.executionAttempt.update({
+        where: { id: genuine.attemptId },
+        data: {
+          claimedByWorkflowId: genuineWorkflowId,
+          claimedByWorkflowRunId: genuineExecution,
+          claimedAt: new Date('2000-01-02T00:00:00.000Z'),
+        },
+      });
+
+      const result = await runClaimReleasePass({
+        prisma: client,
+        probe: {
+          execution: async (_workflowId, workflowRunId) =>
+            workflowRunId === genuineExecution ? 'absent' : 'unknown',
+        },
+        intervalMs: INTERVAL_MS,
+        batchSize,
+      });
+
+      const action = result.actions.find((entry) => entry.attemptId === genuine.attemptId);
+
+      expect(action).toMatchObject({
+        outcome: 'released',
+        workflowId: genuineWorkflowId,
+        workflowRunId: genuineExecution,
+      });
+
+      const released = await attemptRow(genuine.attemptId);
+
+      expect(released.status).toBe('failed');
+      expect(released.claimedByWorkflowId).toBeNull();
+      expect(released.claimedByWorkflowRunId).toBeNull();
+
+      // And no legacy row was selected, changed, or released. They remain stranded — the
+      // documented fail-closed cost — but they no longer cost every other claim its release.
+      for (const reservation of legacy) {
+        const row = await attemptRow(reservation.attemptId);
+
+        expect(row.status).toBe('queued');
+        expect(row.claimedByWorkflowId).toBeNull();
+        expect(row.claimedByWorkflowRunId).not.toBeNull();
+
+        expect(
+          result.actions.find((entry) => entry.attemptId === reservation.attemptId),
+        ).toBeUndefined();
+      }
+
+      expect(
+        await client.auditEvent.count({
+          where: {
+            orgId: fixture.orgId,
+            eventType: 'execution.claim_released.v1',
+            aggregateId: { in: legacy.map((reservation) => reservation.attemptId) },
+          },
+        }),
+      ).toBe(0);
+    }, 60_000);
+
     it('does not look at a claim that is younger than the grace window', async () => {
       const fixture = await tenant('f4-fresh');
       const execution = `execution-fresh-${randomUUID()}`;
@@ -1527,11 +1675,14 @@ describe.skipIf(!enabled)(
         });
       }, 60_000);
 
-      it('skips a claim that records no workflow id instead of guessing one', async () => {
+      it('never selects a claim that records no workflow id, and never guesses one for it', async () => {
         // The pre-migration shape: `claimedByWorkflowRunId` set, `claimedByWorkflowId` NULL.
         // Nothing may derive `task-<taskId>` for it — that guess is what N7 released a live
-        // claim with — and doubt is not evidence, so the row is skipped. It stays stranded,
-        // which is the documented cost of the fail-closed answer.
+        // claim with — and doubt is not evidence, so it is not a candidate at all (N12) and
+        // is never released. It stays stranded, which is the documented cost of the
+        // fail-closed answer. The loop's `workflowId === null` skip is retained for a row
+        // whose column is cleared between the SELECT and the loop; the predicate is the
+        // optimisation, the skip is the control.
         const fixture = await tenant('n7-legacy');
         const execution = randomUUID();
         const reservation = await reservedTask(fixture, 'n7-legacy-run');
@@ -1545,7 +1696,6 @@ describe.skipIf(!enabled)(
           },
         });
 
-        // The probe must not be consulted at all: there is no pair to ask about.
         const asked: string[] = [];
         const result = await runClaimReleasePass({
           prisma: client,
@@ -1559,17 +1709,32 @@ describe.skipIf(!enabled)(
           batchSize: 200,
         });
 
+        // Not scanned, so not even reported as `skipped_unknown`: an unreleasable row must
+        // not consume attention or a batch slot.
         expect(
           result.actions.find((entry) => entry.attemptId === reservation.attemptId),
-        ).toMatchObject({ outcome: 'skipped_unknown', workflowId: null });
+        ).toBeUndefined();
 
-        expect(asked).not.toContain(`task-${reservation.taskId}/${execution}`);
+        // The probe was never asked about this claim: a NULL workflow id cannot form the
+        // pair `describeWorkflowExecution` is keyed by. (`asked` may hold other suites' rows
+        // — every pass scans the table.)
+        expect(asked.some((entry) => entry.endsWith(`/${execution}`))).toBe(false);
 
         const row = await attemptRow(reservation.attemptId);
 
         expect(row.status).toBe('queued');
         expect(row.claimedByWorkflowId).toBeNull();
         expect(row.claimedByWorkflowRunId).toBe(execution);
+
+        expect(
+          await client.auditEvent.count({
+            where: {
+              orgId: fixture.orgId,
+              aggregateId: reservation.attemptId,
+              eventType: 'execution.claim_released.v1',
+            },
+          }),
+        ).toBe(0);
       }, 60_000);
     });
   },

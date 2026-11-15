@@ -1344,3 +1344,435 @@ caveats: (a) the production-registry bound in §H is established by reading `mai
 by running that module, not by inspecting a deployed worker; (b) the cgroup kill and
 io-throughput suites could not run on this host, so Phase 5 enforcement is confirmed by absence
 of change rather than by re-observation.
+
+---
+
+# Addendum — SEC-604 re-review of `23db912`
+
+**Commit reviewed:** `23db912037ee17932f6cd4dc1a801ffe9b8b2337` ("fix: release a claim on
+evidence about that execution, not a naming convention").
+**Parent:** `a75f1217b49b1eb1fdae953076ecc8739f7ebf82`. **Tree:** clean at review time; no
+uncommitted changes.
+**Scope:** the two declared trade-offs, the three findings the previous addendum raised
+(N7, N8, N4-class), pre-fix sensitivity, Phase 5 regression.
+
+## Verdict
+
+**PASS** — for the commit, and for all three gates it was written to close.
+
+Every blocking finding from the previous three rounds is closed, and I could not reopen any
+of them with my own reproductions against real Temporal 1.32 and real PostgreSQL:
+
+- **N7** — fixed by recording the pair. A live execution under a non-canonical workflow id,
+  claiming through the *production* path, is `skipped_live`; the claim survives and still
+  authorises the run's terminal write.
+- **N8** — `succeeded` is refused before the first write; `failed`/`cancelled` still land,
+  including end to end through the shipped workflow.
+- **N4 (residual class)** — the event writer and the start record refuse standalone dispatch,
+  rogue workflow ids and borrowed attempts; the normal path, a retried start, the
+  pre-dispatch failure path and the reaper's own writes all still work.
+
+Two new **Medium** findings are recorded (N12, N13), both non-security: an availability
+regression in the release pass's candidate ordering, and a test-adequacy gap that leaves the
+*writer* half of the N7 fix uncovered. Neither makes a gate statement untrue, and each has a
+one-predicate or one-assertion fix. Details, and why I do not fail the commit for them, in
+"What I would refuse to ship".
+
+## 1. N7 — closed, and the fix is the right shape
+
+### 1.1 The fix is "record the identity, do not derive it"
+
+`ExecutionAttempt.claimedByWorkflowId` (`schema.prisma`, migration
+`20261115120000_phase6_claim_workflow_id`, one nullable `text` column, no back-fill, applied
+cleanly — `_prisma_migrations.finished_at` set, `logs` empty). It is written in the **same**
+conditional `updateMany` as the run id (`claim.ts:318-321`), from
+`executionWorkflowId()` (`claim.ts:194-202`, `Context.current().info.workflowExecution`), and
+in the same write path as `startAttempt`'s adoption (`attempts.ts`, called with
+`executionWorkflowId()` from both `execute-agent.ts` call sites). The probe asks about the
+recorded pair (`reaper.ts:158-176`) and nothing else.
+
+### 1.2 The reproduction I ran — the real shape, not the test's fixture
+
+The shipped test writes the claim with a raw `update`. Mine writes it **through
+`validateTaskActivity`, inside a live workflow started under `probe-<uuid>`** — the exact
+shape N7 was reported in, with the claim produced by production code:
+
+```
+workflowId:            probe-d6c5fcf8-a5ec-449f-b502-9b06b6c923af
+runId:                 01a1de9f-954b-7a20-a9bf-c5e7fe5b90e9
+liveStatus:            RUNNING
+claimAfterValidate:    { status: queued, claimedByWorkflowId: probe-d6c5fcf8…,
+                         claimedByWorkflowRunId: 01a1de9f… }      ← recorded from context
+action:                { outcome: 'skipped_live', workflowId: probe-d6c5fcf8…,
+                         workflowRunId: 01a1de9f… }
+row:                   { status: queued, both claim columns intact, claimedAt intact }
+releaseAudits:         0
+```
+
+Then the assertion that matters more than the row state — the claim still *authorises* the
+live run:
+
+```
+A2: same execution, completeTaskActivity → { changed: true, status: 'failed',
+                                             authority: 'execution-claim' }
+    task: failed
+```
+
+Before this commit the same shape produced `released` while `RUNNING` (SEC-603 §G). N7 is
+closed.
+
+### 1.3 Attacking the new input
+
+| Attack | Result | Evidence |
+|---|---|---|
+| Choose a workflow id that does not resolve | The **recorded** id is used, not the caller's choice; a claim that records no id is skipped before the probe is called | §C |
+| Re-claimed row + stale release attempt | `lost_race`; the row keeps the new pair, zero release audits | §B1: `releasePredicate` requires `status: 'queued'` **and** `claimedByWorkflowId` **and** `claimedByWorkflowRunId` (`claim-release.ts:291-301`) |
+| Adopted between the read and the write | `lost_race`; the row stays `running` | §B2 |
+| `claimedByWorkflowId IS NULL` | `skipped_unknown`; **the probe is never called**, not even with `task-<taskId>` | §C: `askedTotal: 0`, `askedWithDerivedId: []` |
+| Forge the recorded id through activity input | Ignored. Nine candidate identity fields set to the canonical id; the row recorded the real `probe-2db7…` | §F1 |
+| Workflow-id reuse / restart / rename | `describe(id, run)` is keyed by the pair; a reused id mints a new run, and the recorded run stays the one that claimed. Old run terminal → release is correct; new run live → `skipped_live` | §A/§B + `reaper.ts:160-168` |
+| Make someone else's claim releasable | Not possible from an activity: `claim-release.ts` is imported by the reaper and tests only, never from `src/activities/` | structural test `:1893`, and `grep` confirms |
+
+`classifyProbeError` is unchanged — verified, not taken on trust. The implementer's hash is
+reproducible: the region from `classifyProbeError`'s doc comment through `isWorkflowNotFound`
+(stopping before `createTemporalProbe`) hashes to
+`f1ff802830f2383ebd1e04c3e2b3df145ac4beb7315d82103f322bc659845b53` at **both** commits, byte
+for byte. Its helpers (`isWorkflowNotFound`, `errorChain`, `grpcStatus`) hash identically
+too, and the file's only changed hunks are the interface comment and `execution()`.
+
+## 2. N8 — closed; the refusal is still recorded end to end
+
+- `succeeded`, canonical id, no claim: **refused** (`EXECUTION_CLAIM_REFUSED`, details
+  `status: "succeeded"`); task still `queued`, run still `queued`, zero `AgentRun`s.
+- `cancelled`, same shape: **admitted** — `{ changed: true, status: 'cancelled',
+  authority: 'pre-dispatch' }`.
+- End to end through the **shipped** `runTaskWorkflow`: a HIGH task with no approval, a real
+  reservation, started under `task-<taskId>` →
+  `result: { status: 'failed', summary: 'APPROVAL_REQUIRED: …' }`, task `failed`, **one**
+  `task.failed.v1` with `code: APPROVAL_REQUIRED`. The refusal path that the whole
+  `failBeforeExecution` design exists for still records itself.
+- `task.status_changed.v1` from the same canonical, claim-less execution: **refused**. The
+  arm admits refusals, not successes — including the audit event.
+
+## 3. N4-class — closed for `Task` writes, and the legitimate paths still work
+
+| Shape | Result |
+|---|---|
+| standalone `emitEventActivity` (`task.succeeded.v1`) | `EXECUTION_IDENTITY_UNAVAILABLE`, 0 rows |
+| standalone `recordStartActivity` | `EXECUTION_IDENTITY_UNAVAILABLE`, task stays `queued` |
+| rogue workflow id → `task.succeeded.v1` | `EXECUTION_CLAIM_REFUSED`, 0 rows |
+| rogue workflow id → `task.failed.v1` (the refusal event) | `EXECUTION_CLAIM_REFUSED`, 0 rows |
+| canonical id, no claim → `task.status_changed.v1` | `EXECUTION_CLAIM_REFUSED` |
+| canonical id, no claim → `task.failed.v1` | **written** (1 row) — the refusal path |
+| claimed execution: validate → start → `task.status_changed.v1` | **all three succeed**; task `running` |
+| claimed execution: `recordStartActivity` delivered **twice** (retry) | first `{started: true}`, second `{started: false}`, both admitted, no second run row, claim intact |
+| borrowed attempt id (another execution's claim) → complete / emit / start | all three `EXECUTION_ALREADY_CLAIMED`, 0 writes |
+| reaper's own writes | `claim-release.ts` writes `ExecutionAttempt` + `AuditEvent` through Prisma directly, no activity; a real release produced its audit row (§G) |
+
+One scoping fact the "closed" label must carry: the gate runs only for `Task` aggregates
+(`emit-event.ts:69-79`). A rogue workflow can still write `workflow.*`, `agent.*`,
+`approval.*`, `project.*` and `run.*` audit rows by name — §E6 wrote a `workflow.failed.v1`
+for an arbitrary aggregate id. Nothing under review depends on those events, so this is not
+a gate failure; it is a narrower closure than the phrase "N4 is closed" implies. **N15.**
+
+## 4. The two declared trade-offs
+
+### 4.1 A duplicate can no longer write `task.failed.v1` — correct consequence
+
+A duplicate execution holds no claim and does not own the task. Its `task.failed.v1` said "the
+task failed" about a task that is `queued` and owned by another live execution — a false
+statement about somebody else's aggregate. Refusing it is the same ownership rule the
+terminal write already enforced, applied one layer over. §F3, against a real claimed attempt:
+
+```
+duplicate: validate → EXECUTION_ALREADY_CLAIMED
+taskStatus: queued
+taskAggregateFailedEvents: 0
+claimDuplicateEvents: 1        (on the attempt, naming the holder)
+```
+
+Nothing user-visible or evidentially load-bearing depended on the old event: no consumer
+reads `task.failed.v1` outside the worker (`grep` over `apps/` and `packages/`), the task's
+own execution still writes it when *it* fails (the end-to-end refusal in §D3), and the task
+audit trail is now *more* accurate, not less.
+
+Two caveats, both recorded as findings rather than objections:
+
+- the surviving record (`execution.claim_duplicate.v1`) is written **best-effort**
+  (`claim.ts:954-976`) and a duplicate has no `WorkflowRun` row, so if that audit write fails
+  the only record is Temporal history. Before, the workflow's event was the reliable one.
+  Informational.
+- two comments still assert the old behaviour as the guarantee (`claim.ts:95-97`,
+  `:946-952`, `:966` — "the workflow's `task.failed.v1` … is the durable record"). Since
+  AG-604 that is false for exactly the duplicate case. **N14.**
+
+### 4.2 The direct-start fixture moved to the canonical id — preserved, not weakened
+
+The test's subject is "a direct Temporal start with **no attempt id** is refused" and it
+still proves that: `result.status === 'failed'`, `assertNothingRan` (attempt still `queued`,
+zero `AgentRun`s, zero workspaces), exactly one `WorkflowRun`, and the refusal recorded with
+`code: APPROVAL_NOT_RESERVED`. Those assertions are untouched. The fixture changed because
+the *event* is now authority-checked, and it is the only record that shape can produce.
+
+What the test no longer exercises — "a run that is not this task's execution may not write
+the task's refusal" — is asserted directly, with the opposite expectation, in
+`execution-boundary.test.ts:1740` (refusal event from `task-<id>-direct`: refused, 0 rows)
+and `:935` (pre-dispatch completion from a random `probe-…` id: refused, task stays
+`queued`). The coverage moved to where it is the subject; it was not dropped. I also
+re-checked that the old fixture could not have caught the regression it looks like it might:
+its assertions never depended on the terminal write landing.
+
+The cost is real and worth recording: a run started under a non-canonical id now leaves **no
+Postgres trace at all** — its terminal write, its terminal event and its refusal event are all
+refused, and it has no attempt. Its only record is Temporal history. Correct ownership rule,
+thinner evidence. Informational.
+
+## 5. Pre-fix sensitivity — the claim holds, three for three
+
+Scratch at `/tmp/scratch/r4`: `a75f121` extracted over a tree whose `node_modules` resolves to
+this workspace (so the *current* generated Prisma client is used — the class `claimedByWorkflowId`
+exists, which is the comparison most favourable to the implementer: no failure can be blamed
+on a missing column), plus the new test file and probe fixture from `23db912`.
+
+| Test | On `a75f121` |
+|---|---|
+| "does not release a claim held by a live execution whose workflow id is not `task-<taskId>`" | **FAIL** — `outcome: 'released'` where `skipped_live` is required |
+| "refuses `succeeded` for a task with no attempts and no AgentRun" | **FAIL** — promise resolved `{ changed: true, status: 'succeeded', authority: 'pre-dispatch' }` |
+| "refuses a `task.succeeded.v1` written by a standalone activity" | **FAIL** — promise resolved `{ created: true, eventId: … }` |
+
+The implementer's claim about the N7 test is independently reproduced, and its two other
+mutation rows I spot-checked behave the same way. No weakened assertion, no seam supplying an
+identity, no `.only`.
+
+## 6. Phase 5 regression — none
+
+The diff touches no isolation, volume, cgroup, budget, output-cap or resource source file
+(`git diff --name-only` — 22 files, all worker/claim/docs/migration).
+
+| Suite | Result |
+|---|---|
+| `packages/workspace-manager` + `isolation-gate` + `cpu-budget` + `isolation` + `volumes` + `io-limits` | **129 passed, 4 skipped** |
+| volumes: leases, ownership, containment, reclaim, ENOSPC | pass (in the above) |
+| CPU budget arithmetic + sampler | pass; cgroup *kill* tests skip (host refuses delegation) |
+| VM fail-closed | pass |
+| cgroup probe | pass |
+| `apps/worker` | **252 passed, 12 skipped** |
+| monorepo `pnpm -w test` | **822 passed, 15 skipped, 72 files** |
+| `apps/api` e2e | **97 passed** |
+| typecheck (10 projects) / eslint (worker) | clean / clean |
+
+The 4/12 skips are the same host-kernel refusals as the previous two reviews.
+
+## New findings
+
+### N12 — Medium (availability, upgrade window) — permanently-skipped rows are never aged out, so enough legacy claims stall the whole release pass
+
+**Where:** `claim-release.ts:135-156` (candidates: `status: 'queued'`, claimed, `claimedAt <
+cutoff`, `orderBy: { claimedAt: 'asc' }`, `take: batchSize`) and `:174-186` (a claim with no
+recorded workflow id is skipped and **left in place**).
+
+A NULL-id claim can never be released, but it still consumes a slot, and it is the *oldest*, so
+it sits at the front of the queue on every pass for ever. With at least `batchSize` such rows,
+no other task's claim is ever scanned again — and every pass looks healthy, because the
+actions are all `skipped_unknown`.
+
+Reproduction (real `runClaimReleasePass`, real Prisma):
+
+```
+10 legacy claims (claimedByWorkflowId NULL), ages 10h → 9h51m
+ 1 genuine candidate (recorded pair, holder gone), age 1h
+batchSize 5
+
+scanned: 5
+outcomes: { skipped_unknown: 5 }
+genuineCandidateWasScanned: false
+genuineRow: { status: queued, claim intact }      ← never released
+probeCalled: 0
+```
+
+The permanently-skipped *class* is new in this commit (before it, every candidate was probed;
+a malformed run id was the only pre-existing instance, and it is rare). The mechanism is
+pre-existing, so this is "the commit materially widens an existing weakness", not a new
+invention.
+
+**Fix:** exclude them from the candidate query — they can never be released, so selecting
+them is pure cost: `where: { …, claimedByWorkflowId: { not: null } }`. Report them with a
+separate count/query if operators need to see the legacy backlog. That removes the
+per-pass rework and the starvation in one predicate.
+
+### N13 — Medium (test adequacy) — the production claim writer is not covered, and the N7 test cannot see it break
+
+**Where:** `execution-boundary.test.ts:1046-1065` (`strandedAttempt`), `:1301-1315`
+(`holdClaim`) — every `claimedByWorkflowId` assertion in the suite follows a row the **test**
+wrote with `update`. No test asserts the column on a row produced by `validateTaskActivity`
+→ `claimExecution` → `validate-task.ts:259`.
+
+Mutation, on a clean `23db912` tree: delete `workflowId: executionWorkflowId(),` from
+`validate-task.ts` (the writer half of the fix), leave everything else intact:
+
+```
+execution-boundary.test.ts + execution-claim.test.ts → 51 passed (51)
+  including "does not release a claim held by a live execution whose workflow id is not task-<taskId>" ✓
+```
+
+Production would then record NULL for every new claim: every stranded claim unreleasable for
+ever, and N12's starvation triggered by the ordinary traffic of the fix itself. The suite
+would stay green.
+
+**Fix:** one assertion on the legitimate path — after `validateTaskActivity`, the adopted
+attempt's `claimedByWorkflowId` equals the session's workflow id. (`execution-harness`
+already exposes `runId`; the workflow id is the id the session was started under.) The
+probe I ran (§A) shows the behaviour is correct today; only the test is missing.
+
+### N14 — Low (documentation, contradicts the code) — the claim module still promises the duplicate's refusal is recorded by the workflow
+
+`claim.ts:95-97`, `:946-952`, `:966`: "the workflow's `task.failed.v1` carries the same code
+durably" / "… carries that code durably". Since AG-604 a duplicate execution's
+`task.failed.v1` is **refused** (§F3: 0 rows). The durable record is the best-effort
+`execution.claim_duplicate.v1`. This is the audit contract of the module that produces both
+events; the next reviewer will read the comment and believe it. Fix: say what is true — the
+refusal event is best-effort and the workflow result is not persisted.
+
+### N15 — Low (scoping) — N4 is closed for `Task`-aggregate writes only
+
+`emit-event.ts:69-79` gates on `aggregateType === 'Task'`. `workflow.*`, `agent.*`,
+`approval.*`, `project.*` and `run.*` events are still writable by name from any workflow
+(§E6: a rogue workflow wrote a `workflow.failed.v1` for an arbitrary aggregate id). Not
+load-bearing for any gate under review — but "N4 is closed" needs "for task writes" attached,
+and the register should say so.
+
+### N16 — Informational — `CONTINUED_AS_NEW` is `active` for ever
+
+`reaper.ts:170-172` maps `CONTINUED_AS_NEW` to `active`. For the first run of a chain that is
+correct; once the chain has ended it is still `active`, so a claim held by that run can never
+be released. Unreachable through the shipped registry (`runTaskWorkflow` does not
+continue-as-new) and fail-closed, so: recorded, not filed.
+
+### Informational — the duplicate's only durable record is best-effort
+
+`claim.ts:954-976` swallows the audit failure by design, and a duplicate has no `WorkflowRun`
+row to carry an error. If that write fails, Postgres has no record of the refusal. The
+trade-off is defensible (a refusal must not become a retryable DB error) but the *cost*
+changed in this commit and should be written down where the comment is.
+
+### Informational — deployment invariant: the reaper and the worker must share a namespace
+
+The probe now asks about the **recorded** pair, which is exact only if the reaper's
+`TEMPORAL_NAMESPACE` is the one the claim was written under. Two processes in different
+namespaces turn every live claim into `absent` → fail-open release. Pre-existing (the derived
+probe had the same coupling), newly worth stating because the exactness is now the whole
+argument. Not asserted anywhere.
+
+### Re-observed residual — the release pass is not tenant-scoped (O4)
+
+My single pass, run for a test tenant, released a stranded claim belonging to a **different**
+tenant — a row left behind by the earlier vitest run (`workflowId: probe-b4ac6318…`, logged
+at 09:52:17.757 with `liveness: absent`). The write is scoped by `orgId`/`taskId`/holder, so
+it is not a cross-tenant *corruption*, but one sweep acts across tenants and no test covers
+two real orgs. Unchanged by this commit.
+
+## Final status of every gate this phase touched
+
+| Gate | Status | Basis |
+|---|---|---|
+| **Approval-to-attempt (O1)** | **PASS** (unchanged) | Re-confirmed in this commit: standalone activity refused before any read; rogue workflow with a borrowed attempt refused; duplicate execution refused with its own run id in context; retry of the same run admitted under the same claim; the launch-site claim and the approval re-check are untouched by the diff |
+| **Claim release (F4)** | **PARTIAL — safety PASS, liveness M** | Safety: I could not make it release a live claim in any shape I constructed (§A, §B1, §B2, §C, and the shipped tests). Liveness: N12 (starvation at ≥ `batchSize` legacy claims) and the documented permanent wedge for pre-migration claims (§5 of the closure record). Do not mark F4 closed |
+| **Write authority (N4)** | **PASS for `Task` writes; PARTIAL for the class** | The two activities it named now require authority before their first write and refuse every hostile dispatch I could construct; the other five aggregate namespaces are still open (N15) |
+| **Isolation flake (O11)** | **PASS** | `isolation-gate` 5 runs × 4 tests, all green; the `[simulate:ok]` lever is present and the file is untouched by this commit; the deterministic-bucket explanation in the register is the correct one |
+
+## What still cannot be guaranteed
+
+1. **That a stranded claim is released.** Safety is proven; liveness is not. N12 can stall the
+   pass indefinitely, and pre-migration NULL-id claims are never released by design.
+2. **That the writer half of N7 cannot regress silently.** N13 — the suite is green with the
+   writer removed.
+3. **That the audit trail is authoritative for a refused duplicate.** Best-effort write, no
+   run row, and two comments that claim otherwise (N14).
+4. **That no audit row is forged for a non-`Task` aggregate.** N15.
+5. **That every in-flight execution completes across the upgrade.** N9/N11 unchanged: an
+   attempt adopted before the claim columns existed still wedges its task, and its refusal is
+   swallowed while `task.failed.v1` is emitted.
+6. **That CI exercises any of the identity boundary.** The Temporal-gated tests skip without a
+   server; with `TEMPORAL_ADDRESS` closed the worker package reports `197 passed, 54 skipped`
+   as before. CI still never runs (O8).
+7. **Tenant isolation of the release pass.** O4, re-observed above.
+
+## What I would refuse to ship
+
+1. **Enabling the release pass at fleet scale without N12's predicate.** It is one line
+   (`claimedByWorkflowId: { not: null }` in the candidate query) and without it the upgrade
+   window can permanently disable the safety net this phase exists to provide — silently,
+   with a pass that reports only `skipped_unknown`.
+2. **"N4 is closed"** without "for `Task`-aggregate writes" (N15).
+3. **"The duplicate's refusal is durable"** while it is a best-effort write and three comments
+   say a reliable event covers it (N14).
+4. **"F4 is closed."** Safety yes; liveness no.
+
+I would **not** refuse this commit for N12 or N13: neither makes any gate statement untrue,
+both are recorded above with a concrete fix, and the security properties the commit was
+written to establish hold under every reproduction I could build.
+
+## What I tried and could not do
+
+- **Release a live claim.** §A (production-path claim under a non-canonical id), §B1
+  (re-claim between read and write), §B2 (adoption between read and write), §C (NULL id), and
+  the shipped real-probe tests: `skipped_live` / `skipped_unknown` / `lost_race` every time,
+  zero `execution.claim_released.v1` rows.
+- **Influence the recorded workflow id from an activity input.** Nine candidate field names
+  at once, all forged to the canonical id; the row recorded the true `probe-…` id.
+- **Get a duplicate execution to write anything task-scoped.** Terminal write, refusal event
+  and start all refused; the only record is on the attempt.
+- **Make the retried start fail.** Two `recordStartActivity` deliveries in one execution: the
+  second is admitted and idempotent (`started: false`).
+- **Find an out-of-scope change, a disabled control, or a test bent to pass.** None: the diff
+  is 22 files, all claim/docs/migration; the two test fixtures that changed are stronger or
+  redistributed, and the only deleted assertion (`task.status === 'ready'`) was replaced by a
+  `queued` fixture whose assertion is that the write did **not** land.
+- **Reproduce the implementer's full mutation table.** I verified its sha256 exactly, the §G
+  row exactly, and two of the other four rows; the writer-side mutation it does not have is
+  N13.
+
+Honest caveats: (a) the pre-fix comparison used this workspace's generated Prisma client, so
+the `claimedByWorkflowId` column existed at `a75f121` in the scratch tree — the failure
+cannot be attributed to schema drift, and I checked that the failures are behavioural
+(`released`, `changed: true`, `created: true`); (b) cgroup *kill* and io-throughput tests
+still skip on this host, so Phase 5 enforcement is confirmed by absence of change, not by
+re-observation; (c) the review document for round 3 was committed *inside* this fix commit,
+so I cannot attest from git that its text is unaltered — I re-read it, and it matches the
+conclusions I reached in round 3.
+
+## Test and probe evidence gathered during this addendum
+
+| Item | Command / artefact | Result |
+|---|---|---|
+| `apps/worker` full | `npx vitest run apps/worker/test` | **252 passed, 12 skipped, 0 failed** |
+| monorepo | `pnpm -w test` | **822 passed, 15 skipped, 72 files** |
+| `apps/api` e2e | `pnpm --filter @intelligenz/api test:e2e` | **97 passed** |
+| `execution-boundary` verbose | real Temporal + PostgreSQL | **36/36 passed**; every new N7/N8/N4 test executed, none skipped |
+| typecheck / lint | `pnpm -w typecheck`, `eslint apps/worker/{src,test,scripts}` | clean / clean |
+| Phase 5 suites | `vitest run packages/workspace-manager apps/worker/test/{isolation-gate,cpu-budget,isolation,volumes,io-limits}` | **129 passed, 4 skipped** |
+| isolation flake | `isolation-gate` ×5 | 4/4 each, 5/5 runs |
+| migration | `_prisma_migrations` + `information_schema` | applied, `claimedByWorkflowId text` nullable, no back-fill |
+| §A N7, production claim path | `/tmp/opencode/r4-probe.mts` §A | `skipped_live`, pair recorded from context, claim intact, 0 release audits |
+| §A2 authority preserved | §A2 | `{ changed: true, status: 'failed', authority: 'execution-claim' }` |
+| §B1 stale release vs re-claim | §B1 | `lost_race`, new pair intact |
+| §B2 stale release vs adoption | §B2 | `lost_race`, row `running` |
+| §C NULL recorded id | §C | `skipped_unknown`, `askedTotal: 0`, derived id never asked |
+| §D1 N8 `succeeded` | §D1 | refused, nothing written |
+| §D2 N8 `cancelled` | §D2 | admitted, task `cancelled` |
+| §D3 end-to-end refusal (shipped workflow) | §D3 | task `failed`, 1 `task.failed.v1`, `APPROVAL_REQUIRED` |
+| §E1–E4 N4 refusals | `/tmp/opencode/r4-probe-b.mts` | standalone/rogue/no-claim: refused, 0 rows; refusal event admitted |
+| §E5 claimed path | §E5 | validate, start, `task.status_changed.v1` all succeed |
+| §E6 non-`Task` aggregate | §E6 | **written** by a rogue workflow (N15) |
+| §F1 forged workflow id | §F1 | ignored; recorded id is the real one |
+| §F2 borrowed attempt | §F2 | complete/emit/start all `EXECUTION_ALREADY_CLAIMED` |
+| §F3 duplicate | §F3 | 0 task events, 1 `execution.claim_duplicate.v1` |
+| §G absent pair | §G | `released` + audit row |
+| retried start | `/tmp/opencode/r4-probe-c.mts` | `started: true` then `started: false`, claim intact |
+| N12 starvation | `/tmp/opencode/r4-probe-d.mts` | 10 legacy + batchSize 5 → genuine candidate never scanned, probe never called |
+| N13 writer mutation | clean `23db912`, `validate-task.ts:259` removed | **51 passed** — the suite cannot see it |
+| pre-fix N7 / N8 / N4 | `/tmp/scratch/r4` (`a75f121` + new tests) | **3/3 fail**, with the pre-fix outcomes quoted above |
+| classifier hash | region at both commits | `f1ff8028…` identical, byte for byte |
+| claim-release reachability | `grep` + `execution-boundary.test.ts:1893` | not imported from `src/activities/` |
+
+Verification status: **verified** for every command and probe result quoted here.

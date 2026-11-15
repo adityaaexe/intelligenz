@@ -2,8 +2,10 @@
 
 The third review of `phase-6/trust-boundary-closure` returned **PASS** for the
 approval-to-attempt gate and **FAIL** for the commit: one regression introduced by the N2
-fix, one latent hole in the arm that fix added, and one finding closed only for two of the
-three by-name writers it named. This document is the record of that change.
+fix, one latent hole in the arm that fix added, and one finding (N4) closed for
+`Task`-aggregate writes only — for two of the three by-name writers it named, and for none
+of the other five aggregate namespaces (`workflow.*`, `agent.*`, `approval.*`, `project.*`,
+`run.*`), which remain writable by name (N15). This document is the record of that change.
 
 Base: `a75f121`. No prior commit is rewritten.
 
@@ -78,6 +80,11 @@ by-name test (`allows the pre-dispatch arm for the task's own execution…`, now
 no authority. The reviewer wrote a valid `task.succeeded.v1` and moved a task
 `queued → running` from standalone activities. AG-604 makes the audit event the durable
 record of a refused run, so forging it is worth more now, not less.
+
+The scope is `aggregateType === 'Task'` (`emit-event.ts:73`): `workflow.*`, `agent.*`,
+`approval.*`, `project.*` and `run.*` events remain writable by name. That is N15 and is
+recorded as a residual in `TRUST-BOUNDARY-CLOSURE.md`; where this section says N4 is
+closed, it means closed for task writes.
 
 Both now call the same two arms as completion (`requireEventAuthority`,
 `requireStartAuthority` → `requireExecutionWriteAuthority`), **before their first read**:

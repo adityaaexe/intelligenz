@@ -148,3 +148,10 @@ quietly hand an execution the ability to release its own claim.
 6. **A pre-Phase-6 `running` attempt wedges its task** (N9/N11, AG-604). The exact row
    shape and the reason the predicate is not relaxed are in
    `AG-604-CLAIM-IDENTITY-AND-WRITE-AUTHORITY.md` §4 and in `activities/claim.ts`.
+7. **The N4 closure is scoped to `Task`-aggregate writes.** The authority checks added in
+   AG-603/AG-604 gate events whose aggregate resolves to `Task` (`emit-event.ts:73`). The
+   other five aggregate namespaces — `workflow.*`, `agent.*`, `approval.*`, `project.*` and
+   `run.*` — are still writable **by name** from any workflow on the worker's task queue:
+   the re-review wrote a `workflow.failed.v1` for an arbitrary aggregate id (N15). This is
+   not load-bearing for any gate above, but "N4 closed" means closed **for task writes**,
+   not closed for the write class, and the register says so here rather than implying more.

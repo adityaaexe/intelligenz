@@ -94,7 +94,9 @@ import { db, nonRetryableWithDetails } from './support';
  *     write was lost to a crash between transactions (it cannot be: they are one).
  *   - `execution.claim_duplicate.v1` / `execution.claim_refused.v1` — a refusal. Written
  *     best-effort: a failing audit write must not turn a precise refusal into a retryable
- *     database error, and the workflow's `task.failed.v1` carries the same code durably.
+ *     database error. For a **duplicate** this event is the only durable record: the
+ *     workflow's `task.failed.v1` is refused by the pre-dispatch arm, because the attempt
+ *     belongs to the other execution (AG-604).
  *
  * Payloads carry server-side ids only — attempt, task, workflow run — plus the claim
  * timestamp. No hostnames, no pids, no user-supplied text.
@@ -948,8 +950,11 @@ async function recordClaimEvent(
  *
  * A refusal must survive an audit failure: the alternative is that a duplicate execution
  * is retried three times because the *evidence* write failed, and then reported as a
- * generic activity failure instead of the precise code an operator needs. The workflow's
- * `task.failed.v1` — written from the failure's details — is the durable record.
+ * generic activity failure instead of the precise code an operator needs. This event is
+ * therefore the durable record — for a duplicate there is no `task.failed.v1` to fall back
+ * on, because the pre-dispatch arm refuses that write too (the attempt belongs to another
+ * execution, AG-604). If this write fails as well, the refusal survives only in the
+ * workflow's own result.
  */
 async function recordClaimEventBestEffort(
   identity: ClaimIdentity,
@@ -963,7 +968,8 @@ async function recordClaimEventBestEffort(
     // Logged, not thrown. The refusal it accompanies is thrown below either way; turning
     // an evidence-write failure into an activity failure would retry a duplicate
     // execution three times and then report it as a database error instead of the precise
-    // code an operator needs. The workflow's `task.failed.v1` carries that code durably.
+    // code an operator needs. This event is the durable record; a duplicate has no
+    // `task.failed.v1` fallback, because that write is refused too (AG-604).
     workerLogger().warn(
       {
         eventType,
