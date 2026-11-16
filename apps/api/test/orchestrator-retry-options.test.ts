@@ -53,7 +53,12 @@ const config: AppConfig = {
   jwtTtlSeconds: 60,
   logLevel: 'silent',
   corsOrigins: [],
-  temporal: { address: 'localhost:7233', namespace: 'default', taskQueue: 'intelligenz-tasks' },
+  temporal: {
+    address: 'localhost:7233',
+    namespace: 'default',
+    taskQueue: 'intelligenz-tasks',
+    rpcMaxAttempts: 10,
+  },
   readinessTimeoutMs: 2_000,
   artifactRoot: '/tmp/intelligenz-test-artifacts',
   workspaceRoot: '/tmp/intelligenz-test-workspaces',

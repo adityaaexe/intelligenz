@@ -222,7 +222,14 @@ beforeAll(async () => {
   offline = await createTestApp({
     artifactRoot,
     workspaceRoot: join(artifactRoot, 'workspaces'),
-    temporal: { address: '127.0.0.1:1', namespace: 'default', taskQueue: 'intelligenz-tasks' },
+    // One attempt: the 503 is the assertion, so a retry can only leave a timer
+    // pending for `app.close()` to turn into `Channel has been shut down`.
+    temporal: {
+      address: '127.0.0.1:1',
+      namespace: 'default',
+      taskQueue: 'intelligenz-tasks',
+      rpcMaxAttempts: 1,
+    },
     readinessTimeoutMs: 1_000,
   });
 

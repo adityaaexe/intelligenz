@@ -117,7 +117,16 @@ export interface TemporalProbe {
  */
 export async function probeTemporal(address?: string): Promise<TemporalProbe> {
   const target = address ?? optionalEnv('TEMPORAL_ADDRESS') ?? 'localhost:7233';
-  const connection = Connection.lazy({ address: target, connectTimeout: 1_500 });
+  // No retry interceptor, deliberately. A probe asks once and this connection is closed
+  // in `finally`; the SDK's default policy would schedule a `setTimeout` for a retryable
+  // failure, and a timer that fires after `close()` throws `Channel has been shut down`
+  // from the timer callback — an uncaught error in whichever suite called the probe.
+  // Retrying cannot make an unreachable server reachable within a 1.5 s deadline.
+  const connection = Connection.lazy({
+    address: target,
+    connectTimeout: 1_500,
+    interceptors: [],
+  });
 
   try {
     await connection.ensureConnected();

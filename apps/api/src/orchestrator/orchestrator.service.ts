@@ -3,6 +3,8 @@ import {
   Connection,
   WorkflowExecutionAlreadyStartedError,
   WorkflowIdReusePolicy,
+  defaultGrpcRetryOptions,
+  makeGrpcRetryInterceptor,
 } from '@temporalio/client';
 import { Inject, Injectable, type OnApplicationShutdown } from '@nestjs/common';
 
@@ -157,6 +159,28 @@ export class OrchestratorService implements OnApplicationShutdown {
   }
 
   /**
+   * The connection's gRPC retry policy, passed explicitly instead of inherited.
+   *
+   * With `rpcMaxAttempts: 10` (the default) this is byte-for-byte the policy
+   * `Connection.lazy()` would have installed on its own: `defaultGrpcRetryOptions()`
+   * with no arguments and with `{ maxAttempts: 10 }` produce the same backoff.
+   *
+   * The reason to own it is `rpcMaxAttempts: 1`. The retry interceptor schedules a
+   * `setTimeout` per failed attempt, and that timer is not owned by the channel —
+   * `Connection.close()` does not cancel it. A timer that fires after the channel is
+   * shut down throws from the timer callback, where nothing can catch it. An app that
+   * is deliberately pointed at an unreachable orchestrator asserts a `503`; retrying
+   * the abandoned call only buys a pending timer after the answer was decided.
+   */
+  private get grpcInterceptors() {
+    return [
+      makeGrpcRetryInterceptor(
+        defaultGrpcRetryOptions({ maxAttempts: this.temporal.rpcMaxAttempts }),
+      ),
+    ];
+  }
+
+  /**
    * A lazy connection opens its channel on the first RPC instead of at boot. That
    * is deliberate: the API must start (and serve `/health`, which reports the
    * dependency as down) even when Temporal is not running.
@@ -167,6 +191,7 @@ export class OrchestratorService implements OnApplicationShutdown {
     this.connection = Connection.lazy({
       address: this.temporal.address,
       connectTimeout: this.config.readinessTimeoutMs,
+      interceptors: this.grpcInterceptors,
     });
 
     this.client = new Client({
@@ -297,12 +322,17 @@ export class OrchestratorService implements OnApplicationShutdown {
    * memoises its *first* result, so a connection that failed once while Temporal
    * was down would keep reporting down after Temporal recovered. Channel creation
    * is cheap compared to being permanently wrong about readiness.
+   *
+   * It carries the same retry policy as the client, for the same reason: this
+   * connection is closed milliseconds after it is used, and a retry timer outliving
+   * that close throws from the timer callback instead of rejecting a promise.
    */
   async probe(): Promise<ProbeResult> {
     const startedAt = Date.now();
     const connection = Connection.lazy({
       address: this.temporal.address,
       connectTimeout: this.config.readinessTimeoutMs,
+      interceptors: this.grpcInterceptors,
     });
 
     try {

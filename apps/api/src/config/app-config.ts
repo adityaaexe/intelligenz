@@ -16,6 +16,27 @@ export interface TemporalConfig {
   readonly address: string;
   readonly namespace: string;
   readonly taskQueue: string;
+  /**
+   * Attempts per RPC, including the first (`TEMPORAL_RPC_MAX_ATTEMPTS`, default 10 —
+   * the SDK's own default). `1` disables the client's automatic retries.
+   *
+   * ## Why this is stated instead of inherited
+   *
+   * The SDK installs a gRPC retry interceptor that schedules a `setTimeout` per
+   * retryable failure (up to ten attempts, backing off to 5 s). That timer belongs to
+   * the interceptor, not to the channel: `Connection.close()` does not clear it. A
+   * timer that fires after the channel is shut down calls `nextCall()` on a dead
+   * channel and throws `Channel has been shut down` **inside the timer callback** —
+   * there is no promise to reject and no `catch` to run, so it surfaces as an uncaught
+   * exception after the owning app has already been closed.
+   *
+   * That is exactly the shape of a suite that points the app at an unreachable
+   * orchestrator to assert the `503` path: the request is over (it gave up on the call
+   * and answered), but the abandoned call keeps retrying into the closed channel.
+   * Retrying cannot help a call whose answer is already decided, so those apps set `1`
+   * and no timer is ever scheduled.
+   */
+  readonly rpcMaxAttempts: number;
 }
 
 export interface AppConfig {
@@ -242,6 +263,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       address: readString(env, 'TEMPORAL_ADDRESS', 'localhost:7233'),
       namespace: readString(env, 'TEMPORAL_NAMESPACE', 'default'),
       taskQueue: readString(env, 'TEMPORAL_TASK_QUEUE', 'intelligenz-tasks'),
+      // The SDK's default, named. See `TemporalConfig.rpcMaxAttempts` for why an app
+      // pointed at an unreachable address sets 1 instead.
+      rpcMaxAttempts: readPositiveInteger(env, 'TEMPORAL_RPC_MAX_ATTEMPTS', 10),
     },
     readinessTimeoutMs: readInteger(env, 'READINESS_TIMEOUT_MS', 2_000),
     artifactRoot: resolveRoot(env['ARTIFACT_ROOT'], '.artifacts', repositoryRoot),

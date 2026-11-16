@@ -28,6 +28,9 @@ beforeAll(async () => {
       address: '127.0.0.1:1',
       namespace: 'default',
       taskQueue: 'intelligenz-tasks',
+      // One attempt: the probe asserts the down branch, and this connection is
+      // closed milliseconds after it is used.
+      rpcMaxAttempts: 1,
     },
     readinessTimeoutMs: 750,
   });
