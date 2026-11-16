@@ -288,7 +288,7 @@ boundary has been crossed in a test.
 | Branch | `phase-6/trust-boundary-closure` |
 | Code head | `0b68b9ba11c9d96e128cd143156f2868b8ba74fa` |
 | Worktree | clean |
-| Models / migrations | 19 / 10 (both dev and `_test` up to date) |
+| Models / migrations | 19 / **11** (both dev and `_test` up to date) |
 | Activities | 10 (contract test asserts exact match) |
 | Ledger | VALID, phase 8.7, 26 tasks (13 completed, 5 blocked, 8 planned) |
 | Suite | 96 files, 1064 passed, 15 skipped (skip budget = baseline) |
@@ -325,6 +325,64 @@ boundary has been crossed in a test.
 - `packages/contracts` is bundled into the Temporal workflow sandbox. A `node:crypto` import anywhere in the barrel breaks worker start. `plan-hash.ts` is a separate subpath export for exactly this reason; keep it out of `index.ts`.
 - `describe()` in `@temporalio/client` 1.25.0 does **not** expose `continuedExecutionRunId`. Read the link from `WorkflowExecutionContinuedAsNew.newExecutionRunId` in the closing run's history.
 - `Plan` has RESTRICT foreign keys; any suite that drops tenants must delete plans first (`apps/api/test/helpers/tenancy.ts`).
+
+### Verify a cold start in one command
+
+```bash
+pnpm -w typecheck && pnpm -w lint && pnpm -w test && pnpm --filter @intelligenz/api test:e2e && pnpm programme:check
+```
+
+---
+
+## Checkpoint 8.8 — cancellation, deadline truthfulness, and an honest non-reproduction (2026-11-16, `d7a817d`)
+
+**This supersedes the 8.7 "what is not done" list** for P87-010, P87-011 and P87-012.
+
+### Verified state
+
+| Fact | Value |
+|---|---|
+| Branch | `phase-6/trust-boundary-closure` |
+| Code head | `d7a817d61a06` |
+| Worktree | clean |
+| Ledger | VALID, phase 8.8, 32 tasks (15 completed, 6 blocked, 11 planned) |
+| Suite | 98 files, 1073 passed, 15 skipped (skip budget = baseline) |
+| API E2E | 167 passed, exit 0 ×3 (~22 s) |
+| Production | **NO-GO** |
+
+### What changed
+
+| Commit | What |
+|---|---|
+| `7fa4dd9` | P87-011: the failing test now prints statuses, codes and row counts on failure. **No assertion changed.** Investigation in `phase8.8-operations/`. |
+| `78c7ff2` | P87-010: `POST /programmes/:id/cancel`. The writer of the terminal state is decided by `startedAt` — workflow if started, API if not. |
+| `ad1e54d` | P87-010 tests: 4 worker + 8 API, asserting rows and the no-orphan invariants. |
+| `701d134` | P87-012: unparseable deadline fails closed; the deadline and `GRAPH_INVALID` paths return the status the row holds. |
+| `d7a817d` | P87-012 proof and limitations. |
+
+### Read these before writing code
+
+1. `docs/engineering/phase8.8-operations/PHASE88-GATE-MATRIX.md` — the state of every gate, including the ones that did not move.
+2. `docs/engineering/phase8.8-operations/P87-011-APPROVAL-BINDING-INVESTIGATION.md` — why a green suite does **not** close it, and the deadlock that was disproven.
+3. `docs/engineering/phase8.8-operations/PROGRAMME-CANCELLATION-CONTRACT.md` §2 — the single-writer table. Do not let the API write a terminal status for a started programme.
+4. `apps/worker/src/workflows/run-programme.ts` `summarise(state, committed?)` — the override exists because the row is the record.
+
+### What is NOT done, in priority order
+
+1. **P87-011 is blocked on a captured occurrence**, not on an unknown cause. Do not "fix" it; do not close it because the suite is green.
+2. **P88-001** — a cancelled programme can leave one `ProgrammeTask` at `running` with no live execution (known limitation 6.2 of P87-010). The current test asserts `stranded <= 1`; the target is 0.
+3. **P88-003** — `P2034`/`P2028` are unmapped, so a transaction conflict answers 500.
+4. **P88-002** — the deadline is not visible to an operator and a re-start recomputes the 6-hour budget (limitation L1). Needs a decision, not a column.
+5. **P87-009 is BLOCKED_POLICY** on D1–D3 in `APPROVAL-RESUMPTION-DECISIONS.md`.
+6. **Phase 9 ingestion is NOT RUN**: no PostHog SDK, no PostHog tool in this session, project identity unverified. Do not build a dashboard.
+7. **P83-003/004, P83-005, P83-006, P83-007/008, P83-011** — unchanged.
+
+### New traps
+
+- The two P87-011 tools live in `apps/api/test/manual/` and are **not collected** (`vitest.config.mts` includes only `**/*.e2e-spec.ts`). Run them by hand; `run-deadlock-probe.ts` exits **1** when there is no deadlock — that is the answer, not a crash.
+- `eslint.config.mjs` grants `no-console: off` **only** to `apps/api/test/manual/**`. Do not widen it.
+- `prettier --check` is red on `approval-attempt-binding.e2e-spec.ts` at the *previous* commit too. It is pre-existing; do not reformat around assertions.
+- `Date.parse` returns `NaN` for junk and every comparison with `NaN` is false. Any new time bound must check `Number.isFinite` first — that was a real fail-open bug.
 
 ### Verify a cold start in one command
 

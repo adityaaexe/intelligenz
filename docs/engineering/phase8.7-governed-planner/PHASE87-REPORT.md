@@ -25,7 +25,7 @@ Verified from the filesystem, not from the session report.
 | Worktree | clean | `git status --porcelain` empty | exact |
 | Ancestry | `2321c0d`, `b4408e8`, `3e56ef8` | all ancestors (also `4f10d67`, `1cf3c58`) | exact |
 | Models | 18 | 18 | exact |
-| Migrations | 9 | 9 at baseline → 10 after Phase 8.7 | exact |
+| Migrations | 9 | 9 at baseline → **11** after Phase 8.7 (`plans`, then `failureCode`) | exact |
 | Activities | 10 | 10 (`apps/worker/src/activities/index.ts`) | exact |
 | Temporal / Prisma / zod | — | 1.25.0 / 7.10.1 / 4.6.7 | recorded |
 | Node / pnpm | — | 22.23.2 / 10.15.1 | recorded |
@@ -220,7 +220,7 @@ argument for crossing it.
 | typecheck | exit 0 |
 | lint (`--max-warnings=0`) | exit 0 |
 | `prisma validate` | valid |
-| migrations | 10; dev and `_test` both "up to date" |
+| migrations | **11**; dev and `_test` both "up to date" — corrected in Phase 8.8: the count was measured at `0a222ba` (10) and `0b68b9b` then added the `failureCode` migration |
 | `pnpm programme:check` | VALID, 26 tasks |
 
 ### The ten required journeys

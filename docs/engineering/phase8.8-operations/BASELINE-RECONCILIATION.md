@@ -58,7 +58,7 @@ historical evidence. Phase 8.8 must re-measure before claiming anything current.
 | repo suite | 96 files, 1064 passed, 15 skipped | `0b68b9b` |
 | API E2E | 159 passed, exit 0 ×3, 21 s each | `0b68b9b` |
 | `prisma validate` | valid | `0b68b9b` |
-| migrations | 10; dev + `_test` "up to date" | `0b68b9b` |
+| migrations | **11**; dev + `_test` "up to date" (10 at `0a222ba`; `0b68b9b` added `failureCode`) | `0b68b9b` |
 | `programme:check` | VALID | re-measured now |
 
 ## 5. Live host

@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "programme": "INTELLIGENZ",
   "branch": "phase-6/trust-boundary-closure",
-  "head": "7fa4dd9fadf96f5709438e7f35d4a673581b24ab",
-  "phase": "8.7",
+  "head": "d7a817d61a06847eb14dbae628972af4bb8a4c79",
+  "phase": "8.8",
   "createdAt": "2026-11-16T03:30:00.000Z",
-  "updatedAt": "2026-11-16T12:30:00.000Z",
+  "updatedAt": "2026-11-16T12:50:00.000Z",
   "tasks": [
     {
       "id": "P83-001",
@@ -670,13 +670,13 @@
       ],
       "evidenceRequirement": {
         "kind": "test",
-        "artifact": "apps/api/test/programmes.e2e-spec.ts",
-        "note": "NOT DONE. Deferred deliberately rather than added unverified at the end of a session. The child-cancellation half is proven by commit 34eaedf."
+        "artifact": "apps/worker/test/programme-cancellation.test.ts",
+        "note": "Commits 78c7ff2 / ad1e54d. POST /programmes/:id/cancel (MEMBER) with a single-writer rule keyed on startedAt: a started programme is closed by its workflow, an unstarted one by the API under a guarded UPDATE. 4 worker tests + 8 API tests, API e2e 159 -> 167. Nine of twelve scenarios covered; three NOT RUN with reasons. Known limitation: one interrupted node can keep ProgrammeTask.status=running."
       },
       "owner": "node-developer",
-      "status": "planned",
+      "status": "completed",
       "createdAt": "2026-11-16T10:00:00.000Z",
-      "updatedAt": "2026-11-16T11:40:00.000Z",
+      "updatedAt": "2026-11-16T12:40:00.000Z",
       "id": "P87-010",
       "title": "Add a programme cancellation endpoint that stops dispatch",
       "riskClass": "high"
@@ -727,16 +727,183 @@
       ],
       "evidenceRequirement": {
         "kind": "test",
-        "artifact": "apps/worker/test/programme-execution.test.ts",
-        "note": "OPEN, disclosed by P87-006. Pre-existing; deliberately not fixed at the end of the session without its own verification."
+        "artifact": "apps/worker/test/programme-deadline.test.ts",
+        "note": "Commit 701d134 / d7a817d. Three defects: NaN deadline ran with no bound (fail-open); the deadline and GRAPH_INVALID paths returned a status derived from pending nodes while the row held timed_out/failed; the deadline is not discoverable (limitation L1). The five new tests were run against the pre-fix workflow and produced 3 failures / 2 passes, so they detect the defects. Continue-As-New carries deadlineAt, read from the second run history."
       },
       "owner": "node-developer",
-      "status": "planned",
+      "status": "completed",
       "createdAt": "2026-11-16T10:00:00.000Z",
-      "updatedAt": "2026-11-16T11:50:00.000Z",
+      "updatedAt": "2026-11-16T12:45:00.000Z",
       "id": "P87-012",
       "title": "Make the workflow return value agree with the terminal row on the deadline path",
       "riskClass": "moderate"
+    },
+    {
+      "phase": "8.8",
+      "dependsOn": [
+        "P87-010"
+      ],
+      "riskClass": "moderate",
+      "executionPolicy": {
+        "enforcement": "fail-closed",
+        "gate": "no-node-left-running",
+        "rationale": "A cancelled programme can leave one ProgrammeTask at running with no live task or attempt; the row then says a node is executing when nothing is."
+      },
+      "acceptanceCriteria": [
+        "A cancelled programme leaves no node in running.",
+        "The in-flight node is recorded cancelled with evidence naming its attempt or its absence.",
+        "The cancellation handler still never overwrites a completed node."
+      ],
+      "evidenceRequirement": {
+        "kind": "test",
+        "artifact": "apps/worker/test/programme-cancellation.test.ts",
+        "note": "OPEN, disclosed by P87-010 as known limitation 6.2. Current test asserts stranded <= 1; the target is 0."
+      },
+      "owner": "node-developer",
+      "status": "planned",
+      "createdAt": "2026-11-16T12:50:00.000Z",
+      "updatedAt": "2026-11-16T12:50:00.000Z",
+      "id": "P88-001",
+      "title": "Settle the interrupted node when a programme is cancelled"
+    },
+    {
+      "phase": "8.8",
+      "dependsOn": [
+        "P87-012"
+      ],
+      "riskClass": "moderate",
+      "executionPolicy": {
+        "enforcement": "advisory",
+        "gate": "deadline-visibility",
+        "rationale": "The deadline exists only in workflow input, so the API cannot report it and a re-start silently recomputes a fresh six-hour budget."
+      },
+      "acceptanceCriteria": [
+        "The deadline a programme is running under is readable by an operator.",
+        "A re-start does not silently grant a new budget, or the change is an explicit, recorded decision.",
+        "No deadline is enforced by a local timer."
+      ],
+      "evidenceRequirement": {
+        "kind": "test",
+        "artifact": "apps/worker/test/programme-deadline.test.ts",
+        "note": "OPEN, limitation L1 in DEADLINE-SEMANTICS-AND-PROOF.md. Deliberately not fixed with a column that would imply an enforcement the API does not perform."
+      },
+      "owner": "node-developer",
+      "status": "planned",
+      "createdAt": "2026-11-16T12:50:00.000Z",
+      "updatedAt": "2026-11-16T12:50:00.000Z",
+      "id": "P88-002",
+      "title": "Make the programme deadline visible and stable"
+    },
+    {
+      "phase": "8.8",
+      "dependsOn": [
+        "P87-011"
+      ],
+      "riskClass": "moderate",
+      "executionPolicy": {
+        "enforcement": "fail-closed",
+        "gate": "no-unmapped-db-abort",
+        "rationale": "Only P2002 is mapped. A P2034 write conflict or a P2028 transaction timeout reaches the client as 500 INTERNAL_ERROR, which is not an answer a client can act on."
+      },
+      "acceptanceCriteria": [
+        "A transaction conflict maps to a documented status and code, not 500.",
+        "The mapping is covered by a test that would fail if the mapping were removed.",
+        "No retry is added that could mask a race."
+      ],
+      "evidenceRequirement": {
+        "kind": "test",
+        "artifact": "apps/api/src/common/prisma-errors.ts",
+        "note": "OPEN, secondary finding in the P87-011 investigation. NOT claimed as that failure cause: the deadlock that would trigger it was disproven for this path."
+      },
+      "owner": "node-developer",
+      "status": "planned",
+      "createdAt": "2026-11-16T12:50:00.000Z",
+      "updatedAt": "2026-11-16T12:50:00.000Z",
+      "id": "P88-003",
+      "title": "Map transaction conflicts instead of answering 500"
+    },
+    {
+      "phase": "8.8",
+      "dependsOn": [],
+      "riskClass": "high",
+      "executionPolicy": {
+        "enforcement": "fail-closed",
+        "gate": "real-event-read-back",
+        "rationale": "No PostHog SDK exists and no project identity has been verified in this environment; a dashboard built now would be a drawing."
+      },
+      "acceptanceCriteria": [
+        "The SDK is a reviewed dependency change.",
+        "The project identity is verified from a read-back event, not from a key.",
+        "One labelled test event is read back and its properties inspected for free text.",
+        "No synthetic event is used to imply adoption."
+      ],
+      "evidenceRequirement": {
+        "kind": "measurement",
+        "artifact": "docs/engineering/phase9-observability/PHASE9-TELEMETRY-CONTRACT.md",
+        "note": "BLOCKED: no PostHog tool in this session and no credential. Ingestion is NOT RUN. Section 5 is the gate."
+      },
+      "owner": "node-developer",
+      "status": "planned",
+      "createdAt": "2026-11-16T12:50:00.000Z",
+      "updatedAt": "2026-11-16T12:50:00.000Z",
+      "id": "P88-004",
+      "title": "Install and verify telemetry ingestion"
+    },
+    {
+      "phase": "8.8",
+      "dependsOn": [
+        "P88-004"
+      ],
+      "riskClass": "moderate",
+      "executionPolicy": {
+        "enforcement": "advisory",
+        "gate": "one-real-trace",
+        "rationale": "OpenTelemetry is not installed; a trace that stops at the API answers none of the questions that matter."
+      },
+      "acceptanceCriteria": [
+        "traceparent propagates API -> workflow input -> activity.",
+        "One real programme produces one joined trace.",
+        "Span attributes carry no prompt, goal, criteria or artifact content."
+      ],
+      "evidenceRequirement": {
+        "kind": "measurement",
+        "artifact": "docs/engineering/phase9-observability/OBSERVABILITY-ARCHITECTURE.md",
+        "note": "PLANNED. Blocked in practice on P88-004 for the export side; local tracing could proceed independently."
+      },
+      "owner": "node-developer",
+      "status": "planned",
+      "createdAt": "2026-11-16T12:50:00.000Z",
+      "updatedAt": "2026-11-16T12:50:00.000Z",
+      "id": "P88-005",
+      "title": "Instrument one end-to-end trace across the Temporal boundary"
+    },
+    {
+      "phase": "8.8",
+      "dependsOn": [
+        "P87-010"
+      ],
+      "riskClass": "low",
+      "executionPolicy": {
+        "enforcement": "advisory",
+        "gate": "real-file-key",
+        "rationale": "No INTELLIGENZ Figma file key was supplied; creating one would spend credits on an unapproved target."
+      },
+      "acceptanceCriteria": [
+        "A real file key is supplied by the operator.",
+        "The design uses the actual API fields, including failureCode and cancellation states.",
+        "A proposed plan is never rendered as approved."
+      ],
+      "evidenceRequirement": {
+        "kind": "document",
+        "artifact": "docs/engineering/phase8.7-governed-planner/CONTROL-PLANE-UX-REQUIREMENTS.md",
+        "note": "BLOCKED on the file key. Requirements exist locally; no Figma file was created and no credits were spent."
+      },
+      "owner": "designer",
+      "status": "planned",
+      "createdAt": "2026-11-16T12:50:00.000Z",
+      "updatedAt": "2026-11-16T12:50:00.000Z",
+      "id": "P88-006",
+      "title": "Control-centre design in Figma"
     }
   ],
   "pendingTasks": [
@@ -750,9 +917,13 @@
     "P83-010",
     "P83-011",
     "P87-009",
-    "P87-010",
     "P87-011",
-    "P87-012"
+    "P88-001",
+    "P88-002",
+    "P88-003",
+    "P88-004",
+    "P88-005",
+    "P88-006"
   ],
   "completedTasks": [
     "P83-001",
@@ -767,7 +938,9 @@
     "P87-005",
     "P87-006",
     "P87-007",
-    "P87-008"
+    "P87-008",
+    "P87-010",
+    "P87-012"
   ],
   "history": [
     {
@@ -831,6 +1004,17 @@
         "docs/engineering/phase8.8-operations/P87-011-APPROVAL-BINDING-INVESTIGATION.md",
         "apps/api/test/manual/approval-binding-stress.ts",
         "apps/api/test/manual/run-deadlock-probe.ts"
+      ]
+    },
+    {
+      "at": "2026-11-16T12:50:00.000Z",
+      "summary": "Phase 8.8: P87-011 investigated and left blocked on a captured occurrence after ~95 clean executions and a disproven deadlock mechanism; P87-010 added programme cancellation with a single-writer rule for the terminal state and 12 new tests; P87-012 closed a fail-open deadline, made the workflow return the status the row holds, and proved deadlineAt survives Continue-As-New. Six follow-ups were opened, each with its blocker named. Phase 9 contracts written with ingestion NOT RUN. Production remains NO-GO.",
+      "evidence": [
+        "docs/engineering/phase8.8-operations/PHASE88-GATE-MATRIX.md",
+        "docs/engineering/phase8.8-operations/P87-011-APPROVAL-BINDING-INVESTIGATION.md",
+        "docs/engineering/phase8.8-operations/PROGRAMME-CANCELLATION-CONTRACT.md",
+        "docs/engineering/phase8.8-operations/DEADLINE-SEMANTICS-AND-PROOF.md",
+        "docs/engineering/phase9-observability/PHASE9-TELEMETRY-CONTRACT.md"
       ]
     }
   ]
