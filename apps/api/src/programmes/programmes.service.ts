@@ -278,6 +278,25 @@ export class ProgrammesService {
 
     return { programme: toResponse(programme), created: true };
   }
+
+  /**
+   * Org-scoped read of one programme.
+   *
+   * Added for the plan layer: `POST /plans/:id/submit` must be able to answer a replay with
+   * the programme the first submission created, and duplicating `PROGRAMME_SELECT` /
+   * `toResponse` in another service would let the two response shapes drift. Cross-tenant
+   * reads are 404 for the same reason as everywhere else.
+   */
+  async detail(orgId: string, programmeId: string): Promise<ProgrammeResponse> {
+    const programme = await this.prisma.programme.findFirst({
+      where: { id: programmeId, orgId },
+      select: PROGRAMME_SELECT,
+    });
+
+    if (programme === null) throw AppError.notFound('Programme');
+
+    return toResponse(programme);
+  }
 }
 
 function toResponse(row: ProgrammeRow): ProgrammeResponse {

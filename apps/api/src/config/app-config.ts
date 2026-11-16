@@ -39,6 +39,38 @@ export interface TemporalConfig {
   readonly rpcMaxAttempts: number;
 }
 
+/**
+ * The proposal planner's endpoint configuration.
+ *
+ * ## Why every field is nullable except the two numbers
+ *
+ * A planner that is not configured must be a **refusal**, not a fallback. If the
+ * service substituted a heuristic when these were missing, the product would ship a
+ * "planner" that fabricates tasks from an objective and calls it a model — which is
+ * precisely the failure this phase exists to prevent. So absence is represented as
+ * absence, and `POST /plans` answers `503 PLANNER_UNAVAILABLE` without writing a row.
+ *
+ * The three identity fields are all-or-nothing: `isPlannerConfigured` requires base URL,
+ * key and model together. A partial configuration is not "mostly working"; it is a
+ * deployment mistake that would otherwise surface as a 401 from somebody's gateway.
+ */
+export interface PlannerConfig {
+  /** `PLANNER_BASE_URL`. Must be `http:` or `https:` — validated at boot, not per request. */
+  readonly baseUrl: string | null;
+  /** `PLANNER_API_KEY`. Never logged, never returned, never placed in an audit payload. */
+  readonly apiKey: string | null;
+  /** `PLANNER_MODEL`. The model id sent with every request. */
+  readonly model: string | null;
+  /** `PLANNER_TIMEOUT_MS`, default 30 000. Bounds one call; there are no retries. */
+  readonly timeoutMs: number;
+  /**
+   * `PLANNER_APPROVAL_TTL_HOURS`, default 24. How long an approved plan may be submitted
+   * before it must be approved again. The same shape as `APPROVAL_TTL_HOURS`, because it
+   * is the same kind of grant.
+   */
+  readonly approvalTtlHours: number;
+}
+
 export interface AppConfig {
   readonly nodeEnv: string;
   readonly port: number;
@@ -82,6 +114,8 @@ export interface AppConfig {
    * is why a file write on an unlisted repository is at least `HIGH` (D-006).
    */
   readonly trustedSourceRepos: readonly string[];
+  /** Phase 8.7. Absent configuration is a refusal, never a fallback planner. */
+  readonly planner: PlannerConfig;
 }
 
 /**
@@ -275,7 +309,50 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       .split(',')
       .map((entry) => entry.trim())
       .filter((entry) => entry.length > 0),
+    planner: {
+      baseUrl: readOptionalHttpUrl(env, 'PLANNER_BASE_URL'),
+      apiKey: readOptionalString(env, 'PLANNER_API_KEY'),
+      model: readOptionalString(env, 'PLANNER_MODEL'),
+      timeoutMs: readPositiveInteger(env, 'PLANNER_TIMEOUT_MS', 30_000),
+      approvalTtlHours: readPositiveInteger(env, 'PLANNER_APPROVAL_TTL_HOURS', 24),
+    },
   };
+}
+
+/** An optional string: absent and empty mean the same thing (not configured). */
+function readOptionalString(env: NodeJS.ProcessEnv, name: string): string | null {
+  const value = env[name]?.trim();
+
+  return value === undefined || value.length === 0 ? null : value;
+}
+
+/**
+ * An optional URL that must be HTTP(S).
+ *
+ * The protocol check is at boot rather than per request because a `file:`, `ftp:` or
+ * `data:` base URL is not a slower planner — it is a different capability. `fetch` would
+ * happily read `file:///etc/passwd` for a URL that a misconfiguration supplied, and the
+ * response would then be parsed as a plan. Refusing every scheme but two makes that
+ * unreachable, and it fails where an operator can see it instead of on the first proposal.
+ */
+function readOptionalHttpUrl(env: NodeJS.ProcessEnv, name: string): string | null {
+  const raw = readOptionalString(env, name);
+
+  if (raw === null) return null;
+
+  let parsed: URL;
+
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`${name} is not a valid URL.`);
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`${name} must use http: or https:, received "${parsed.protocol}".`);
+  }
+
+  return parsed.toString().replace(/\/+$/, '');
 }
 
 /**

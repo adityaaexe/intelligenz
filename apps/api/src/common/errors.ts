@@ -32,6 +32,16 @@ export type ErrorCode =
   | 'WORKFLOW_ALREADY_RUNNING'
   | 'ORCHESTRATOR_UNAVAILABLE'
   | 'PROGRAMME_GRAPH_INVALID'
+  // Phase 8.7. A proposal is data; these are the ways a proposal, a decision about it,
+  // or its materialisation can be refused. They are distinct codes because a client (and
+  // an operator) must be able to tell "the planner is down" from "the planner answered
+  // nonsense" from "this plan may not be approved" from "the approved content changed".
+  | 'PLANNER_UNAVAILABLE'
+  | 'PLANNER_INVALID_RESPONSE'
+  | 'PLAN_NOT_VALID'
+  | 'PLAN_NOT_APPROVED'
+  | 'PLAN_APPROVAL_EXPIRED'
+  | 'PLAN_CONTENT_CHANGED'
   | 'RATE_LIMITED'
   | 'INVALID_CURSOR'
   | 'ARTIFACT_INTEGRITY_FAILED'

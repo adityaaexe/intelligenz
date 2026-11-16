@@ -85,6 +85,10 @@ const TRUNCATE_TABLES = [
   'ProgrammeCheckpoint',
   'ProgrammeTask',
   'Programme',
+  // Phase 8.7. Before `Programme` in a *delete* order (it points at one), but `TRUNCATE`
+  // needs only the table named: the list is the record of what a suite expects to empty,
+  // and a plan row left behind is state a later test would read.
+  'Plan',
   'Task',
   'Project',
   'Workspace',

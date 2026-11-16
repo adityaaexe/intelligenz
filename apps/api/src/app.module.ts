@@ -16,6 +16,7 @@ import { ExecutionsModule } from './executions/executions.module';
 import { HealthModule } from './health/health.module';
 import { OrchestratorModule } from './orchestrator/orchestrator.module';
 import { OrgsModule } from './orgs/orgs.module';
+import { PlansModule } from './plans/plans.module';
 import { ProgrammesModule } from './programmes/programmes.module';
 import { ProjectsModule } from './projects/projects.module';
 import { RolesGuard } from './tenancy/roles.guard';
@@ -62,6 +63,7 @@ export class AppModule {
         ProjectsModule,
         TasksModule,
         ProgrammesModule,
+        PlansModule,
         ApprovalsModule,
         ArtifactsModule.forRoot(),
         ExecutionsModule,

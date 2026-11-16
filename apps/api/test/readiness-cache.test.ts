@@ -36,6 +36,15 @@ const config: AppConfig = {
   // unreachable without them only because the config is a closed contract.
   approvalTtlHours: 24,
   trustedSourceRepos: [],
+  // Phase 8.7. Unconfigured, which is what every test that does not exercise the planner
+  // wants: `POST /plans` answers 503 without writing a row.
+  planner: {
+    baseUrl: null,
+    apiKey: null,
+    model: null,
+    timeoutMs: 30_000,
+    approvalTtlHours: 24,
+  },
 };
 
 function responseStub(): ApiResponse & { statusCalls: number[] } {

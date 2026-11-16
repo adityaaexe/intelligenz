@@ -66,6 +66,15 @@ const config: AppConfig = {
   // because `AppConfig` is a closed contract and a fixture must state every field.
   approvalTtlHours: 24,
   trustedSourceRepos: [],
+  // Phase 8.7. Unconfigured, which is what every test that does not exercise the planner
+  // wants: `POST /plans` answers 503 without writing a row.
+  planner: {
+    baseUrl: null,
+    apiKey: null,
+    model: null,
+    timeoutMs: 30_000,
+    approvalTtlHours: 24,
+  },
 };
 
 const input: RunTaskWorkflowInput = {

@@ -741,6 +741,9 @@ export async function reclaimTenant(prisma: PrismaClient, orgId: string): Promis
   await prisma.workflowRun.deleteMany({ where: { orgId } });
   await prisma.approvalRequest.deleteMany({ where: { orgId } });
   await prisma.auditEvent.deleteMany({ where: { orgId } });
+  // Phase 8.7: before `Task`/`Project`/`User`, because `Plan.createdById` is RESTRICT and
+  // `Plan.projectId` follows the project. A plan pruned after its approver would be refused.
+  await prisma.plan.deleteMany({ where: { orgId } });
   await prisma.task.deleteMany({ where: { orgId } });
   await prisma.project.deleteMany({ where: { orgId } });
   await prisma.workspace.deleteMany({ where: { orgId } });
