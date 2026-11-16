@@ -143,7 +143,9 @@ const AGENT_RUNTIMES = new Set<string>(AGENT_RUNTIME_IDS);
 /** Contract §16. Hard-coded defaults so an unset `.env` still speaks the right queue. */
 export const TASK_QUEUE = 'intelligenz-tasks';
 export const WORKFLOW_TYPE = 'runTaskWorkflow';
-export const WORKFLOW_ID_PREFIX = 'task-';
+// Defined in `shared/workflow-ids.ts` and re-exported here, because the workflow bundle
+// reads it and this module imports `node:fs`. See that file for the full reason.
+export { WORKFLOW_ID_PREFIX } from './shared/workflow-ids';
 
 /**
  * Phase 8.6: the parent workflow that dispatches `runTaskWorkflow` as children.

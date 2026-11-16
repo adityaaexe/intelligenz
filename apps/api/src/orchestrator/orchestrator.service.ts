@@ -3,6 +3,7 @@ import {
   Connection,
   WorkflowExecutionAlreadyStartedError,
   WorkflowIdReusePolicy,
+  WorkflowNotFoundError,
   defaultGrpcRetryOptions,
   makeGrpcRetryInterceptor,
 } from '@temporalio/client';
@@ -286,8 +287,13 @@ export class OrchestratorService implements OnApplicationShutdown {
   }
 
   /**
-   * Requests cancellation. `not_found` means Temporal has no execution with that id
-   * — which is a safe state to treat as "nothing is running", not an error.
+   * Requests cancellation. `not_found` means Temporal has no execution with that id —
+   * which is a safe state to treat as "nothing is running", not an error.
+   *
+   * The SDK converts a gRPC `NOT_FOUND` into `WorkflowNotFoundError` **before** this
+   * catches anything (`WorkflowClient.rethrowGrpcError`), so the status check has to name
+   * that class as well: without it a cancellation of a missing execution fell through to a
+   * 500, and the caller never saw the one answer that says "there was nothing to cancel".
    */
   async cancelTaskWorkflow(workflowId: string): Promise<CancelResult> {
     const client = this.getClient();
@@ -300,6 +306,8 @@ export class OrchestratorService implements OnApplicationShutdown {
 
       return 'cancelled';
     } catch (error) {
+      if (error instanceof WorkflowNotFoundError) return 'not_found';
+
       const status = grpcStatus(error);
 
       if (status === GRPC_NOT_FOUND) return 'not_found';

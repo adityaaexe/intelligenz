@@ -1045,7 +1045,8 @@ model ProgrammeCheckpoint {
   sequence    Int
   taskId      String
   /// `succeeded` | `failed` | `blocked` | `waiting_for_approval` | `already_succeeded` |
-  /// `cancelled` | `dispatch_failed`. A string, not an enum, for the same reason as
+  /// `cancelled` | `dispatch_failed` | `precondition_failed` | `held_elsewhere` |
+  /// `programme_terminal`. A string, not an enum, for the same reason as
   /// `terminationReason`: the vocabulary belongs to the scheduler and grows without a
   /// migration.
   outcome     String

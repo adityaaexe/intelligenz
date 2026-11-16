@@ -7,7 +7,10 @@ import type { PrismaClient } from '@intelligenz/database';
 import type { WorkflowHandle } from '@temporalio/client';
 import type { Workflow } from '@temporalio/workflow';
 
+import { resetWorkerConfig } from '../src/config';
+import { resetAgentRuntime } from '../src/runtime';
 import type { RunProgrammeWorkflowResult } from '../src/shared/programme';
+import type { ProgrammeProbeStep } from './fixtures/programme-probe.workflow';
 import {
   createTenant,
   dropAllTenants,
@@ -60,7 +63,20 @@ const databaseUrl = testDatabaseUrl();
 const temporalEnabled = databaseUrl !== undefined && (await temporalReachable());
 const enabled = temporalEnabled;
 
-const PROGRAMME_WORKFLOWS = fileURLToPath(new URL('../src/workflows/index.ts', import.meta.url));
+const PROGRAMME_WORKFLOWS = fileURLToPath(
+  new URL('./fixtures/programme-bundle.workflow.ts', import.meta.url),
+);
+
+/**
+ * The probe's update and signal names, as strings.
+ *
+ * Deliberately not imported from the fixture: that module imports `@temporalio/workflow`,
+ * and dragging the workflow SDK into the test process is the thing the harness exists to
+ * avoid. The strings are the contract — a typo fails the first update instead of quietly
+ * passing, exactly like `runSteps`/`finish` in `execution-harness.ts`.
+ */
+const PROGRAMME_PROBE_UPDATE = 'runProgrammeSteps';
+const PROGRAMME_PROBE_FINISH = 'finishProgrammeProbe';
 
 const tenants: TenantFixture[] = [];
 
@@ -157,6 +173,43 @@ async function submitProgramme(options: {
   readonly objective: string;
   readonly nodes: readonly { readonly taskId: string; readonly dependsOn: readonly string[] }[];
 }): Promise<{ readonly programmeId: string; readonly handle: WorkflowHandle<Workflow> }> {
+  const { fixture } = options;
+  const programmeId = await createProgrammeRow(options);
+
+  if (harness === undefined) {
+    throw new Error('the execution harness was not created; Temporal is not reachable.');
+  }
+
+  const handle = await harness.start('runProgrammeWorkflow', {
+    // The id the programme activities demand. A different id is refused by every one of
+    // them (`PROGRAMME_AUTHORITY_REFUSED`), which is what stops a task execution from
+    // minting reservations.
+    workflowId: `programme-${programmeId}`,
+    args: [
+      {
+        programmeId,
+        orgId: fixture.orgId,
+        deadlineAt: new Date(Date.now() + 3_600_000).toISOString(),
+      },
+    ],
+  });
+
+  return { programmeId, handle };
+}
+
+/**
+ * The programme row and its graph, exactly as `POST /programmes` writes them — without
+ * starting the parent.
+ *
+ * The reservation and checkpoint suites call the activities themselves (through
+ * `programmeProbe`), so they need the rows a submission would have produced and no
+ * scheduler competing with them for the same nodes.
+ */
+async function createProgrammeRow(options: {
+  readonly fixture: TenantFixture;
+  readonly objective: string;
+  readonly nodes: readonly { readonly taskId: string; readonly dependsOn: readonly string[] }[];
+}): Promise<string> {
   const { fixture, objective, nodes } = options;
 
   const programme = await client.programme.create({
@@ -178,26 +231,57 @@ async function submitProgramme(options: {
     })),
   });
 
+  return programme.id;
+}
+
+/**
+ * Runs programme-activity steps inside a real execution started under `workflowId`.
+ *
+ * `programme-<id>` is the only id `requireProgrammeAuthority` accepts, so this is the only
+ * way to ask the activities anything. The execution is finished before returning: a probe
+ * left running would occupy the worker's queue for the rest of the file.
+ */
+async function callProgrammeProbe(
+  workflowId: string,
+  steps: readonly ProgrammeProbeStep[],
+): Promise<readonly unknown[]> {
   if (harness === undefined) {
     throw new Error('the execution harness was not created; Temporal is not reachable.');
   }
 
-  const handle = await harness.start('runProgrammeWorkflow', {
-    // The id the programme activities demand. A different id is refused by every one of
-    // them (`PROGRAMME_AUTHORITY_REFUSED`), which is what stops a task execution from
-    // minting reservations.
-    workflowId: `programme-${programme.id}`,
-    args: [
-      {
-        programmeId: programme.id,
-        orgId: fixture.orgId,
-        deadlineAt: new Date(Date.now() + 3_600_000).toISOString(),
-      },
-    ],
+  const handle = await harness.start('programmeProbe', {
+    workflowId,
+    args: [],
     workflowRunTimeout: '10m',
   });
 
-  return { programmeId: programme.id, handle };
+  try {
+    return await handle.executeUpdate<readonly unknown[], [readonly ProgrammeProbeStep[]]>(
+      PROGRAMME_PROBE_UPDATE,
+      { args: [steps] },
+    );
+  } finally {
+    await handle.signal(PROGRAMME_PROBE_FINISH).catch(() => undefined);
+    await handle.result().catch(() => undefined);
+  }
+}
+
+/** Polls until `condition` holds, or throws with the deadline it exceeded. */
+async function waitFor(
+  condition: () => Promise<boolean>,
+  timeoutMs: number,
+  description: string,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+
+  for (;;) {
+    if (await condition()) return;
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out after ${String(timeoutMs)}ms waiting for ${description}`);
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
 }
 
 describe.skipIf(!enabled)('THREE-TASK-E2E — one submission, then only the database speaks', () => {
@@ -510,5 +594,520 @@ describe.skipIf(!enabled)('one failure does not stop independent branches', () =
     const sequenceOf = (taskId: string): number =>
       checkpoints.findIndex((row) => row.taskId === taskId);
     expect(sequenceOf(c)).toBeGreaterThan(sequenceOf(b));
+  }, 300_000);
+});
+
+// ─── AUTH-02/03: the child's workflow id ─────────────────────────────────────
+
+/**
+ * A child started without an explicit `workflowId` gets a random uuid4 from the SDK
+ * (`addDefaultWorkflowOptions` does `workflowId ?? uuid4()`), and three things then break at
+ * once, all of them quiet:
+ *
+ *   - `POST /cancel` cancels `task-<taskId>`, which names nobody. The cancellation cannot
+ *     reach the child, and a task the caller cancelled keeps working — long enough to write
+ *     `task.succeeded.v1` as the last word about it;
+ *   - `requireCompletionAuthority`'s pre-dispatch arm expects `task-<taskId>`, so a child
+ *     cancelled before it claimed cannot record the refusal at all;
+ *   - the checkpoint's `childWorkflowId` is a uuid nobody can connect to a task.
+ *
+ * These two tests are the id space and the cancellation it enables.
+ */
+describe.skipIf(!enabled)('AUTH-02/03 — a programme child runs under the task id space', () => {
+  it('starts the child under task-<taskId>, so the checkpoint names an execution an operator can re-probe', async () => {
+    if (harness === undefined) {
+      throw new Error('the execution harness was not created; Temporal is not reachable.');
+    }
+
+    const execution = harness;
+    const fixture = await tenant('programme-child-id');
+    const taskId = await createReadyTask(fixture, 'Child id', 'Child id work. [simulate:ok]');
+
+    const { programmeId, handle } = await submitProgramme({
+      fixture,
+      objective: 'Prove the child runs under the task id space.',
+      nodes: [{ taskId, dependsOn: [] }],
+    });
+
+    const result = (await handle.result()) as RunProgrammeWorkflowResult;
+    expect(result.status).toBe('succeeded');
+
+    const checkpoint = await client.programmeCheckpoint.findFirstOrThrow({
+      where: { programmeId },
+      select: { taskId: true, outcome: true, evidence: true },
+    });
+
+    // The evidence names the exact execution, derived from the task — not a uuid4 that
+    // cannot be reached from anything an operator has.
+    expect(checkpoint.evidence).toMatchObject({ childWorkflowId: `task-${taskId}` });
+
+    // And it is a real execution, in a terminal state, under that id.
+    const child = await execution.describeWorkflow(`task-${taskId}`);
+
+    expect(child).not.toBeNull();
+    expect(child?.status).toBe('COMPLETED');
+  }, 300_000);
+
+  it('cancels a dispatched child by its task id, and the cancelled task is never recorded as succeeded', async () => {
+    if (harness === undefined) {
+      throw new Error('the execution harness was not created; Temporal is not reachable.');
+    }
+
+    const execution = harness;
+    const fixture = await tenant('programme-cancel');
+    const taskId = await createReadyTask(
+      fixture,
+      'Cancel a dispatched child',
+      'Slow simulated work so the cancellation lands mid-run. [simulate:ok]',
+    );
+
+    /**
+     * The simulated runtime is the only clock this suite owns. 1500 ms per step keeps the
+     * child alive for seconds after it has claimed, so "the task is running, cancel it" is a
+     * fact rather than a race against a zero-delay run. The cancellation may land in
+     * `recordStartActivity` or in `executeAgentActivity`; either way the execution was alive
+     * and the id is the only thing that reached it. Restored below so every other test in the
+     * file keeps the zero-delay run.
+     */
+    const previousDelay = process.env['AGENT_STEP_DELAY_MS'];
+    process.env['AGENT_STEP_DELAY_MS'] = '1500';
+    resetWorkerConfig();
+    resetAgentRuntime();
+
+    try {
+      const { programmeId, handle } = await submitProgramme({
+        fixture,
+        objective: 'Cancel a child that is already running.',
+        nodes: [{ taskId, dependsOn: [] }],
+      });
+
+      await waitFor(
+        async () => {
+          const row = await client.task.findUniqueOrThrow({
+            where: { id: taskId },
+            select: { status: true },
+          });
+
+          return row.status === 'running';
+        },
+        60_000,
+        `task ${taskId} to be claimed and running`,
+      );
+
+      // The exact RPC and the exact id `POST /cancel` uses. Before the fix the child was
+      // under a uuid4 and this answered `not_found`.
+      expect(await execution.cancelWorkflow(`task-${taskId}`)).toBe('cancelled');
+
+      const result = (await handle.result()) as RunProgrammeWorkflowResult;
+      expect(result.status).toBe('failed');
+
+      // The task ends cancelled, not succeeded.
+      const task = await client.task.findUniqueOrThrow({
+        where: { id: taskId },
+        select: { status: true },
+      });
+      expect(task.status).toBe('cancelled');
+
+      // The decisive assertion: no success was ever emitted for a task the caller cancelled.
+      // Under the pre-fix id — a random uuid4 — this cancellation reached nobody, the child
+      // finished, and its `task.succeeded.v1` was the last word about the task.
+      expect(
+        await client.auditEvent.count({
+          where: { orgId: fixture.orgId, aggregateId: taskId, eventType: 'task.succeeded.v1' },
+        }),
+      ).toBe(0);
+
+      expect(
+        await client.auditEvent.count({
+          where: { orgId: fixture.orgId, aggregateId: taskId, eventType: 'task.cancelled.v1' },
+        }),
+      ).toBe(1);
+
+      // The child execution reached a terminal state under the id every operator has.
+      const child = await execution.describeWorkflow(`task-${taskId}`);
+      expect(child?.status).toBe('CANCELLED');
+
+      const checkpoint = await client.programmeCheckpoint.findFirstOrThrow({
+        where: { programmeId, taskId },
+        select: { outcome: true, evidence: true },
+      });
+
+      expect(checkpoint.outcome).toBe('cancelled');
+      expect(checkpoint.evidence).toMatchObject({ childWorkflowId: `task-${taskId}` });
+
+      expect(
+        (
+          await client.programmeTask.findFirstOrThrow({
+            where: { programmeId, taskId },
+            select: { status: true },
+          })
+        ).status,
+      ).toBe('cancelled');
+    } finally {
+      if (previousDelay === undefined) delete process.env['AGENT_STEP_DELAY_MS'];
+      else process.env['AGENT_STEP_DELAY_MS'] = previousDelay;
+
+      resetWorkerConfig();
+      resetAgentRuntime();
+    }
+  }, 300_000);
+});
+
+// ─── AUTH-01/04/06: what the reservation answers, and in which order ─────────
+
+/**
+ * The reservation is the scheduler's only write, so its answers are the scheduler's whole
+ * view of the world. These tests pin the four things that were wrong:
+ *
+ *   - a retry that finds its own committed rows must report `reserved`, not `not_runnable`
+ *     (which wedged the task: `queued` with an unclaimed attempt and no sweep to reclaim it);
+ *   - a terminal programme must refuse the reservation;
+ *   - a task held by another execution is a **scheduling** observation (`blocked`), not a
+ *     task failure (`failed`);
+ *   - a task that really failed is recorded as failed.
+ */
+describe.skipIf(!enabled)(
+  'AUTH-01/04/06 — the reservation answers truthfully, in that order',
+  () => {
+    it('answers a second identical reservation with the same attempt instead of not_runnable', async () => {
+      const fixture = await tenant('programme-idempotent');
+      const taskId = await createReadyTask(fixture, 'Idempotent reservation', 'Reserve me twice.');
+
+      const programmeId = await createProgrammeRow({
+        fixture,
+        objective: 'A retried reservation must find its own rows.',
+        nodes: [{ taskId, dependsOn: [] }],
+      });
+
+      // One input object, sent twice: the correlation id is part of the reservation, so an
+      // identical call is what a Temporal retry of a lost response produces.
+      const input = {
+        programmeId,
+        orgId: fixture.orgId,
+        taskId,
+        attemptNumber: 1,
+        correlationId: randomUUID(),
+      };
+
+      const [first, second] = (await callProgrammeProbe(`programme-${programmeId}`, [
+        { op: 'reserve', input },
+        { op: 'reserve', input },
+      ])) as [
+        { outcome: string; attemptId: string; workflowRunId: string },
+        { outcome: string; attemptId: string; workflowRunId: string },
+      ];
+
+      expect(first.outcome).toBe('reserved');
+
+      // The retry sees `Task.status = 'queued'` — because this reservation moved it there —
+      // and must still answer `reserved`. Answering `not_runnable` here is what left the task
+      // queued forever with an attempt no sweep reclaims.
+      expect(second.outcome).toBe('reserved');
+      expect(second.attemptId).toBe(first.attemptId);
+      expect(second.workflowRunId).toBe(first.workflowRunId);
+
+      const task = await client.task.findUniqueOrThrow({
+        where: { id: taskId },
+        select: { status: true },
+      });
+      expect(task.status).toBe('queued');
+
+      // Exactly one reservation: not zero (the retry re-created nothing) and not two.
+      expect(await client.executionAttempt.count({ where: { orgId: fixture.orgId, taskId } })).toBe(
+        1,
+      );
+      expect(await client.workflowRun.count({ where: { orgId: fixture.orgId, taskId } })).toBe(1);
+    }, 120_000);
+
+    it('refuses a reservation for a programme that is already terminal, writing no rows', async () => {
+      const fixture = await tenant('programme-terminal');
+      const taskId = await createReadyTask(fixture, 'Terminal programme', 'Nothing here may run.');
+
+      const programmeId = await createProgrammeRow({
+        fixture,
+        objective: 'A cancelled programme reserves nothing.',
+        nodes: [{ taskId, dependsOn: [] }],
+      });
+
+      await client.programme.update({
+        where: { id: programmeId },
+        data: { status: 'cancelled', finishedAt: new Date() },
+      });
+
+      const [reservation] = (await callProgrammeProbe(`programme-${programmeId}`, [
+        {
+          op: 'reserve',
+          input: {
+            programmeId,
+            orgId: fixture.orgId,
+            taskId,
+            attemptNumber: 1,
+            correlationId: randomUUID(),
+          },
+        },
+      ])) as [{ outcome: string; programmeStatus: string }];
+
+      expect(reservation.outcome).toBe('programme_terminal');
+      expect(reservation.programmeStatus).toBe('cancelled');
+
+      // No reservation, no status change: the row is the authority, and it says stop.
+      expect(await client.workflowRun.count({ where: { orgId: fixture.orgId, taskId } })).toBe(0);
+      expect(await client.executionAttempt.count({ where: { orgId: fixture.orgId, taskId } })).toBe(
+        0,
+      );
+      expect(
+        (
+          await client.task.findUniqueOrThrow({
+            where: { id: taskId },
+            select: { status: true },
+          })
+        ).status,
+      ).toBe('ready');
+    }, 120_000);
+
+    it('records a node whose task is already running elsewhere as blocked, not failed', async () => {
+      const fixture = await tenant('programme-held');
+      const taskId = await createReadyTask(fixture, 'Held elsewhere', 'Already held by a run.');
+
+      // The other execution: submitted through POST /run in production. The row is what makes
+      // "held" a fact rather than a status someone typed.
+      await client.task.update({ where: { id: taskId }, data: { status: 'running' } });
+      await client.workflowRun.create({
+        data: {
+          orgId: fixture.orgId,
+          taskId,
+          workflowId: `task-${taskId}`,
+          temporalRunId: `held-${randomUUID()}`,
+          status: 'running',
+          startedAt: new Date(),
+        },
+      });
+
+      const { programmeId, handle } = await submitProgramme({
+        fixture,
+        objective: 'A task somebody else is running is not a failure.',
+        nodes: [{ taskId, dependsOn: [] }],
+      });
+
+      const result = (await handle.result()) as RunProgrammeWorkflowResult;
+
+      // `blocked`, not `failed`: the work may be running to success under the other execution,
+      // and a programme that reported `failed` while every task succeeded is the lie this
+      // distinction exists to prevent.
+      expect(result.status).toBe('blocked');
+      expect(result.failed).toBe(0);
+
+      const checkpoint = await client.programmeCheckpoint.findFirstOrThrow({
+        where: { programmeId, taskId },
+        select: { outcome: true, evidence: true },
+      });
+
+      expect(checkpoint.outcome).toBe('held_elsewhere');
+
+      const node = await client.programmeTask.findFirstOrThrow({
+        where: { programmeId, taskId },
+        select: { status: true, attemptCount: true },
+      });
+
+      expect(node.status).toBe('blocked');
+      expect(node.attemptCount).toBe(0);
+
+      // Nothing was reserved against it, and the task's own status is untouched.
+      expect(await client.executionAttempt.count({ where: { orgId: fixture.orgId, taskId } })).toBe(
+        0,
+      );
+      expect(
+        (
+          await client.task.findUniqueOrThrow({
+            where: { id: taskId },
+            select: { status: true },
+          })
+        ).status,
+      ).toBe('running');
+    }, 300_000);
+
+    it('records a node whose task already failed as failed', async () => {
+      const fixture = await tenant('programme-precondition');
+      const taskId = await createReadyTask(
+        fixture,
+        'Already failed',
+        'It failed before we got here.',
+      );
+
+      await client.task.update({ where: { id: taskId }, data: { status: 'failed' } });
+
+      const { programmeId, handle } = await submitProgramme({
+        fixture,
+        objective: 'A task that really failed is recorded as failed.',
+        nodes: [{ taskId, dependsOn: [] }],
+      });
+
+      const result = (await handle.result()) as RunProgrammeWorkflowResult;
+      expect(result.status).toBe('failed');
+
+      const checkpoint = await client.programmeCheckpoint.findFirstOrThrow({
+        where: { programmeId, taskId },
+        select: { outcome: true },
+      });
+
+      expect(checkpoint.outcome).toBe('precondition_failed');
+
+      expect(
+        (
+          await client.programmeTask.findFirstOrThrow({
+            where: { programmeId, taskId },
+            select: { status: true },
+          })
+        ).status,
+      ).toBe('failed');
+    }, 300_000);
+  },
+);
+
+// ─── AUTH-07: the checkpoint row may not be relabelled ──────────────────────
+
+describe.skipIf(!enabled)('AUTH-07 — a checkpoint belongs to the task it was written for', () => {
+  it('refuses a checkpoint for a sequence already recorded for another task, leaving that row intact', async () => {
+    const fixture = await tenant('programme-checkpoint-guard');
+    const first = await createReadyTask(fixture, 'Checkpoint owner', 'Owns sequence 1.');
+    const second = await createReadyTask(fixture, 'Checkpoint intruder', 'Asks for sequence 1.');
+
+    const programmeId = await createProgrammeRow({
+      fixture,
+      objective: 'A sequence belongs to the node that recorded it.',
+      nodes: [
+        { taskId: first, dependsOn: [] },
+        { taskId: second, dependsOn: [] },
+      ],
+    });
+
+    const [recorded, refused] = (await callProgrammeProbe(`programme-${programmeId}`, [
+      {
+        op: 'checkpoint',
+        input: {
+          programmeId,
+          orgId: fixture.orgId,
+          sequence: 1,
+          taskId: first,
+          outcome: 'succeeded',
+          evidence: { summary: 'the first task succeeded' },
+        },
+      },
+      {
+        op: 'checkpoint',
+        input: {
+          programmeId,
+          orgId: fixture.orgId,
+          sequence: 1,
+          taskId: second,
+          outcome: 'failed',
+          evidence: { summary: 'the second task failed' },
+        },
+        // Captured as a value: the refusal is the assertion, and the first call's result
+        // must survive it.
+        captureFailure: true,
+      },
+    ])) as [{ sequence: number }, { failed: boolean; type: string; message: string }];
+
+    expect(recorded).toEqual({ sequence: 1 });
+    expect(refused.failed).toBe(true);
+    expect(refused.type).toBe('PROGRAMME_CHECKPOINT_TASK_MISMATCH');
+    // The message names both nodes, so the operator can see which one owns the sequence.
+    expect(refused.message).toContain(first);
+    expect(refused.message).toContain(second);
+
+    // The owner's row is untouched — outcome *and* task id — and there is still exactly one.
+    const row = await client.programmeCheckpoint.findFirstOrThrow({
+      where: { programmeId, sequence: 1 },
+      select: { taskId: true, outcome: true, evidence: true },
+    });
+
+    expect(row.taskId).toBe(first);
+    expect(row.outcome).toBe('succeeded');
+    expect(row.evidence).toMatchObject({ summary: 'the first task succeeded' });
+    expect(await client.programmeCheckpoint.count({ where: { programmeId } })).toBe(1);
+  }, 120_000);
+});
+
+// ─── AUTH-04: a child that never starts ─────────────────────────────────────
+
+/**
+ * `POST /run` compensates a reservation whose start failed
+ * (`TaskService.compensateFailedStart`); the programme path had no equivalent. If
+ * `startChild` rejects — the parent cancelled between the two calls, a server-side start
+ * failure, or a workflow id already held — the task stayed `queued` with an unclaimed
+ * `queued` attempt and a `queued` run, and nothing reclaims that state: `claim-release`
+ * selects only **claimed** attempts and `POST /run` requires `ready`.
+ */
+describe.skipIf(!enabled)('AUTH-04 — a child that never starts is compensated', () => {
+  it('fails the run and the attempt, restores the task to ready, and records dispatch_failed', async () => {
+    if (harness === undefined) {
+      throw new Error('the execution harness was not created; Temporal is not reachable.');
+    }
+
+    const execution = harness;
+    const fixture = await tenant('programme-start-failed');
+    const taskId = await createReadyTask(fixture, 'Start refused', 'This start will be refused.');
+
+    // Hold the deterministic child id, so the start is refused deterministically: a live
+    // execution on `task-<taskId>` is exactly what `ALLOW_DUPLICATE_FAILED_ONLY` refuses.
+    const held = await execution.session({ workflowId: `task-${taskId}` });
+
+    try {
+      const { programmeId, handle } = await submitProgramme({
+        fixture,
+        objective: 'A start that fails must not wedge the task.',
+        nodes: [{ taskId, dependsOn: [] }],
+      });
+
+      const result = (await handle.result()) as RunProgrammeWorkflowResult;
+      expect(result.status).toBe('failed');
+
+      // The attempt is failed for the reason it actually failed, not left queued.
+      const attempt = await client.executionAttempt.findFirstOrThrow({
+        where: { orgId: fixture.orgId, taskId },
+        select: { status: true, terminationReason: true, error: true },
+      });
+
+      expect(attempt.status).toBe('failed');
+      expect(attempt.terminationReason).toBe('start_failed');
+      expect(JSON.stringify(attempt.error)).toContain('START_FAILED');
+
+      const run = await client.workflowRun.findFirstOrThrow({
+        where: { orgId: fixture.orgId, taskId },
+        orderBy: { createdAt: 'desc' },
+        select: { status: true, error: true },
+      });
+
+      expect(run.status).toBe('failed');
+      expect(JSON.stringify(run.error)).toContain('START_FAILED');
+
+      // The task is back where the reservation found it, so the next attempt is possible.
+      expect(
+        (
+          await client.task.findUniqueOrThrow({
+            where: { id: taskId },
+            select: { status: true },
+          })
+        ).status,
+      ).toBe('ready');
+
+      // The node records the failed dispatch — and nothing is recorded as succeeded.
+      const checkpoints = await client.programmeCheckpoint.findMany({
+        where: { programmeId },
+        select: { outcome: true, evidence: true },
+      });
+
+      expect(checkpoints.map((row) => row.outcome)).toEqual(['dispatch_failed']);
+      expect(JSON.stringify(checkpoints[0]?.evidence)).toContain('START_FAILED');
+
+      expect(
+        await client.auditEvent.count({
+          where: { orgId: fixture.orgId, aggregateId: taskId, eventType: 'task.succeeded.v1' },
+        }),
+      ).toBe(0);
+    } finally {
+      await held.stop();
+    }
   }, 300_000);
 });

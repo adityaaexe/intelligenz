@@ -717,3 +717,56 @@ describe('workflow start (requires Temporal)', () => {
     expect(auditRow.payload).toMatchObject({ workflowId: run.data.workflowId, taskId });
   });
 });
+
+describe('cancellation with no execution to cancel (requires Temporal)', () => {
+  /**
+   * The status says the task is live; Temporal says there is no execution under
+   * `task-<taskId>`. That disagreement is not a licence to write `cancelled` locally: the
+   * row would be cancelled in the UI while whatever the task's status claims keeps working,
+   * and the next `task.succeeded.v1` would flip the run row back to `succeeded`.
+   *
+   * Reached in production by a task queued before its workflow start failed, or by an
+   * execution Temporal has since lost. Constructed here by moving the row directly.
+   */
+  it('refuses, leaving the task status untouched', async (context) => {
+    if (!temporal.ok) {
+      context.skip(temporal.reason);
+    }
+
+    const created = await request(suite.app.getHttpServer())
+      .post(tasksPath())
+      .set(authHeaders(ownerToken, suite.fixtures.orgA.id))
+      .set('idempotency-key', 'cancel-without-execution-1')
+      .send({
+        title: 'Cancellable but not running',
+        goal: 'Exercise the cancel path against an execution Temporal does not have.',
+        riskClass: 'LOW',
+        acceptanceCriteria: [],
+      })
+      .expect(201);
+
+    const taskId = (created.body as CreateTaskBody).data.id;
+
+    // The state `POST /run` leaves when its start failed: the task looks live and nothing
+    // in Temporal answers to its id.
+    await suite.prisma.task.update({ where: { id: taskId }, data: { status: 'running' } });
+
+    const response = await request(suite.app.getHttpServer())
+      .post(`${taskPath(taskId)}/cancel`)
+      .set(authHeaders(ownerToken, suite.fixtures.orgA.id))
+      .expect(409);
+
+    expect((response.body as ApiErrorBody).error.code).toBe('EXECUTION_NOT_FOUND');
+
+    const row = await suite.prisma.task.findUniqueOrThrow({ where: { id: taskId } });
+
+    expect(row.status).toBe('running');
+
+    // And no cancellation was recorded for it: a refused cancel writes nothing.
+    expect(
+      await suite.prisma.auditEvent.count({
+        where: { aggregateId: taskId, eventType: 'task.cancelled.v1' },
+      }),
+    ).toBe(0);
+  });
+});

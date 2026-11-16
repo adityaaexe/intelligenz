@@ -62,6 +62,7 @@ every audit row written by the request.
 | `APPROVAL_REQUIRED` | 409 | HIGH/CRITICAL task queued without an approved request |
 | `ALREADY_DECIDED` | 409 | Approval request already decided |
 | `TASK_NOT_CANCELLABLE` | 409 | Task is not `queued`/`running` |
+| `EXECUTION_NOT_FOUND` | 409 | The task looks live but Temporal has no execution under `task-<taskId>`; nothing was cancelled |
 | `WORKFLOW_ALREADY_RUNNING` | 409 | An execution for this task is still open under the deterministic workflow id |
 | `INVALID_TRANSITION` | 422 | State machine refused the edge; `details.transition` says which |
 | `RATE_LIMITED` | 429 | Too many sign-in attempts for this `(ip, email)`; `Retry-After` says when |
@@ -187,8 +188,12 @@ task state machine still decides whether a retry is reachable: only `blocked →
 terminal even though Temporal would accept a new run.
 
 `cancel` requires the task to be `queued` or `running`; otherwise
-`409 TASK_NOT_CANCELLABLE`. `orchestrator: "not_found"` means Temporal had no
-execution to cancel, which is not an error.
+`409 TASK_NOT_CANCELLABLE`. It cancels `task-<taskId>` — the same id every execution of
+that task runs under, including a task a programme dispatched as a child. If Temporal has
+no execution under that id the request is refused with `409 EXECUTION_NOT_FOUND` and the
+task keeps its status: a row marked cancelled while an execution the API cannot name keeps
+working is worse than a failed request, because the execution's later success would flip
+the run row back to `succeeded`.
 
 ### Programmes (Phase 8.6)
 

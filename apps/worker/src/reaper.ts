@@ -395,11 +395,17 @@ async function reapOne(deps: ReaperDeps, candidate: Candidate): Promise<ReaperAc
   // ── 2. The attempt that owned this workspace is abandoned ───────────────────
   // The attempt row is found by `(orgId, taskId)` and `status = running`: a workspace is
   // 1:1 with an attempt by construction (`executionWorkspaceIdFor` and
-  // `executionAttemptIdFor` hash the same pair), and only one attempt per task can be
-  // running because the workflow id is unique.
+  // `executionAttemptIdFor` hash the same pair), and the task-status compare-and-swap is
+  // what keeps one task to one live run — not the workflow id, which the same task may
+  // legitimately carry across a retry after a failed execution.
+  //
+  // Ordered by `createdAt`, **not** `attemptNumber`: every reservation writes
+  // `attemptNumber = 1` (it counts attempts within one workflow run, and a programme
+  // reservation mints a new run each time), so the column cannot order attempts across
+  // runs. Creation order can, and the newest row is the one holding the workspace.
   const attempt = await deps.prisma.executionAttempt.findFirst({
     where: { orgId: candidate.orgId, taskId: candidate.taskId, status: 'running' },
-    orderBy: { attemptNumber: 'desc' },
+    orderBy: { createdAt: 'desc' },
     select: { id: true, attemptNumber: true },
   });
 

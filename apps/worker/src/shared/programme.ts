@@ -17,7 +17,15 @@ export type ProgrammeRunStatus = 'succeeded' | 'failed' | 'blocked' | 'timed_out
 export type ProgrammeNodeStatus =
   'pending' | 'running' | 'succeeded' | 'failed' | 'blocked' | 'waiting_for_approval' | 'cancelled';
 
-/** Where each checkpoint outcome lands the node. One table, used by both sides. */
+/**
+ * Where each checkpoint outcome lands the node. One table, used by both sides.
+ *
+ * The distinction `failed` / `blocked` carries is not cosmetic: `failed` says **this
+ * node's work failed**, `blocked` says **this node could not be scheduled**. A programme
+ * reports itself `failed` when a node failed and `blocked` when work remains that could
+ * not run, so recording "another execution already holds this task" as `failed` would
+ * report a broken programme while every task eventually succeeded.
+ */
 export const NODE_STATUS_BY_OUTCOME: Readonly<
   Record<ProgrammeCheckpointOutcome, ProgrammeNodeStatus>
 > = {
@@ -25,7 +33,10 @@ export const NODE_STATUS_BY_OUTCOME: Readonly<
   already_succeeded: 'succeeded',
   failed: 'failed',
   dispatch_failed: 'failed',
+  precondition_failed: 'failed',
   blocked: 'blocked',
+  held_elsewhere: 'blocked',
+  programme_terminal: 'blocked',
   waiting_for_approval: 'waiting_for_approval',
   cancelled: 'cancelled',
 };
@@ -124,7 +135,40 @@ export type ReserveProgrammeTaskResult =
    * records the node as waiting and leaves the approval to a human.
    */
   | { readonly outcome: 'approval_required' }
-  /** The task is not in a state the programme can start: terminal, or held by a run. */
+  /**
+   * The task itself is `failed` or `cancelled`. Nothing to dispatch and nothing to wait
+   * for: the node is recorded `failed`, which is the truth about the task.
+   */
+  | {
+      readonly outcome: 'precondition_failed';
+      readonly taskStatus: string;
+      readonly detail: string;
+    }
+  /**
+   * The task is `queued`/`running` under **another** execution — submitted through
+   * `POST /run`, or reserved by an earlier programme run. The work is not the scheduler's
+   * to start and is not a failure: the node is recorded `blocked`, and its dependents
+   * wait for a task that may well succeed.
+   */
+  | {
+      readonly outcome: 'held_elsewhere';
+      readonly taskStatus: string;
+      readonly detail: string;
+    }
+  /**
+   * The programme row is already terminal (`cancelled`, `failed`, `succeeded`, …). A
+   * terminal programme does not mint reservations, whatever its workflow is doing.
+   */
+  | {
+      readonly outcome: 'programme_terminal';
+      readonly programmeStatus: string;
+      readonly detail: string;
+    }
+  /**
+   * The task is not `ready` for a reason that is neither terminal nor another execution's
+   * hold (`draft`, `blocked`, `verifying`). Nothing failed and nothing is running it, so
+   * the node is recorded `blocked`.
+   */
   | {
       readonly outcome: 'not_runnable';
       readonly taskStatus: string;
@@ -132,6 +176,14 @@ export type ReserveProgrammeTaskResult =
     }
   | { readonly outcome: 'not_found' };
 
+/**
+ * The scheduler's vocabulary for one node. A string on the wire and a string in the
+ * column (`ProgrammeCheckpoint.outcome`), so a new word needs no migration.
+ *
+ * `dispatch_failed` is reserved for an **actual dispatch fault** — a start that was
+ * refused, or a node whose execution could not be observed. It is not the word for
+ * "somebody else is running this task", which is `held_elsewhere`.
+ */
 export type ProgrammeCheckpointOutcome =
   | 'succeeded'
   | 'failed'
@@ -139,13 +191,23 @@ export type ProgrammeCheckpointOutcome =
   | 'waiting_for_approval'
   | 'already_succeeded'
   | 'cancelled'
-  | 'dispatch_failed';
+  | 'dispatch_failed'
+  /** The task is `failed`/`cancelled`: dispatch was never possible, truthfully. */
+  | 'precondition_failed'
+  /** The task is held by another execution: not a failure, so the node is blocked. */
+  | 'held_elsewhere'
+  /** The programme is already terminal: nothing may be reserved for it. */
+  | 'programme_terminal';
 
 /** The links that make a checkpoint evidence rather than an assertion. */
 export interface ProgrammeCheckpointEvidence {
   readonly attemptId?: string;
   readonly workflowRunId?: string;
-  /** The Temporal child execution, as the server named it. */
+  /**
+   * The child's workflow id. Since Phase 8.6's cancellation fix this is not a server-minted
+   * uuid: the parent starts every child under `${WORKFLOW_ID_PREFIX}${taskId}`, so an
+   * operator re-probing this id from the task id reaches the same execution.
+   */
   readonly childWorkflowId?: string;
   readonly childRunId?: string;
   /** The child's own verdict, verbatim. */
@@ -161,6 +223,26 @@ export interface RecordProgrammeCheckpointInput {
   readonly taskId: string;
   readonly outcome: ProgrammeCheckpointOutcome;
   readonly evidence: ProgrammeCheckpointEvidence | null;
+  /**
+   * Present **only** when the workflow is recording a dispatch that never produced a
+   * child: `startChild` rejected after the reservation committed. The activity then
+   * releases that reservation in the same transaction as the checkpoint.
+   *
+   * It rides on this input because the workflow sandbox cannot write, and because the
+   * record ("this dispatch failed") and the undo ("the attempt and run it left behind are
+   * failed, the task is ready again") must commit together: a checkpoint that says the
+   * start failed while the attempt stays `queued` is the wedge this compensation exists
+   * to prevent.
+   */
+  readonly release?: ProgrammeReservationRelease;
+}
+
+/** The reservation a failed child start left behind. Ids are the ones the activity minted. */
+export interface ProgrammeReservationRelease {
+  readonly workflowRunId: string;
+  readonly attemptId: string;
+  /** One line, recorded on the run and the attempt as `START_FAILED`. */
+  readonly reason: string;
 }
 
 export interface RecordProgrammeCheckpointResult {

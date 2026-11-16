@@ -8,6 +8,7 @@ import {
   startChild,
   uuid4,
   workflowInfo,
+  WorkflowIdReusePolicy,
   type ChildWorkflowHandle,
 } from '@temporalio/workflow';
 
@@ -20,10 +21,12 @@ import {
   type ProgrammeCheckpointOutcome,
   type ProgrammeNode,
   type ProgrammeNodeStatus,
+  type ProgrammeReservationRelease,
   type ProgrammeRunStatus,
   type RunProgrammeWorkflowInput,
   type RunProgrammeWorkflowResult,
 } from '../shared/programme';
+import { WORKFLOW_ID_PREFIX } from '../shared/workflow-ids';
 import { runTaskWorkflow } from './run-task';
 
 /**
@@ -296,62 +299,159 @@ async function dispatch(
       correlationId,
     });
 
-    if (reservation.outcome === 'reserved') {
-      const handle = await startChild(runTaskWorkflow, {
-        args: [
-          {
-            taskId: node.taskId,
-            orgId: input.orgId,
-            correlationId,
+    switch (reservation.outcome) {
+      case 'reserved': {
+        const childWorkflowId = `${WORKFLOW_ID_PREFIX}${node.taskId}`;
+
+        try {
+          const handle = await startChild(runTaskWorkflow, {
+            // The task's own id space, exactly as `POST /run` starts a top-level run and
+            // exactly as `POST /cancel` cancels one. The SDK would otherwise mint a random
+            // uuid4 and the child would be unreachable: cancellation would answer
+            // `not_found` while the child kept working, and the pre-dispatch completion
+            // arm — which requires this derived id — could never record a refusal for a
+            // child cancelled before it claimed.
+            workflowId: childWorkflowId,
+            // Same policy as the API's `WORKFLOW_ID_REUSE_POLICY`: a live duplicate is
+            // still refused (one execution per task id), while a run that already closed
+            // as failed/cancelled may be replaced by a retry.
+            workflowIdReusePolicy: WorkflowIdReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY,
+            args: [
+              {
+                taskId: node.taskId,
+                orgId: input.orgId,
+                correlationId,
+                attemptId: reservation.attemptId,
+              },
+            ],
+            // Same ceiling the API gives a top-level run.
+            workflowRunTimeout: CHILD_RUN_TIMEOUT,
+            // One attempt, deliberately. A workflow-level retry would re-enter with the same
+            // spent attempt and be refused by the claim; the task's own activity retries are
+            // where a transient failure is absorbed.
+            retry: { maximumAttempts: 1 },
+          });
+
+          dispatched.push({
+            node,
+            handle,
             attemptId: reservation.attemptId,
-          },
-        ],
-        // Same ceiling the API gives a top-level run.
-        workflowRunTimeout: CHILD_RUN_TIMEOUT,
-        // One attempt, deliberately. A workflow-level retry would re-enter with the same
-        // spent attempt and be refused by the claim; the task's own activity retries are
-        // where a transient failure is absorbed.
-        retry: { maximumAttempts: 1 },
-      });
+            workflowRunId: reservation.workflowRunId,
+          });
+        } catch (error) {
+          // Cancellation is not a dispatch fault. The parent is stopping; the child, if it
+          // did start, owns its own rows and its own `recordCancellation`. Compensating
+          // here would put the task back in `ready` for a scheduler that is going away.
+          if (isCancellation(error)) throw error;
 
-      dispatched.push({
-        node,
-        handle,
-        attemptId: reservation.attemptId,
-        workflowRunId: reservation.workflowRunId,
-      });
-      continue;
+          // The reservation committed and nothing is running it: without this, the task
+          // stays `queued` with an unclaimed attempt and a `queued` run that no sweep
+          // reclaims (`claim-release` only selects claimed attempts; `POST /run` requires
+          // `ready`). The same compensation `POST /run` performs for the same failure.
+          const reason = `START_FAILED: the child execution for task ${node.taskId} could not be started: ${describeFailure(error)}`;
+
+          await checkpoint(
+            state,
+            input,
+            node,
+            'dispatch_failed',
+            {
+              attemptId: reservation.attemptId,
+              workflowRunId: reservation.workflowRunId,
+              childWorkflowId,
+              reason,
+            },
+            {
+              workflowRunId: reservation.workflowRunId,
+              attemptId: reservation.attemptId,
+              reason,
+            },
+          );
+        }
+
+        break;
+      }
+
+      case 'already_succeeded': {
+        await checkpoint(state, input, node, 'already_succeeded', {
+          reason: 'The task was already succeeded before the programme reached it.',
+        });
+        break;
+      }
+
+      case 'approval_required': {
+        // Not a failure: a human still has to approve. The node is settled for this run
+        // and only its dependents wait — independent branches keep going.
+        await checkpoint(state, input, node, 'waiting_for_approval', {
+          reason:
+            'The task requires an approval. A programme does not spend approval grants: ' +
+            'reserve the run through POST /run once the grant exists.',
+        });
+        break;
+      }
+
+      case 'not_found': {
+        await checkpoint(state, input, node, 'failed', {
+          reason: 'The task no longer exists in this organisation and project.',
+        });
+        break;
+      }
+
+      case 'precondition_failed': {
+        // The task really did fail: the node is failed and its dependents block.
+        await checkpoint(state, input, node, 'precondition_failed', {
+          reason: reservation.detail,
+          summary: reservation.taskStatus,
+        });
+        break;
+      }
+
+      case 'held_elsewhere': {
+        // Another execution holds the task and may well be running it to success. This is
+        // a scheduling observation, not a task failure: the node is blocked, not failed,
+        // and the programme's own verdict stays `blocked` rather than `failed`.
+        await checkpoint(state, input, node, 'held_elsewhere', {
+          reason: reservation.detail,
+          summary: reservation.taskStatus,
+        });
+        break;
+      }
+
+      case 'programme_terminal': {
+        // The row this scheduler acts for is finished — cancelled, in practice. Nothing
+        // may be reserved, and no node of it is runnable.
+        await checkpoint(state, input, node, 'programme_terminal', {
+          reason: reservation.detail,
+          summary: reservation.programmeStatus,
+        });
+        break;
+      }
+
+      case 'not_runnable': {
+        // Neither terminal nor held by anybody: `draft`, `blocked`, `verifying`. Nothing
+        // failed, so the node waits rather than failing the programme.
+        await checkpoint(state, input, node, 'blocked', {
+          reason: reservation.detail,
+          summary: reservation.taskStatus,
+        });
+        break;
+      }
+
+      default: {
+        // Fail closed. A reservation answer this build does not recognise — an activity
+        // newer than the workflow during a rolling deploy — must never be read as "start
+        // the child anyway", and must never fall through to a checkpoint that could read
+        // as success. `dispatch_failed` fails the node and blocks its dependents.
+        const unknown = reservation as { readonly outcome?: unknown };
+
+        await checkpoint(state, input, node, 'dispatch_failed', {
+          reason:
+            'PROGRAMME_RESERVATION_OUTCOME_UNKNOWN: the reservation activity answered ' +
+            `"${String(unknown.outcome)}", which this scheduler does not understand.`,
+        });
+        break;
+      }
     }
-
-    if (reservation.outcome === 'already_succeeded') {
-      await checkpoint(state, input, node, 'already_succeeded', {
-        reason: 'The task was already succeeded before the programme reached it.',
-      });
-      continue;
-    }
-
-    if (reservation.outcome === 'approval_required') {
-      // Not a failure: a human still has to approve. The node is settled for this run and
-      // only its dependents wait — independent branches keep going.
-      await checkpoint(state, input, node, 'waiting_for_approval', {
-        reason:
-          'The task requires an approval. A programme does not spend approval grants: ' +
-          'reserve the run through POST /run once the grant exists.',
-      });
-      continue;
-    }
-
-    if (reservation.outcome === 'not_found') {
-      await checkpoint(state, input, node, 'failed', {
-        reason: 'The task no longer exists in this organisation and project.',
-      });
-      continue;
-    }
-
-    await checkpoint(state, input, node, 'dispatch_failed', {
-      reason: reservation.detail,
-      summary: reservation.taskStatus,
-    });
   }
 
   for (const entry of dispatched) {
@@ -487,6 +587,7 @@ async function checkpoint(
   node: ProgrammeNode,
   outcome: ProgrammeCheckpointOutcome,
   evidence: ProgrammeCheckpointEvidence | null,
+  release?: ProgrammeReservationRelease,
 ): Promise<void> {
   state.sequence += 1;
 
@@ -497,6 +598,9 @@ async function checkpoint(
     taskId: node.taskId,
     outcome,
     evidence,
+    // Only a dispatch that never produced a child carries one: the activity then releases
+    // the reservation the start left behind, in the same transaction as this record.
+    ...(release === undefined ? {} : { release }),
   });
 
   // Only after the write: an in-memory state that disagrees with the database would make

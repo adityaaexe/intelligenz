@@ -1,7 +1,7 @@
 import { requiresApproval } from '@intelligenz/contracts';
 import { Prisma } from '@intelligenz/database';
 
-import { PROGRAMME_WORKFLOW_ID_PREFIX } from '../config';
+import { PROGRAMME_WORKFLOW_ID_PREFIX, WORKFLOW_ID_PREFIX } from '../config';
 import { AGENT_ACTOR_ID } from '../shared/actors';
 import { NODE_STATUS_BY_OUTCOME } from '../shared/programme';
 import type {
@@ -55,12 +55,24 @@ import { db, nonRetryable } from './support';
  * will not spend one. It refuses the node with `approval_required`, the scheduler records
  * `waiting_for_approval`, and the dependents block. A programme that spent its own grants
  * would be the programme layer authorising execution — the one thing it must never do.
+ *
+ * ## Two attempt counters, and why they are not one
+ *
+ * A reservation writes `ExecutionAttempt.attemptNumber` (always `1`) and
+ * `ProgrammeTask.attemptCount` (the workflow's dispatch number). They hold the same value
+ * today and mean different things: the first counts attempts **within one run**, the
+ * second counts dispatches **per node**. They can only diverge once a node is dispatched
+ * twice, which is unreachable in this build — a node leaves the ready set the moment its
+ * first checkpoint is written, so `attemptCount > 1` never occurs. Neither value may be
+ * read as evidence about the other.
  */
 
 /** The refusal codes an operator will grep for. */
 const PROGRAMME_IDENTITY_UNAVAILABLE = 'PROGRAMME_IDENTITY_UNAVAILABLE';
 const PROGRAMME_AUTHORITY_REFUSED = 'PROGRAMME_AUTHORITY_REFUSED';
 const PROGRAMME_NOT_FOUND = 'PROGRAMME_NOT_FOUND';
+/** A checkpoint sequence already belongs to another node of this programme. */
+const PROGRAMME_CHECKPOINT_TASK_MISMATCH = 'PROGRAMME_CHECKPOINT_TASK_MISMATCH';
 
 /**
  * Throws unless this activity is running inside `programme-<programmeId>`.
@@ -133,11 +145,30 @@ export async function loadProgrammeActivity(
     );
   }
 
+  // The status this activity will report. Starts as what was read; the conditional update
+  // below may change it, and a lost update changes it to whatever the row actually holds.
+  let status: LoadProgrammeActivityResult['programme']['status'] = programme.status;
+
   if (programme.status === 'pending') {
-    await prisma.programme.updateMany({
+    const started = await prisma.programme.updateMany({
       where: { id: programme.id, orgId: input.orgId, status: 'pending' },
       data: { status: 'running', startedAt: new Date() },
     });
+
+    if (started.count === 0) {
+      // The conditional update lost to a concurrent writer — a cancellation is the case
+      // that matters. Report the status the row actually has, not the `running` this call
+      // intended: a cancelled programme reported as running is a workflow that keeps
+      // dispatching for a row nobody can cancel again.
+      const current = await prisma.programme.findFirst({
+        where: { id: programme.id, orgId: input.orgId },
+        select: { status: true },
+      });
+
+      status = current?.status ?? status;
+    } else {
+      status = 'running';
+    }
   }
 
   const [rows, checkpoints] = await Promise.all([
@@ -164,7 +195,9 @@ export async function loadProgrammeActivity(
       id: programme.id,
       projectId: programme.projectId,
       objective: programme.objective,
-      status: programme.status === 'pending' ? 'running' : programme.status,
+      // What the row actually holds after the conditional write above — not the status
+      // this call meant to write.
+      status,
     },
     nodes: rows.map((row) => ({
       taskId: row.taskId,
@@ -201,9 +234,15 @@ class ReservationLost extends Error {}
  * and reports `reserved` again instead of reserving a second execution. `attemptCount` is
  * assigned, never incremented, for the same reason.
  *
+ * The committed-rows check therefore runs **first**, before any status gate: a retry that
+ * finds its own reservation must report it, even though the reservation itself moved the
+ * task to `queued`. See the block comment at the check for the wedge that ordering
+ * prevents.
+ *
  * The task compare-and-swap is what arbitrates against everything else: if another
  * execution already moved the task out of `ready`, the transaction rolls back and the
- * answer is `not_runnable` — no run row, no attempt, nothing to clean up.
+ * answer names the state the task is in now — `held_elsewhere`, `precondition_failed` or
+ * `already_succeeded` — with no run row, no attempt and nothing to clean up.
  */
 export async function reserveProgrammeTaskActivity(
   input: ReserveProgrammeTaskInput,
@@ -214,7 +253,10 @@ export async function reserveProgrammeTaskActivity(
 
   const programme = await prisma.programme.findFirst({
     where: { id: input.programmeId, orgId: input.orgId },
-    select: { projectId: true },
+    // `status` is read here, not only in `loadProgrammeActivity`: the graph was loaded by
+    // an execution that may since have been cancelled, and a terminal row must refuse a
+    // reservation even from a live loop.
+    select: { projectId: true, status: true },
   });
 
   if (programme === null) {
@@ -222,6 +264,20 @@ export async function reserveProgrammeTaskActivity(
       PROGRAMME_NOT_FOUND,
       `Programme ${input.programmeId} does not exist in organisation ${input.orgId}.`,
     );
+  }
+
+  if (programme.status !== 'pending' && programme.status !== 'running') {
+    // A programme row that is already terminal owns no further dispatch, whatever the
+    // execution asking is doing. Without this, a cancelled programme whose parent had
+    // already loaded the graph could still mint a reservation and start a child — the
+    // cancellation would be a statement about a row nobody consulted.
+    return {
+      outcome: 'programme_terminal',
+      programmeStatus: programme.status,
+      detail:
+        `Programme ${input.programmeId} is "${programme.status}", not pending or running. ` +
+        'A terminal programme reserves nothing.',
+    };
   }
 
   const node = await prisma.programmeTask.findFirst({
@@ -246,13 +302,63 @@ export async function reserveProgrammeTaskActivity(
 
   if (task === null) return { outcome: 'not_found' };
 
+  const workflowRunId = deterministicId(`programme-run:${node.id}:${String(input.attemptNumber)}`);
+  const attemptId = executionAttemptIdFor(workflowRunId, 1);
+
+  // ── A committed reservation outranks the task-status gate ────────────────────
+  //
+  // This check runs **before** the status gate on purpose. The activity commits its
+  // transaction and can then lose its response (a worker restart, a network partition, a
+  // server-side timeout), and Temporal retries it. On that retry the rows exist and the
+  // task is `queued` — because *this reservation* moved it there. Answering
+  // `not_runnable` would report a lost race against itself: the workflow would record
+  // `dispatch_failed`, the node would fail, no child would start, and the task would sit
+  // `queued` with an unclaimed attempt that nothing reclaims (`claim-release` only
+  // selects claimed attempts; `POST /run` requires `ready`).
+  //
+  // The predicate is scoped to this node, this task and this org, and to the workflow id
+  // this reservation writes, so a foreign row that happens to share an id cannot revive
+  // a reservation that is not ours.
+  const [existingRun, existingAttempt] = await Promise.all([
+    prisma.workflowRun.findFirst({
+      where: {
+        id: workflowRunId,
+        orgId: input.orgId,
+        taskId: input.taskId,
+        workflowId: `${WORKFLOW_ID_PREFIX}${input.taskId}`,
+      },
+      select: { id: true },
+    }),
+    prisma.executionAttempt.findFirst({
+      where: { id: attemptId, orgId: input.orgId, taskId: input.taskId, workflowRunId },
+      select: { id: true },
+    }),
+  ]);
+
+  if (existingRun !== null && existingAttempt !== null) {
+    return { outcome: 'reserved', attemptId, workflowRunId };
+  }
+
   if (task.status === 'succeeded') return { outcome: 'already_succeeded' };
 
   if (task.status === 'failed' || task.status === 'cancelled') {
     return {
-      outcome: 'not_runnable',
+      outcome: 'precondition_failed',
       taskStatus: task.status,
       detail: `Task ${task.id} is already ${task.status}; nothing to dispatch.`,
+    };
+  }
+
+  if (task.status === 'queued' || task.status === 'running') {
+    // Held, not broken. The work may be running to success under a `POST /run`
+    // execution or an earlier programme; recording the node `failed` would block its
+    // dependents and report a failed programme while every task succeeded.
+    return {
+      outcome: 'held_elsewhere',
+      taskStatus: task.status,
+      detail:
+        `Task ${task.id} is "${task.status}": another execution already holds it. A ` +
+        'programme dispatches only "ready" tasks and does not treat a held task as a failure.',
     };
   }
 
@@ -261,8 +367,8 @@ export async function reserveProgrammeTaskActivity(
       outcome: 'not_runnable',
       taskStatus: task.status,
       detail:
-        `Task ${task.id} is "${task.status}". A programme dispatches only "ready" tasks: ` +
-        '"queued" or "running" means another execution already holds it.',
+        `Task ${task.id} is "${task.status}". A programme dispatches only "ready" tasks; ` +
+        'this node cannot start until the task is ready again.',
     };
   }
 
@@ -270,26 +376,6 @@ export async function reserveProgrammeTaskActivity(
   // become a second spender. The node waits for a human, and its dependents wait with it.
   if (requiresApproval(task.riskClass)) {
     return { outcome: 'approval_required' };
-  }
-
-  const workflowRunId = deterministicId(`programme-run:${node.id}:${String(input.attemptNumber)}`);
-  const attemptId = executionAttemptIdFor(workflowRunId, 1);
-
-  // A committed reservation from an earlier invocation of this same activity. Reported as
-  // success rather than re-created: the run and the attempt are the same execution.
-  const [existingRun, existingAttempt] = await Promise.all([
-    prisma.workflowRun.findFirst({
-      where: { id: workflowRunId, orgId: input.orgId },
-      select: { id: true },
-    }),
-    prisma.executionAttempt.findFirst({
-      where: { id: attemptId, orgId: input.orgId, taskId: input.taskId },
-      select: { id: true },
-    }),
-  ]);
-
-  if (existingRun !== null && existingAttempt !== null) {
-    return { outcome: 'reserved', attemptId, workflowRunId };
   }
 
   try {
@@ -310,7 +396,9 @@ export async function reserveProgrammeTaskActivity(
           taskId: task.id,
           // The workflow the child will run under. `recordStartActivity` adopts this row
           // through its "newest active run for the task" fallback and rewrites the status.
-          workflowId: `task-${task.id}`,
+          // This is also the id the parent starts the child with, so cancellation reaches
+          // it: see `dispatch()` in `workflows/run-programme.ts`.
+          workflowId: `${WORKFLOW_ID_PREFIX}${task.id}`,
           status: 'queued',
         },
       });
@@ -321,6 +409,20 @@ export async function reserveProgrammeTaskActivity(
           orgId: input.orgId,
           taskId: task.id,
           workflowRunId,
+          // **Not** the node's `attemptCount` below. Two different counters happen to hold
+          // the same number today:
+          //
+          //   - this one is the attempt number *within one workflow run*
+          //     (`@@unique([workflowRunId, attemptNumber])`), always 1 because every
+          //     reservation mints a new run and a run never retries an attempt here;
+          //   - `ProgrammeTask.attemptCount` is the *dispatch count per node* and is
+          //     assigned from the workflow's `input.attemptNumber`.
+          //
+          // They diverge only once a re-dispatch path exists — a node reserved, its child
+          // failing, and the scheduler dispatching a second time against the same run.
+          // That path does not exist: `attemptCount > 1` is currently unreachable, because
+          // a node is settled by its first checkpoint and never re-enters the ready set.
+          // Do not read the equality below as a guarantee that they agree.
           attemptNumber: 1,
           // Same vocabulary `POST /run` writes: the adapter is chosen by the worker at
           // dispatch, and `startAttempt` replaces this when the run is adopted.
@@ -335,7 +437,8 @@ export async function reserveProgrammeTaskActivity(
         data: {
           status: 'running',
           // Assigned from the workflow's deterministic number, never incremented, so a
-          // retried activity cannot inflate it.
+          // retried activity cannot inflate it. This is the **dispatch count per node**,
+          // not the attempt number of the row above; the two are not the same counter.
           attemptCount: input.attemptNumber,
           startedAt: new Date(),
         },
@@ -376,12 +479,34 @@ export async function reserveProgrammeTaskActivity(
         select: { status: true },
       });
 
+      const status = current?.status ?? 'unknown';
+      const context = `Task ${task.id} left "ready" while the programme was reserving it.`;
+
+      // The same truthful mapping as the pre-check above: losing the CAS to a task that is
+      // now terminal is not the same observation as losing it to one another execution is
+      // running, and neither is a dispatch fault.
+      if (status === 'succeeded') return { outcome: 'already_succeeded' };
+
+      if (status === 'failed' || status === 'cancelled') {
+        return {
+          outcome: 'precondition_failed',
+          taskStatus: status,
+          detail: `${context} It is now ${status}; nothing to dispatch.`,
+        };
+      }
+
+      if (status === 'queued' || status === 'running') {
+        return {
+          outcome: 'held_elsewhere',
+          taskStatus: status,
+          detail: `${context} It is now "${status}": another execution holds it.`,
+        };
+      }
+
       return {
         outcome: 'not_runnable',
-        taskStatus: current?.status ?? 'unknown',
-        detail:
-          `Task ${task.id} left "ready" while the programme was reserving it; another ` +
-          'execution holds it now.',
+        taskStatus: status,
+        detail: `${context} It is now "${status}", which a programme cannot dispatch.`,
       };
     }
 
@@ -405,12 +530,16 @@ export async function reserveProgrammeTaskActivity(
 // ─── checkpoint ──────────────────────────────────────────────────────────────
 
 /**
- * Appends a checkpoint and moves the node to its terminal state, in one transaction.
+ * Appends a checkpoint, moves the node to its terminal state, and — when the workflow says
+ * a child never started — releases the reservation that start left behind.
  *
- * `(programmeId, sequence)` unique is the idempotency key: a retried write upserts the
- * same row. The node update is restricted to `pending`/`running`, so a retry cannot move a
- * node that has already been settled — and a second, different write for the same node
- * would be refused by the state predicate rather than silently overwriting.
+ * `(programmeId, sequence)` unique is the idempotency key for a **retry of this write**:
+ * the same sequence for the same node rewrites its own row. It is not authority to rewrite
+ * someone else's: `taskId` is part of the update predicate, so a `(programmeId, sequence)`
+ * collision against a row recorded for a different task is refused instead of relabelling
+ * that row's outcome and evidence under a task id it does not have. The node update is
+ * restricted to `pending`/`running`, so a retry cannot move a node that has already been
+ * settled.
  */
 export async function recordProgrammeCheckpointActivity(
   input: RecordProgrammeCheckpointInput,
@@ -420,23 +549,99 @@ export async function recordProgrammeCheckpointActivity(
   const prisma = db();
   const evidence =
     input.evidence === null ? Prisma.DbNull : (input.evidence as unknown as Prisma.InputJsonObject);
+  const finishedAt = new Date();
 
   await prisma.$transaction(async (transaction) => {
-    await transaction.programmeCheckpoint.upsert({
+    const updated = await transaction.programmeCheckpoint.updateMany({
       where: {
-        programmeId_sequence: { programmeId: input.programmeId, sequence: input.sequence },
-      },
-      create: {
-        id: deterministicId(`programme-checkpoint:${input.programmeId}:${String(input.sequence)}`),
-        orgId: input.orgId,
         programmeId: input.programmeId,
+        orgId: input.orgId,
         sequence: input.sequence,
+        // The guard the upsert did not have. Without it a sequence collision rewrites the
+        // outcome and evidence of a row that keeps the *other* task's `taskId`, so the
+        // programme's history would attribute this task's result to that task.
         taskId: input.taskId,
-        outcome: input.outcome,
-        evidence,
       },
-      update: { outcome: input.outcome, evidence },
+      data: { outcome: input.outcome, evidence },
     });
+
+    if (updated.count === 0) {
+      const occupied = await transaction.programmeCheckpoint.findFirst({
+        where: { programmeId: input.programmeId, orgId: input.orgId, sequence: input.sequence },
+        select: { taskId: true },
+      });
+
+      if (occupied !== null) {
+        // Non-retryable: the sequence is not this task's to write, and a retry would ask
+        // the same question of the same row. Naming both ids is what makes the refusal
+        // actionable — it says which node owns the checkpoint and which one asked.
+        throw nonRetryable(
+          PROGRAMME_CHECKPOINT_TASK_MISMATCH,
+          `Checkpoint ${String(input.sequence)} of programme ${input.programmeId} was recorded ` +
+            `for task ${occupied.taskId}; this write is for task ${input.taskId}. A checkpoint ` +
+            'is evidence about one node and may not be relabelled as another.',
+        );
+      }
+
+      await transaction.programmeCheckpoint.create({
+        data: {
+          id: deterministicId(
+            `programme-checkpoint:${input.programmeId}:${String(input.sequence)}`,
+          ),
+          orgId: input.orgId,
+          programmeId: input.programmeId,
+          sequence: input.sequence,
+          taskId: input.taskId,
+          outcome: input.outcome,
+          evidence,
+        },
+      });
+    }
+
+    if (input.release !== undefined) {
+      // The compensation `POST /run` performs for the same failure
+      // (`TaskService.compensateFailedStart`): the run and the **reserved** attempt are
+      // failed `start_failed`, and the task returns to `ready`. It lives here because the
+      // workflow cannot write, and because the record ("this dispatch failed") and the
+      // undo ("and here is what it left behind") must commit together.
+      //
+      // Every write is conditional, so a child that *did* start — a start whose RPC
+      // response was lost rather than a start that failed — is not relabelled:
+      //   - the run must still be `queued`: adoption moves it to `running`;
+      //   - the attempt write is guarded by `status: 'queued'` for the same reason;
+      //   - the task CAS is `queued → ready`, so a concurrent cancellation is not undone.
+      const error = { code: 'START_FAILED', message: input.release.reason };
+
+      await transaction.workflowRun.updateMany({
+        where: {
+          id: input.release.workflowRunId,
+          orgId: input.orgId,
+          taskId: input.taskId,
+          status: 'queued',
+        },
+        data: { status: 'failed', finishedAt, error: { ...error } },
+      });
+
+      await transaction.executionAttempt.updateMany({
+        where: {
+          id: input.release.attemptId,
+          orgId: input.orgId,
+          taskId: input.taskId,
+          status: 'queued',
+        },
+        data: {
+          status: 'failed',
+          finishedAt,
+          terminationReason: 'start_failed',
+          error: { ...error },
+        },
+      });
+
+      await transaction.task.updateMany({
+        where: { id: input.taskId, orgId: input.orgId, status: 'queued' },
+        data: { status: 'ready' },
+      });
+    }
 
     await transaction.programmeTask.updateMany({
       where: {
@@ -447,7 +652,7 @@ export async function recordProgrammeCheckpointActivity(
       },
       data: {
         status: NODE_STATUS_BY_OUTCOME[input.outcome],
-        finishedAt: new Date(),
+        finishedAt,
       },
     });
   });

@@ -235,7 +235,10 @@ Cancellation has three layers, and each does something different.
 2. **Temporal first.** `cancelTaskWorkflow('task-<taskId>')`. If the orchestrator is
    unreachable, the API returns `503 ORCHESTRATOR_UNAVAILABLE` and **does not** mark the
    task cancelled — a task that is cancelled in the UI while the workflow keeps working is
-   worse than a failed request.
+   worse than a failed request. If Temporal answers `not_found` — the row claims a live
+   execution and there is none — the API returns `409 EXECUTION_NOT_FOUND` and likewise
+   writes nothing. A programme-dispatched task runs under the same `task-<taskId>` id, so
+   this reaches it.
 3. Then, in one transaction: task → `cancelled`, active `WorkflowRun` →
    `cancelled` + `finishedAt`, `AuditEvent(task.cancelled)` with `orchestrator` in the
    payload.

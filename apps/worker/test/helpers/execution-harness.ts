@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-import { Client, Connection, WorkflowFailedError, WorkflowIdReusePolicy } from '@temporalio/client';
+import { Client, Connection, WorkflowFailedError, WorkflowIdReusePolicy, WorkflowNotFoundError } from '@temporalio/client';
 import type { WorkflowHandle } from '@temporalio/client';
 import type { Workflow } from '@temporalio/workflow';
 import { NativeConnection, Worker } from '@temporalio/worker';
@@ -16,6 +16,9 @@ import type { ProbeStep } from '../fixtures/probe.workflow';
  */
 const runStepsUpdateName = 'runSteps';
 const finishSignalName = 'finish';
+
+/** gRPC `NOT_FOUND`. The API maps the same code to `not_found` for a cancellation. */
+const GRPC_NOT_FOUND = 5;
 
 /**
  * Run activities inside a **real workflow execution** — Phase 6, AG-603.
@@ -105,6 +108,24 @@ export interface ExecutionHarness {
    * proved it.
    */
   executeStandalone<T = unknown>(activity: string, args: readonly unknown[]): Promise<T>;
+  /**
+   * Requests cancellation of one execution **by workflow id** — the exact RPC
+   * `POST /cancel` issues (`OrchestratorService.cancelTaskWorkflow`).
+   *
+   * `not_found` is a return value, not a throw, because the API's behaviour on it is the
+   * subject of a test: Temporal having no execution under that id is a fact the caller has
+   * to act on, and after the Phase 8.6 fix the API refuses rather than writing `cancelled`.
+   */
+  cancelWorkflow(workflowId: string): Promise<'cancelled' | 'not_found'>;
+  /**
+   * Temporal's own view of one execution, or `null` when it has none.
+   *
+   * The re-probe an operator performs from a task id. It is also how a test proves the
+   * child a programme started really reached a terminal state instead of running on.
+   */
+  describeWorkflow(
+    workflowId: string,
+  ): Promise<{ readonly status: string; readonly runId: string } | null>;
   close(): Promise<void>;
 }
 
@@ -265,6 +286,45 @@ export async function createExecutionHarness(
         });
       } catch (error) {
         throw unwrapActivityFailure(error);
+      }
+    },
+
+    /**
+     * `workflow.getHandle(id).cancel()` — the RPC the API performs.
+     *
+     * `not_found` is a return value rather than an error because "Temporal has no execution
+     * under this id" is a state the caller must act on, exactly as
+     * `OrchestratorService.cancelTaskWorkflow` treats it. The SDK converts a gRPC
+     * `NOT_FOUND` into `WorkflowNotFoundError`, so both shapes are recognised here.
+     */
+    async cancelWorkflow(workflowId: string): Promise<'cancelled' | 'not_found'> {
+      try {
+        await client.workflow.getHandle(workflowId).cancel();
+        return 'cancelled';
+      } catch (error) {
+        if (error instanceof WorkflowNotFoundError) return 'not_found';
+        if ((error as { code?: unknown }).code === GRPC_NOT_FOUND) return 'not_found';
+
+        throw error;
+      }
+    },
+
+    /**
+     * Temporal's own view of one execution — the re-probe an operator performs from a task
+     * id, and the proof that a cancelled child reached a terminal state.
+     */
+    async describeWorkflow(
+      workflowId: string,
+    ): Promise<{ readonly status: string; readonly runId: string } | null> {
+      try {
+        const description = await client.workflow.getHandle(workflowId).describe();
+
+        return { status: description.status.name, runId: description.runId };
+      } catch (error) {
+        if (error instanceof WorkflowNotFoundError) return null;
+        if ((error as { code?: unknown }).code === GRPC_NOT_FOUND) return null;
+
+        throw error;
       }
     },
 

@@ -1057,6 +1057,24 @@ export class TasksService {
       throw error;
     }
 
+    if (orchestrator === 'not_found') {
+      // The row says the task is queued/running, so it claims a live execution — and the
+      // execution named by the deterministic workflow id does not exist. Refusing is the
+      // same posture as the unreachable arm above, for the same reason: writing `cancelled`
+      // here would mark a task cancelled in the UI while an execution the API cannot name
+      // keeps working, and a later `task.succeeded.v1` would flip the run back to succeeded.
+      // If no execution exists, there is nothing to cancel; the row needs an operator, not a
+      // status write.
+      throw new AppError(
+        409,
+        'EXECUTION_NOT_FOUND',
+        `No execution named "${WORKFLOW_ID_PREFIX}${taskId}" exists in the orchestrator. ` +
+          'The task was not cancelled: marking it cancelled locally while its execution ' +
+          'cannot be reached would produce a task that is cancelled in the UI and working ' +
+          'in the background.',
+      );
+    }
+
     await this.prisma.$transaction(async (transaction) => {
       await transaction.task.updateMany({
         // Tenant scoping, and the status guard keeps the compare-and-swap honest.
