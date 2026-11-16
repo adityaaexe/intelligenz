@@ -33,7 +33,7 @@
 | **R-18** | Dependency classification | **PASS** | 3 advisories: 1 low, 2 moderate (`glob >=9.0.0 <=14.0.1`, `minimatch >=7.0.0 <11.0.1`, both patched). **0 critical, 0 high.** Both are glob-matching libraries used by tooling, not request-path code. |
 | **R-19** | Backup / restore | **BLOCKED** | No backup target, no restore drill. A backup never restored is not a recovery process. |
 | **R-20** | Independent final-SHA review | **PARTIAL** | Gate G reviewed at `39063b9`/`c6eb96f` with 7 rounds. Phase 7's own work (Gate M, host assessment) has **not** had an independent review of this SHA. |
-| **R-21** | Documentation and evidence index | **PASS** | Phase 6: 14/14. Phase 7: this matrix, `HOST-PRIVILEGE-ASSESSMENT.md`, `GATE-M-SUMMARY.md`, `EVIDENCE-INDEX-PHASE7.md`. |
+| **R-21** | Documentation and evidence index | **PARTIAL** | Phase 6: 14/14 verified present. Phase 7: `PHASE7-GATE-MATRIX.md` and `HOST-PRIVILEGE-ASSESSMENT.md` exist and were verified. **`GATE-M-SUMMARY.md` and `EVIDENCE-INDEX-PHASE7.md` do not exist** — this row previously claimed four documents and measured two, which is a false citation of exactly the class G-21 exists to catch. Corrected in Phase 8 rather than deleted, so the error stays visible. |
 | **R-22** | Production-readiness recommendation | **NO-GO** | See below. |
 
 ## Why R-22 is NO-GO, stated once
