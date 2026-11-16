@@ -98,7 +98,12 @@ export interface DetectOptions {
   readonly timeoutMs?: number;
 }
 
-const SETUP_REMEDIATION =
+/**
+ * The one remediation string for "this host or this process is not delegated". Exported
+ * because the execution-enforcement gate refuses with the same instruction — an operator
+ * who sees two different commands for one problem will run the wrong one.
+ */
+export const SETUP_REMEDIATION =
   'Run: sudo bash infra/scripts/setup-cgroups.sh (once), then start the worker with ' +
   'sudo bash infra/scripts/worker-with-cgroup.sh so it runs inside the delegated cgroup.';
 

@@ -1,0 +1,359 @@
+{
+  "schemaVersion": 1,
+  "programme": "INTELLIGENZ",
+  "branch": "phase-6/trust-boundary-closure",
+  "head": "1cf3c58893c30e8e3ccf9310496d43d8019b72db",
+  "phase": "8.3",
+  "createdAt": "2026-11-16T03:30:00.000Z",
+  "updatedAt": "2026-11-16T07:12:00.000Z",
+  "tasks": [
+    {
+      "id": "P83-001",
+      "title": "Refuse to start a worker that cannot enforce: execution-enforcement gate at boot",
+      "phase": "8.3",
+      "dependsOn": [],
+      "riskClass": "critical",
+      "executionPolicy": {
+        "enforcement": "fail-closed",
+        "gate": "EXECUTION_ENFORCEMENT_UNAVAILABLE",
+        "rationale": "A worker outside its delegated cgroup executes every task with rlimit-only enforcement while the record still looks complete; refusing at boot is the only way the absence stays visible."
+      },
+      "acceptanceCriteria": [
+        "A worker started outside the delegated subtree exits non-zero before opening a Temporal connection.",
+        "The refusal names the actual cgroup, the expected cgroup path and every failing check.",
+        "A correctly launched worker (infra/scripts/worker-with-cgroup.sh) verifies and polls.",
+        "The opt-out exists, is configurable, defaults to off, and is documented as control-plane only."
+      ],
+      "evidenceRequirement": {
+        "kind": "test",
+        "artifact": "apps/worker/test/execution-enforcement.test.ts",
+        "note": "29 tests: parsing, path-segment containment, controller and limit refusals, the source-order assertion that the gate precedes NativeConnection.connect, and the real-host verdict."
+      },
+      "owner": "node-developer",
+      "status": "completed",
+      "createdAt": "2026-11-16T06:00:00.000Z",
+      "updatedAt": "2026-11-16T07:00:00.000Z"
+    },
+    {
+      "id": "P83-002",
+      "title": "Dispose test-owned cgroup leaves on every path and reconcile the leftovers",
+      "phase": "8.3",
+      "dependsOn": [],
+      "riskClass": "high",
+      "executionPolicy": {
+        "enforcement": "fail-closed",
+        "gate": "reconcile-test-cgroups",
+        "rationale": "A leaked leaf keeps charging the delegation root and can hold a live process; cleanup that returns a boolean nobody reads is not a cleanup path."
+      },
+      "acceptanceCriteria": [
+        "A leaf is killed, verified empty and removed on success, assertion failure, timeout and forced child termination.",
+        "rmdir is never attempted while cgroup.procs is non-empty.",
+        "Reconciliation deletes only names the test suites produce; the launcher leaf and workspace-id leaves are refused.",
+        "The three leaves recorded in IO-ENFORCEMENT-PROOF.md section 8 are each measured and resolved or refused."
+      ],
+      "evidenceRequirement": {
+        "kind": "test",
+        "artifact": "apps/worker/test/cgroup-cleanup.test.ts",
+        "note": "16 tests, including the refusal to rmdir a non-empty leaf, the refusal when cgroup.procs cannot be read, and the name allowlist that excludes worker and UUID leaves."
+      },
+      "owner": "node-developer",
+      "status": "completed",
+      "createdAt": "2026-11-16T06:00:00.000Z",
+      "updatedAt": "2026-11-16T07:12:00.000Z"
+    },
+    {
+      "id": "P83-003",
+      "title": "Remove passwordless sudo from the uid that runs the worker",
+      "phase": "8.4",
+      "dependsOn": [],
+      "riskClass": "critical",
+      "executionPolicy": {
+        "enforcement": "advisory",
+        "gate": "none",
+        "rationale": "This is a sudoers change on a live host; no code gate can carry it and the change requires operator authorisation before it is applied."
+      },
+      "acceptanceCriteria": [
+        "sudo -n true exits non-zero for the worker uid.",
+        "Password sudo still works for the four bootstrap scripts, proven in a new session.",
+        "A sudoers backup exists and its restore path is written down before the change."
+      ],
+      "evidenceRequirement": {
+        "kind": "attestation",
+        "artifact": "docs/engineering/phase8-host-boundary/HOST-PRIVILEGE-INVENTORY.md",
+        "note": "Steps 1 and 2 of the remediation sequence; needs authorisation per section 7."
+      },
+      "owner": "host-operator",
+      "status": "blocked",
+      "createdAt": "2026-11-16T03:30:00.000Z",
+      "updatedAt": "2026-11-16T03:30:00.000Z"
+    },
+    {
+      "id": "P83-004",
+      "title": "Split broker and sandbox identities so peer credentials discriminate",
+      "phase": "8.4",
+      "dependsOn": [
+        "P83-003"
+      ],
+      "riskClass": "critical",
+      "executionPolicy": {
+        "enforcement": "fail-closed",
+        "gate": "broker-peer-credential",
+        "rationale": "The broker socket currently accepts the worker and the sandbox as the same peer, so SO_PEERCRED cannot distinguish the two and an authorisation check on it would be theatre."
+      },
+      "acceptanceCriteria": [
+        "izbroker and izsandbox exist as separate nologin identities.",
+        "The broker socket is 0660 izbroker:izsandbox and the peer uid is checked on connect.",
+        "The worker uid cannot read the credential store by path."
+      ],
+      "evidenceRequirement": {
+        "kind": "test",
+        "artifact": "packages/egress-broker",
+        "note": "A broker test that asserts a connect from each uid, with the worker refused."
+      },
+      "owner": "security-architect",
+      "status": "blocked",
+      "createdAt": "2026-11-16T03:30:00.000Z",
+      "updatedAt": "2026-11-16T03:30:00.000Z"
+    },
+    {
+      "id": "P83-005",
+      "title": "Execute the authored CI workflow against a real Temporal service",
+      "phase": "8.4",
+      "dependsOn": [],
+      "riskClass": "high",
+      "executionPolicy": {
+        "enforcement": "advisory",
+        "gate": "none",
+        "rationale": "The workflow is authored and has never run; a pipeline that has never executed is a configuration file, not a gate."
+      },
+      "acceptanceCriteria": [
+        "The workflow runs to completion once on a push or a manual dispatch.",
+        "The run proves the Temporal-dependent suites execute rather than skip.",
+        "The skip budget reporter is visible in the job log."
+      ],
+      "evidenceRequirement": {
+        "kind": "document",
+        "artifact": ".github/workflows/ci.yml",
+        "note": "Needs a git remote and a push credential; see PHASE7-GATE-MATRIX.md R-17."
+      },
+      "owner": "devops",
+      "status": "blocked",
+      "createdAt": "2026-11-16T03:30:00.000Z",
+      "updatedAt": "2026-11-16T03:30:00.000Z"
+    },
+    {
+      "id": "P83-006",
+      "title": "Prove a backup restores by performing an isolated restore drill",
+      "phase": "8.4",
+      "dependsOn": [],
+      "riskClass": "high",
+      "executionPolicy": {
+        "enforcement": "advisory",
+        "gate": "none",
+        "rationale": "A backup that has never been restored is not a recovery process, and the drill needs a destination this host does not have."
+      },
+      "acceptanceCriteria": [
+        "A backup is taken, restored into an isolated database, and queried for a known tenant row.",
+        "The restore duration and the recovery point are recorded.",
+        "The drill is repeatable from a documented script."
+      ],
+      "evidenceRequirement": {
+        "kind": "measurement",
+        "artifact": "docs/engineering/phase8-host-boundary/PHASE8-BASELINE.md",
+        "note": "Gate recorded BLOCKED; needs a destination and an authorisation."
+      },
+      "owner": "database-reliability-engineer",
+      "status": "blocked",
+      "createdAt": "2026-11-16T03:30:00.000Z",
+      "updatedAt": "2026-11-16T03:30:00.000Z"
+    },
+    {
+      "id": "P83-007",
+      "title": "Apply io.max inside per-attempt leaves, not only the worker leaf",
+      "phase": "8.4",
+      "dependsOn": [
+        "P83-001"
+      ],
+      "riskClass": "high",
+      "executionPolicy": {
+        "enforcement": "fail-closed",
+        "gate": "EXECUTION_ENFORCEMENT_UNAVAILABLE",
+        "rationale": "The I/O proof measured the worker leaf; agent workloads run in per-attempt leaves, where io.max has never been applied and would otherwise be assumed from the parent's numbers."
+      },
+      "acceptanceCriteria": [
+        "An attempt leaf carries io.max for the configured device before the process starts.",
+        "A write beyond the limit is throttled inside the attempt leaf and recorded.",
+        "Read bandwidth and iops dimensions are measured or explicitly excluded."
+      ],
+      "evidenceRequirement": {
+        "kind": "measurement",
+        "artifact": "apps/worker/test/io-limits.test.ts",
+        "note": "Extends the existing suite; section 7 of IO-ENFORCEMENT-PROOF.md lists this as not established."
+      },
+      "owner": "node-developer",
+      "status": "planned",
+      "createdAt": "2026-11-16T03:30:00.000Z",
+      "updatedAt": "2026-11-16T03:30:00.000Z"
+    },
+    {
+      "id": "P83-008",
+      "title": "Prove per-attempt accounting under two concurrent attempts",
+      "phase": "8.4",
+      "dependsOn": [
+        "P83-001"
+      ],
+      "riskClass": "moderate",
+      "executionPolicy": {
+        "enforcement": "fail-closed",
+        "gate": "EXECUTION_ENFORCEMENT_UNAVAILABLE",
+        "rationale": "Every measurement so far is a single attempt; cross-attempt accounting in one parent cgroup is unmeasured and would show up as a wrong cpu_time_ms on a real attempt."
+      },
+      "acceptanceCriteria": [
+        "Two attempts run simultaneously in separate leaves and each records only its own usage.",
+        "Neither attempt's kill affects the other's process tree.",
+        "The parent's subtree-wide counters are reconciled against the two children."
+      ],
+      "evidenceRequirement": {
+        "kind": "test",
+        "artifact": "apps/worker/test/cpu-budget.test.ts",
+        "note": "Section 5 item 1 of CPU-MEMORY-ENFORCEMENT-PROOF.md records this as unproven."
+      },
+      "owner": "node-developer",
+      "status": "planned",
+      "createdAt": "2026-11-16T03:30:00.000Z",
+      "updatedAt": "2026-11-16T03:30:00.000Z"
+    },
+    {
+      "id": "P83-009",
+      "title": "Decide and enforce a swap policy for agent workloads",
+      "phase": "8.4",
+      "dependsOn": [],
+      "riskClass": "high",
+      "executionPolicy": {
+        "enforcement": "advisory",
+        "gate": "none",
+        "rationale": "Swap is fully consumed on this host, there is no per-workload swap policy, and a memory limit interacting with an exhausted swap device is untested."
+      },
+      "acceptanceCriteria": [
+        "The policy is stated: swap allowed, bounded, or denied for agent workloads.",
+        "memory.swap.max is set per attempt and read back, or its absence is recorded.",
+        "An attempt under memory pressure is classified the same way twice."
+      ],
+      "evidenceRequirement": {
+        "kind": "measurement",
+        "artifact": "docs/engineering/phase8-host-boundary/HOST-PRIVILEGE-INVENTORY.md",
+        "note": "Section 5 records swap at 100 percent of 4 GiB."
+      },
+      "owner": "sre-site-reliability-engineer",
+      "status": "planned",
+      "createdAt": "2026-11-16T03:30:00.000Z",
+      "updatedAt": "2026-11-16T03:30:00.000Z"
+    },
+    {
+      "id": "P83-010",
+      "title": "Independent review of the Phase 7 and Phase 8 SHA",
+      "phase": "8.4",
+      "dependsOn": [
+        "P83-001",
+        "P83-002"
+      ],
+      "riskClass": "high",
+      "executionPolicy": {
+        "enforcement": "advisory",
+        "gate": "none",
+        "rationale": "Gate G had seven independent rounds and Phase 7 had none; the gate this phase added is itself unreviewed by anyone but its author."
+      },
+      "acceptanceCriteria": [
+        "A reviewer who did not write the gate reads apps/worker/src/execution-enforcement.ts and its tests.",
+        "Every claim in the Phase 8 documents is checked against the repository, not the transcript.",
+        "Findings are recorded with severity and disposition."
+      ],
+      "evidenceRequirement": {
+        "kind": "review",
+        "artifact": "docs/engineering/phase6-trust-boundary/FINAL-INDEPENDENT-REVIEW.md",
+        "note": "The Phase 6 review is the template; R-20 is PARTIAL for Phase 7 and Phase 8."
+      },
+      "owner": "reviewer",
+      "status": "planned",
+      "createdAt": "2026-11-16T03:30:00.000Z",
+      "updatedAt": "2026-11-16T03:30:00.000Z"
+    },
+    {
+      "id": "P83-011",
+      "title": "Write the two Phase 7 documents the matrix claims",
+      "phase": "8.4",
+      "dependsOn": [],
+      "riskClass": "low",
+      "executionPolicy": {
+        "enforcement": "advisory",
+        "gate": "none",
+        "rationale": "R-21 cites GATE-M-SUMMARY.md and EVIDENCE-INDEX-PHASE7.md; neither exists, which is the documentation defect class the claim audit exists for."
+      },
+      "acceptanceCriteria": [
+        "Both files exist under docs/engineering/phase7-host-boundary/ and are cited from R-21.",
+        "Every file reference in the Phase 7 and Phase 8 documents resolves on disk.",
+        "R-21 moves from PARTIAL only when the filesystem agrees."
+      ],
+      "evidenceRequirement": {
+        "kind": "document",
+        "artifact": "docs/engineering/phase7-host-boundary/PHASE7-GATE-MATRIX.md",
+        "note": "R-21 was corrected to PARTIAL in Phase 8 rather than deleted, so the gap stays visible."
+      },
+      "owner": "technical-writer",
+      "status": "planned",
+      "createdAt": "2026-11-16T03:30:00.000Z",
+      "updatedAt": "2026-11-16T03:30:00.000Z"
+    }
+  ],
+  "pendingTasks": [
+    "P83-003",
+    "P83-004",
+    "P83-005",
+    "P83-006",
+    "P83-007",
+    "P83-008",
+    "P83-009",
+    "P83-010",
+    "P83-011"
+  ],
+  "completedTasks": [
+    "P83-001",
+    "P83-002"
+  ],
+  "history": [
+    {
+      "at": "2026-11-16T03:30:00.000Z",
+      "summary": "Phase 8 baseline: the Phase 7 matrix was reconciled against the filesystem, two cited documents were confirmed absent, and R-21 was corrected to PARTIAL rather than deleted.",
+      "evidence": [
+        "docs/engineering/phase8-host-boundary/PHASE8-BASELINE.md",
+        "docs/engineering/phase7-host-boundary/PHASE7-GATE-MATRIX.md"
+      ]
+    },
+    {
+      "at": "2026-11-16T04:10:00.000Z",
+      "summary": "R-11 measured at the full tier through the documented launcher: 16 passed, 0 skipped, the three cgroup kill tests executed. The remaining boundary was that nothing refused a worker started outside the leaf.",
+      "evidence": [
+        "docs/engineering/phase8-host-boundary/CPU-MEMORY-ENFORCEMENT-PROOF.md",
+        "apps/worker/test/cpu-budget.test.ts"
+      ]
+    },
+    {
+      "at": "2026-11-16T05:20:00.000Z",
+      "summary": "R-13 measured on block device 259:0: write bandwidth enforced on a real process and read back from io.max. Per-attempt enforcement and read bandwidth recorded as not established.",
+      "evidence": [
+        "docs/engineering/phase8-host-boundary/IO-ENFORCEMENT-PROOF.md"
+      ]
+    },
+    {
+      "at": "2026-11-16T06:45:00.000Z",
+      "summary": "The boot gate landed: a worker outside the delegated subtree now exits non-zero before opening a Temporal connection, and a correctly launched one verifies. Leaf hygiene added; oom-684210-31881 was empty and removed, cpu-budget-857041-28855 holds a live process and was refused, oom3-687854 matches no test naming pattern and was refused.",
+      "evidence": [
+        "apps/worker/src/execution-enforcement.ts",
+        "apps/worker/test/execution-enforcement.test.ts",
+        "apps/worker/src/cgroup-hygiene.ts",
+        "apps/worker/test/cgroup-cleanup.test.ts",
+        "infra/scripts/reconcile-test-cgroups.ts"
+      ]
+    }
+  ]
+}

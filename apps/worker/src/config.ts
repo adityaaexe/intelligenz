@@ -96,6 +96,22 @@ export interface WorkerConfig {
      * delegated; the capability probe reads this path and nothing else.
      */
     readonly cgroupRoot: string;
+    /**
+     * `WORKER_ALLOW_UNENFORCED_EXECUTION` — the documented escape hatch from the boot-time
+     * execution-enforcement gate. **Default: false.**
+     *
+     * Off by default because the gate protects the one property the platform cannot
+     * observe from inside itself: whether the process that executes tasks is actually
+     * inside the delegated cgroup. A worker outside it runs every task with rlimit-only
+     * enforcement and records `rlimit-only` — the record is honest, the enforcement is
+     * absent, and nothing else notices. So the only process that may take this flag is one
+     * that does not execute tasks: a control-plane or diagnostics process, a migration
+     * runner, a queue-observation probe. A worker that polls a task queue must never take
+     * it by default, because the flag would then be indistinguishable from a normal boot
+     * and its absence of enforcement would be invisible in exactly the way this gate was
+     * built to end.
+     */
+    readonly allowUnenforcedExecution: boolean;
     /** `WORKER_RESOURCE_PROFILE` — an operator override of the selection policy. */
     readonly profile: ResourceProfileName | undefined;
     /**
@@ -530,6 +546,9 @@ export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerCo
     },
     resources: {
       cgroupRoot: readString(env, 'WORKER_CGROUP_ROOT', '/sys/fs/cgroup/intelligenz'),
+      // Not `readBoolean(..., true)` and not "warn only": see the field comment. A gate
+      // that is on by default and off by configuration is a gate in name only.
+      allowUnenforcedExecution: readBoolean(env, 'WORKER_ALLOW_UNENFORCED_EXECUTION', false),
       profile: readResourceProfile(env),
       reaperIntervalMs: readInteger(env, 'WORKER_REAPER_INTERVAL_MS', 60_000),
       reaperEnabled: readBoolean(env, 'WORKER_REAPER_ENABLED', true),

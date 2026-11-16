@@ -18,8 +18,8 @@ import {
   ioControllerDelegated,
   readIoMax,
   readIoStat,
-  removeCgroup,
 } from '../src/cgroup';
+import { disposeLeaf, makeLeafId } from '../src/cgroup-hygiene';
 import { measureDisk, mentionsNoSpace } from '../src/activities/execute-agent';
 import { RESOURCE_PROFILES, cpuCeilingFor } from '../src/resource-profiles';
 import { classifyTermination, statusForTermination } from '../src/termination';
@@ -146,8 +146,7 @@ async function leaseProbeVolume(set: VolumeSet): Promise<VolumeLease> {
   return claimed;
 }
 
-const unique = (label: string): string =>
-  `${label}-${String(process.pid)}-${String(Date.now() % 100_000)}`;
+const unique = (label: string): string => makeLeafId(label);
 
 describe.skipIf(SET === null)('io.max — configuration and read-back', () => {
   it('accepts a bytes-per-second ceiling on the volume device and reports what the kernel kept', async () => {
@@ -179,7 +178,7 @@ describe.skipIf(SET === null)('io.max — configuration and read-back', () => {
       const readBack = await readIoMax(handle);
       expect(readBack.find((entry) => entry.device === volume.device)).toEqual(effective);
     } finally {
-      await removeCgroup(handle);
+      await disposeLeaf(handle);
     }
   });
 
@@ -192,7 +191,7 @@ describe.skipIf(SET === null)('io.max — configuration and read-back', () => {
       );
       await expect(applyIoMax(handle, { device: '7:6' })).rejects.toThrow(/no limits/);
     } finally {
-      await removeCgroup(handle);
+      await disposeLeaf(handle);
     }
   });
 });
@@ -301,8 +300,8 @@ describe.skipIf(SET === null || TIER !== 'full')('io.max — measured throughput
         );
       }
     } finally {
-      await removeCgroup(baselineHandle);
-      await removeCgroup(throttledHandle);
+      await disposeLeaf(baselineHandle);
+      await disposeLeaf(throttledHandle);
       await rm(baselineProbe, { force: true });
       await rm(throttledProbe, { force: true });
     }

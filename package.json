@@ -26,6 +26,9 @@
     "dev": "bash infra/scripts/dev.sh",
     "db:bootstrap": "bash infra/scripts/bootstrap-db.sh",
     "temporal:start": "bash infra/scripts/start-temporal.sh",
+    "programme:check": "tsx packages/contracts/src/programme-check.ts",
+    "cgroups:reconcile": "tsx infra/scripts/reconcile-test-cgroups.ts",
+    "enforcement:check": "tsx infra/scripts/execution-enforcement-probe.ts",
     "verify": "bash infra/scripts/verify.sh"
   },
   "devDependencies": {

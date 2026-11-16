@@ -15,6 +15,7 @@ import {
   readUsage,
   removeCgroup,
 } from '../src/cgroup';
+import { disposeLeaf, makeLeafId } from '../src/cgroup-hygiene';
 import { RESOURCE_PROFILES } from '../src/resource-profiles';
 
 /**
@@ -38,8 +39,7 @@ import { RESOURCE_PROFILES } from '../src/resource-profiles';
 
 import { ROOT, SELF_CGROUP, TIER as tier } from './helpers/cgroup-tier';
 
-const unique = (label: string): string =>
-  `${label}-${String(process.pid)}-${String(Date.now() % 100000)}`;
+const unique = (label: string): string => makeLeafId(label);
 
 describe.skipIf(tier === 'unavailable')('cgroup v2 enforcement (tier: limits)', () => {
   it('writes the profile limits and reads back exactly what the kernel accepted', async () => {
@@ -64,7 +64,7 @@ describe.skipIf(tier === 'unavailable')('cgroup v2 enforcement (tier: limits)', 
       expect(effective.cpuQuotaMicros).toBe(profile.cpuQuotaMicros);
       expect(effective.cpuPeriodMicros).toBe(profile.cpuPeriodMicros);
     } finally {
-      await removeCgroup(handle);
+      await disposeLeaf(handle);
     }
   });
 
@@ -92,7 +92,7 @@ describe.skipIf(tier === 'unavailable')('cgroup v2 enforcement (tier: limits)', 
       expect(usage.oomKills).toBe(0);
       expect(usage.pidsEventsMax).toBe(0);
     } finally {
-      await removeCgroup(handle);
+      await disposeLeaf(handle);
     }
   });
 
@@ -114,7 +114,7 @@ describe.skipIf(tier === 'unavailable')('cgroup v2 enforcement (tier: limits)', 
       expect(effective.swapMax).toBe('0');
       expect(effective.memoryMax).toBe(String(32 * 1024 * 1024));
     } finally {
-      await removeCgroup(handle);
+      await disposeLeaf(handle);
     }
   });
 
@@ -168,7 +168,7 @@ describe.skipIf(tier !== 'full')('cgroup v2 enforcement (tier: full)', () => {
 
       expect(nested.exitCode).toBe(0);
     } finally {
-      await removeCgroup(handle);
+      await disposeLeaf(handle);
     }
   }, 20_000);
 
@@ -251,7 +251,7 @@ describe.skipIf(tier !== 'full')('cgroup v2 enforcement (tier: full)', () => {
       // The process was killed by the kernel, not by us: no `cgroup.kill` was sent.
       expect(outcome.exitCode).not.toBe(0);
     } finally {
-      await removeCgroup(handle);
+      await disposeLeaf(handle);
     }
   }, 30_000);
 
@@ -287,7 +287,7 @@ describe.skipIf(tier !== 'full')('cgroup v2 enforcement (tier: full)', () => {
       expect(usage.pidsPeak).toBeGreaterThan(0);
       expect(usage.pidsPeak).toBeLessThanOrEqual(6);
     } finally {
-      await removeCgroup(handle);
+      await disposeLeaf(handle);
     }
   }, 30_000);
 
@@ -320,7 +320,7 @@ describe.skipIf(tier !== 'full')('cgroup v2 enforcement (tier: full)', () => {
       // `usage_usec` is the authority; the millisecond column is a rounding of it.
       expect(usage.cpuTimeMs).toBe(Math.round(usage.cpuUsageUs / 1000));
     } finally {
-      await removeCgroup(handle);
+      await disposeLeaf(handle);
     }
   });
 
@@ -344,7 +344,7 @@ describe.skipIf(tier !== 'full')('cgroup v2 enforcement (tier: full)', () => {
       expect(effective.pidsMax).toBe('2');
       expect(effective.cpuMax).toBe('1000 100000');
     } finally {
-      await removeCgroup(handle);
+      await disposeLeaf(handle);
     }
   });
 
@@ -378,8 +378,8 @@ describe.skipIf(tier !== 'full')('cgroup v2 enforcement (tier: full)', () => {
       expect(a.cpuUsageUs).toBeGreaterThan(0);
       expect(b.cpuUsageUs).toBe(0);
     } finally {
-      await removeCgroup(first);
-      await removeCgroup(second);
+      await disposeLeaf(first);
+      await disposeLeaf(second);
     }
   }, 20_000);
 });

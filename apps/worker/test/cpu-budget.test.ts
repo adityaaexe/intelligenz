@@ -13,13 +13,13 @@ import {
   killCgroup,
   readCpuUsageUs,
   readUsage,
-  removeCgroup,
   startCpuBudgetWatch,
   type CgroupHandle,
   type CgroupUsage,
   type CpuBudgetSample,
   type CpuBudgetWatch,
 } from '../src/cgroup';
+import { disposeLeaf, makeLeafId } from '../src/cgroup-hygiene';
 import {
   RESOURCE_PROFILES,
   checkCpuBudget,
@@ -46,8 +46,7 @@ import { ROOT, TIER, TIER_REASON } from './helpers/cgroup-tier';
  * printed reason rather than mocked: a budget kill that did not happen is not evidence.
  */
 
-const unique = (label: string): string =>
-  `${label}-${String(process.pid)}-${String(Date.now() % 100_000)}`;
+const unique = (label: string): string => makeLeafId(label);
 
 function limitsFor(profile: ResourceProfile): Parameters<typeof applyLimits>[1] {
   return {
@@ -617,8 +616,10 @@ describe.skipIf(TIER !== 'full')('CPU budget — descendant accounting in a real
       expect((parentUsage ?? 0) - before).toBeGreaterThanOrEqual(childUsage ?? 0);
       expect((parentUsage ?? 0) - before).toBeGreaterThan(0);
     } finally {
-      await removeCgroup(child, { attempts: 5, delayMs: 20 }).catch(() => undefined);
-      await removeCgroup(parent, { attempts: 5, delayMs: 20 }).catch(() => undefined);
+      // Child first: `rmdir` on a parent with a live child cgroup fails with ENOTEMPTY,
+      // and the signed `removeCgroup` here was the silent kind — it reported `false`.
+      await disposeLeaf(child);
+      await disposeLeaf(parent);
     }
   }, 30_000);
 });
@@ -721,7 +722,7 @@ describe.skipIf(TIER !== 'full')('CPU budget — enforced against a real cgroup'
       ).toBe('cpu');
     } finally {
       watch.stop();
-      await removeCgroup(handle);
+      await disposeLeaf(handle);
     }
   }, 150_000);
 
@@ -781,7 +782,7 @@ describe.skipIf(TIER !== 'full')('CPU budget — enforced against a real cgroup'
       expect(statusForTermination(verdict)).toBe('succeeded');
     } finally {
       watch.stop();
-      await removeCgroup(handle);
+      await disposeLeaf(handle);
     }
   }, 60_000);
 });

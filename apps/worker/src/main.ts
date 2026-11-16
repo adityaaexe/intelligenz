@@ -9,6 +9,11 @@ import {
   type WorkerConfig,
 } from './config';
 import { describeCgroupCapability, getCgroupCapability } from './capabilities';
+import {
+  ExecutionEnforcementError,
+  assertExecutionEnforcement,
+  describeExecutionEnforcement,
+} from './execution-enforcement';
 import { createLogger, serializeError, type WorkerLogger } from './logger';
 import { createTemporalProbe, startReaper, type ReaperHandle } from './reaper';
 import { RESOURCE_PROFILES } from './resource-profiles';
@@ -22,6 +27,11 @@ import { getAgentRuntime } from './runtime';
  * A worker that starts happily with no engine to poll is worse than one that refuses:
  * workflows queue up and nothing reports it. The connection is established *before* the
  * worker is created, and a failure exits non-zero with an actionable message.
+ *
+ * The same rule applies to enforcement, and it is stricter: a worker that is not inside
+ * its delegated cgroup is refused **before** the connection is opened. `pnpm dev` outside
+ * `infra/scripts/worker-with-cgroup.sh` is not a degraded worker, it is a worker that
+ * cannot bound a single task — see `execution-enforcement.ts`.
  *
  * ## Structured logs only
  *
@@ -90,6 +100,57 @@ async function main(): Promise<void> {
     },
     describeCgroupCapability(cgroup),
   );
+
+  // ── Execution enforcement gate: may this process execute tasks at all? ──────
+  //
+  // The probe above answers "can this host enforce". It does not answer "is this process
+  // in the right place to use that ability", and this worker used to treat the first
+  // answer as the second: it warned and continued. A worker started with `pnpm dev`
+  // therefore ran every task with rlimit-only enforcement while every test still passed.
+  //
+  // So the gate runs here — **before** the Temporal connection is opened, let alone a
+  // worker registered on the task queue — and a refusal exits non-zero. The process is
+  // then unavailable for dispatch rather than degraded: a worker that accepts work it
+  // cannot bound is worse than one that does not accept it at all.
+  if (config.resources.allowUnenforcedExecution) {
+    // Deliberate, documented, and never the default. Only a control-plane process may
+    // take this; a worker that polls a task queue must not, because the absence of
+    // enforcement would then be invisible in exactly the way this gate exists to end.
+    logger.warn(
+      { flag: 'WORKER_ALLOW_UNENFORCED_EXECUTION', cgroupMode: cgroup.mode },
+      'execution enforcement gate DISABLED by operator flag — this process must not execute tasks',
+    );
+  } else {
+    try {
+      const enforcement = await assertExecutionEnforcement({
+        root: config.resources.cgroupRoot,
+        capability: cgroup,
+      });
+
+      logger.info(
+        {
+          actualCgroup: enforcement.actualCgroup,
+          expectedCgroupPath: enforcement.expectedCgroupPath,
+          controllers: enforcement.controllers,
+          limits: enforcement.limits,
+        },
+        describeExecutionEnforcement(enforcement),
+      );
+    } catch (error) {
+      if (!(error instanceof ExecutionEnforcementError)) throw error;
+
+      logger.error(
+        error.toDiagnostic(),
+        'execution enforcement unavailable — refusing to register with Temporal',
+      );
+
+      // `return` before any connection or `Worker.create`: no task can be dispatched to a
+      // process that never polls. The non-zero code is what a supervisor restarts on; a
+      // zero-exit refusal would look like a clean shutdown to systemd and to CI.
+      process.exitCode = 1;
+      return;
+    }
+  }
 
   const runtime = getAgentRuntime(config);
   const [capabilities, health] = await Promise.all([runtime.capabilities(), runtime.health()]);
