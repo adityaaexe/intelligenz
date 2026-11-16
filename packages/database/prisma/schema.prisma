@@ -43,6 +43,11 @@
 // programme is always created with its graph in one transaction, so there is no legacy
 // row that would need an invented graph.
 //
+// Phase 8.7 adds the proposal layer: `Plan` and `PlanStatus`, one table and one enum, all
+// additive. A plan is what a planner proposed and what a human decided about it; it is
+// *not* a schedule. `Programme` still records only what is scheduled, and the only writer
+// that turns one into the other is `POST /plans/:id/submit`.
+//
 // Prisma 7: the connection URL lives in `prisma.config.ts`, not in this file.
 
 generator client {
@@ -157,6 +162,23 @@ enum ProgrammeTaskStatus {
   cancelled
 }
 
+/// Phase 8.7. The proposal lifecycle, deliberately *not* `ProgrammeStatus`.
+///
+/// `proposed` and `invalid` are what the planner produced; `approved` and `rejected` are
+/// what a human decided; `submitted` means the approved content was materialised into
+/// tasks and a programme. Nothing else may create execution rows: approval alone does not,
+/// and only `submit` reads `approved`.
+///
+/// Append-only, same rule as the other enums: a Postgres enum label is positional on disk
+/// and renaming one is a table rewrite.
+enum PlanStatus {
+  proposed
+  invalid
+  approved
+  rejected
+  submitted
+}
+
 enum Environment {
   prod
   staging
@@ -225,6 +247,9 @@ model Organization {
   programmes           Programme[]
   programmeTasks       ProgrammeTask[]
   programmeCheckpoints ProgrammeCheckpoint[]
+
+  /// Phase 8.7: proposals made in this tenant.
+  plans Plan[]
 }
 
 model Workspace {
@@ -257,6 +282,11 @@ model User {
   createdTasks       Task[]            @relation("TaskCreatedBy")
   requestedApprovals ApprovalRequest[] @relation("ApprovalRequestedBy")
   decidedApprovals   ApprovalRequest[] @relation("ApprovalDecidedBy")
+  // Phase 8.7. Restrict on all three: a person who proposed or decided a plan is part of
+  // its history, and deleting the account must not erase who approved what.
+  createdPlans       Plan[]            @relation("PlanCreatedBy")
+  approvedPlans      Plan[]            @relation("PlanApprovedBy")
+  rejectedPlans      Plan[]            @relation("PlanRejectedBy")
 }
 
 model Membership {
@@ -289,6 +319,8 @@ model Project {
   tasks        Task[]
   auditEvents  AuditEvent[]
   programmes   Programme[]
+  /// Phase 8.7: proposals scoped to this project.
+  plans        Plan[]
 
   @@unique([workspaceId, key])
   @@index([orgId])
@@ -982,6 +1014,8 @@ model Programme {
 
   tasks       ProgrammeTask[]
   checkpoints ProgrammeCheckpoint[]
+  /// Phase 8.7: the approval that authorised this programme, if it came from a plan.
+  plan        Plan?
 
   // Submission idempotency. Scoped by org: two tenants may use the same client key.
   @@unique([orgId, idempotencyKey])
@@ -1068,4 +1102,86 @@ model ProgrammeCheckpoint {
   @@index([programmeId, taskId])
   // Foreign-key maintenance for the Restrict reference above.
   @@index([taskId])
+}
+
+/// One proposal by a planner, and the human decision about it.
+///
+/// ## Why this table exists beside `Programme`
+///
+/// `Programme` records what is scheduled. A `Plan` records what was *proposed* — the
+/// model's output, the deterministic validation of it, and the approval that authorises
+/// materialisation. Keeping them apart is what makes "the planner proposes, a human
+/// authorises, the workflow executes" checkable rather than aspirational: there is a row
+/// that exists between the proposal and the schedule, and it carries who approved which
+/// bytes.
+///
+/// ## Provenance is a server column, never a proposal field
+///
+/// `provider`, `providerModel` and `simulated` are columns here because the proposal is
+/// stored as untrusted JSON. The model's response cannot populate them — `ProposedPlanV1`
+/// is strict and has no such keys — and the API writes them from the provider
+/// implementation that actually made the call.
+///
+/// ## `approvedContentHash` is nullable until a decision exists
+///
+/// A proposal that never reached a decision was never approved, so there is no content it
+/// authorises. Back-filling a hash on approval would invent a review; a null is the honest
+/// state and is why submission refuses a plan whose status is not `approved` before it ever
+/// looks at the hash.
+///
+/// ## Delete behaviour
+///
+/// The organisation, project and programme references cascade/set-null: pruning a project
+/// or a programme must not destroy the approval record, so `programmeId` is `SetNull`. The
+/// three user references are `Restrict`, matching `ApprovalRequest`: a person who proposed
+/// or decided a plan is named in its history, and deleting the account would erase it.
+model Plan {
+  id          String     @id @default(uuid())
+  orgId       String
+  projectId   String
+  /// The objective the planner was given, as it was given. Bounded by the proposal schema.
+  objective   String
+  status      PlanStatus @default(proposed)
+  /// The provider implementation's name (`http-llm`). Written by the API, never the model.
+  provider    String
+  /// The configured model id, or null when the provider has none.
+  providerModel String?
+  /// True unless the provider actually performed a model call. Defaults to true.
+  simulated   Boolean    @default(true)
+  /// The validated `ProposedPlanV1`. Untrusted input, stored verbatim for review.
+  proposal    Json
+  /// `{ ok, issues }` from `validateProposedPlan` at proposal time. Recomputed on submit.
+  validation  Json
+  /// sha256 of `canonicalPlanContent(proposal)`, written when the decision is recorded.
+  /// Recomputed at submission and compared; a mismatch refuses. Nullable because a
+  /// proposal that never reached a decision was never approved.
+  approvedContentHash String?
+  approvedById       String?
+  approvedAt         DateTime?
+  approvalExpiresAt  DateTime?
+  rejectedById       String?
+  decidedAt          DateTime?
+  decisionNote       String?
+  /// Set exactly once, by submission, under a conditional update on `status = 'approved'`.
+  programmeId        String?  @unique
+  createdById        String
+  /// Client key scoped by organisation: two tenants may use the same value.
+  idempotencyKey     String
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  project      Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  createdBy    User         @relation("PlanCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  approvedBy   User?        @relation("PlanApprovedBy", fields: [approvedById], references: [id], onDelete: Restrict)
+  rejectedBy   User?        @relation("PlanRejectedBy", fields: [rejectedById], references: [id], onDelete: Restrict)
+  /// SetNull: pruning a programme must not destroy the approval that authorised it.
+  programme    Programme?   @relation(fields: [programmeId], references: [id], onDelete: SetNull)
+
+  // Proposal idempotency. Scoped by org for the same reason as `Programme`.
+  @@unique([orgId, idempotencyKey])
+  // The tenant's review queue, filtered by state.
+  @@index([orgId, status])
+  // "What was proposed recently" — the default list order.
+  @@index([orgId, createdAt])
 }

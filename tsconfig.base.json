@@ -8,6 +8,7 @@
     "baseUrl": ".",
     "paths": {
       "@intelligenz/contracts": ["packages/contracts/src/index.ts"],
+      "@intelligenz/contracts/plan-hash": ["packages/contracts/src/plan-hash.ts"],
       "@intelligenz/database": ["packages/database/src/index.ts"],
       "@intelligenz/design-system": ["packages/design-system/src/index.ts"],
       "@intelligenz/agent-runtime": ["packages/agent-runtime/src/index.ts"],
