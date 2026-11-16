@@ -7,7 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { loadConfig } from '../src/config/app-config';
 import type { ApiErrorBody, DataBody, TaskBody } from './helpers/api-types';
 import type { Suite, TemporalProbe } from './helpers/app';
-import { authHeaders, login, probeTemporal, startSuite } from './helpers/app';
+import { authHeaders, createTestApp, login, probeTemporal, startSuite } from './helpers/app';
 import { optionalEnv } from './helpers/env';
 
 /**
@@ -44,6 +44,13 @@ const taskQueue = `intelligenz-programme-api-test-${randomUUID().slice(0, 8)}`;
 
 const startedWorkflowIds: string[] = [];
 
+/**
+ * A second application pointed at an address nothing listens on, so the
+ * `ORCHESTRATOR_UNAVAILABLE` branch is deterministic instead of depending on whether this
+ * host happens to have a Temporal server running.
+ */
+let offline: { app: Awaited<ReturnType<typeof createTestApp>>; close(): Promise<void> };
+
 beforeAll(async () => {
   const base = loadConfig();
 
@@ -54,6 +61,22 @@ beforeAll(async () => {
       temporal: { ...base.temporal, taskQueue },
     },
   });
+
+  offline = await (async () => {
+    const app = await createTestApp({
+      // One attempt: the 503 is the assertion, so a retry can only leave a timer pending
+      // for `app.close()` to turn into `Channel has been shut down`.
+      temporal: {
+        address: '127.0.0.1:1',
+        namespace: 'default',
+        taskQueue: 'intelligenz-tasks',
+        rpcMaxAttempts: 1,
+      },
+      readinessTimeoutMs: 1_000,
+    });
+
+    return { app, close: () => app.close() };
+  })();
 
   ownerToken = await login(suite.app, suite.fixtures.users.ownerA.email);
   memberToken = await login(suite.app, suite.fixtures.users.memberA.email);
@@ -83,6 +106,7 @@ afterAll(async () => {
     }
   }
 
+  await offline.close();
   await suite.close();
 });
 
@@ -416,5 +440,379 @@ describe('programme submission', () => {
 
     const body = response.body as CreatedProgrammeBody;
     startedWorkflowIds.push(`programme-${body.data.programmeId}`);
+  }, 30_000);
+});
+
+/**
+ * `POST /v1/orgs/:orgId/programmes/:programmeId/cancel` — stopping a programme.
+ *
+ * This suite has no worker polling the programme queue, so a submitted programme stays
+ * `pending` with `startedAt = null`. That is not a gap in the test: it is exactly the
+ * branch where the API owns the terminal state, because no execution will ever run to
+ * write it. The branch where a *started* programme is closed by its workflow is proved in
+ * `apps/worker/test/programme-cancellation.test.ts`, against a real worker and a real
+ * database.
+ *
+ * What is asserted here:
+ *
+ *   - a MEMBER can cancel a programme that never started, and the row is closed by the API
+ *     with `failureCode = CANCELLED`, one audit event, and no objective in the payload;
+ *   - a terminal programme is refused with `409 PROGRAMME_NOT_CANCELLABLE`, nothing written;
+ *   - another organisation's programme is a `404`, never a `403`;
+ *   - an unknown id is a `404`;
+ *   - a second cancellation answers `200 already_cancelled` and does not move `finishedAt`.
+ */
+describe('programme cancellation', () => {
+  interface CancelBody {
+    data: {
+      programmeId: string;
+      cancellation: string;
+      recordedBy?: string;
+    };
+  }
+
+  function cancel(
+    token: string,
+    programmeId: string,
+    orgId: string = suite.fixtures.orgA.id,
+  ): request.Test {
+    return request(suite.app.getHttpServer())
+      .post(`/v1/orgs/${orgId}/programmes/${programmeId}/cancel`)
+      .set(authHeaders(token, orgId));
+  }
+
+  it('cancels a programme that never started, records CANCELLED, and answers 202', async (context) => {
+    if (!temporal.ok) {
+      // The cancellation request goes to the orchestrator before any row is written; with
+      // no orchestrator the endpoint answers 503 by design. A silent pass would claim a
+      // behaviour that was never exercised.
+      context.skip(temporal.reason);
+    }
+
+    const a = await createTask(memberToken, 'Cancel A', ['Done when the test passes.']);
+    const b = await createTask(memberToken, 'Cancel B', ['Done when the test passes.']);
+    const objective = 'A member cancels a programme before it starts.';
+
+    const submitted = await submit(memberToken, {
+      projectId: suite.fixtures.projectA,
+      objective,
+      tasks: [
+        { taskId: a, dependsOn: [] },
+        { taskId: b, dependsOn: [a] },
+      ],
+    });
+
+    expect(submitted.status).toBe(202);
+
+    const { programmeId } = (submitted.body as CreatedProgrammeBody).data;
+    startedWorkflowIds.push(`programme-${programmeId}`);
+
+    const response = await cancel(memberToken, programmeId);
+
+    expect(response.status).toBe(202);
+    expect((response.body as CancelBody).data).toEqual({
+      programmeId,
+      cancellation: 'cancelled_before_start',
+      recordedBy: 'api',
+    });
+
+    const row = await suite.prisma.programme.findUniqueOrThrow({
+      where: { id: programmeId },
+    });
+
+    expect(row.status).toBe('cancelled');
+    expect(row.failureCode).toBe('CANCELLED');
+    expect(row.failureReason).toContain('no task was dispatched');
+    expect(row.startedAt).toBeNull();
+    expect(row.finishedAt).not.toBeNull();
+
+    // One event, attributable to the caller, and it names the writer. The objective is
+    // deliberately absent: the submission event already carries it, and an audit row that
+    // echoed programme content would make every cancellation a second copy of it.
+    const events = await suite.prisma.auditEvent.findMany({
+      where: { aggregateId: programmeId, eventType: 'programme.cancel_requested.v1' },
+    });
+
+    expect(events).toHaveLength(1);
+    expect(events[0]?.actorId).toBe(suite.fixtures.users.memberA.id);
+    expect(events[0]?.idempotencyKey).toBe(`programme.cancel_requested:${programmeId}`);
+    expect(events[0]?.payload).toMatchObject({
+      programmeId,
+      actorId: suite.fixtures.users.memberA.id,
+      recordedBy: 'api',
+      previousStatus: 'pending',
+    });
+    expect(JSON.stringify(events[0]?.payload)).not.toContain(objective);
+  }, 30_000);
+
+  it('hands a started programme to its workflow: 202 requested, and the API writes no status', async (context) => {
+    if (!temporal.ok) {
+      context.skip(temporal.reason);
+    }
+
+    const a = await createTask(ownerToken, 'Started A', ['Done when the test passes.']);
+
+    const submitted = await submit(ownerToken, {
+      projectId: suite.fixtures.projectA,
+      objective: 'A started programme is closed by its workflow, not by the API.',
+      tasks: [{ taskId: a, dependsOn: [] }],
+    });
+
+    expect(submitted.status).toBe(202);
+
+    const { programmeId } = (submitted.body as CreatedProgrammeBody).data;
+    startedWorkflowIds.push(`programme-${programmeId}`);
+
+    // Forced, and stated: no worker polls this queue, so `loadProgrammeActivity` never
+    // runs. This is exactly the pair of columns that activity writes on its first call
+    // (`status: 'running'`, `startedAt`), and the branch under test is "the scheduler has
+    // taken the row".
+    const startedAt = new Date();
+    await suite.prisma.programme.update({
+      where: { id: programmeId },
+      data: { status: 'running', startedAt },
+    });
+
+    const response = await cancel(ownerToken, programmeId);
+
+    expect(response.status).toBe(202);
+    expect((response.body as CancelBody).data).toEqual({
+      programmeId,
+      cancellation: 'requested',
+      recordedBy: 'workflow',
+    });
+
+    // The API wrote **nothing** to the status: the workflow's own non-cancellable scope
+    // records `cancelled` when it observes the cancellation, and two writers for one
+    // terminal state is the failure this branch exists to avoid.
+    const row = await suite.prisma.programme.findUniqueOrThrow({ where: { id: programmeId } });
+
+    expect(row.status).toBe('running');
+    expect(row.failureCode).toBeNull();
+    expect(row.finishedAt).toBeNull();
+    expect(row.startedAt?.getTime()).toBe(startedAt.getTime());
+
+    const events = await suite.prisma.auditEvent.findMany({
+      where: { aggregateId: programmeId, eventType: 'programme.cancel_requested.v1' },
+    });
+
+    expect(events).toHaveLength(1);
+    expect(events[0]?.payload).toMatchObject({
+      programmeId,
+      recordedBy: 'workflow',
+      previousStatus: 'running',
+    });
+  }, 30_000);
+
+  it('refuses a programme that already succeeded, leaving the row untouched', async (context) => {
+    if (!temporal.ok) {
+      context.skip(temporal.reason);
+    }
+
+    const a = await createTask(ownerToken, 'Succeeded A', ['Done when the test passes.']);
+
+    const submitted = await submit(ownerToken, {
+      projectId: suite.fixtures.projectA,
+      objective: 'A programme that already finished has nothing to stop.',
+      tasks: [{ taskId: a, dependsOn: [] }],
+    });
+
+    expect(submitted.status).toBe(202);
+
+    const { programmeId } = (submitted.body as CreatedProgrammeBody).data;
+    startedWorkflowIds.push(`programme-${programmeId}`);
+
+    // Forced, and stated: no worker polls this queue, so the row cannot reach `succeeded`
+    // on its own here. The endpoint's contract is about the row's state, not about how it
+    // got there — the transition itself is covered by the worker suite.
+    const finishedAt = new Date();
+    await suite.prisma.programme.update({
+      where: { id: programmeId },
+      data: { status: 'succeeded', startedAt: finishedAt, finishedAt, failureCode: null },
+    });
+
+    const response = await cancel(ownerToken, programmeId);
+
+    expect(response.status).toBe(409);
+    expect((response.body as ApiErrorBody).error.code).toBe('PROGRAMME_NOT_CANCELLABLE');
+    expect((response.body as ApiErrorBody).error.message).toContain('succeeded');
+
+    const row = await suite.prisma.programme.findUniqueOrThrow({ where: { id: programmeId } });
+
+    expect(row.status).toBe('succeeded');
+    expect(row.failureCode).toBeNull();
+    expect(row.finishedAt?.getTime()).toBe(finishedAt.getTime());
+
+    // Nothing written: a refusal is not a cancellation request.
+    expect(
+      await suite.prisma.auditEvent.count({
+        where: { aggregateId: programmeId, eventType: 'programme.cancel_requested.v1' },
+      }),
+    ).toBe(0);
+  }, 30_000);
+
+  it('answers 404, not 403, for another organisation’s programme', async () => {
+    // The programme exists, in organisation B. From organisation A's route it must not
+    // resolve: a 403 would confirm the id is real, which is an existence oracle across
+    // tenants.
+    const foreign = await suite.prisma.programme.create({
+      data: {
+        orgId: suite.fixtures.orgB.id,
+        projectId: suite.fixtures.projectB,
+        objective: 'Belongs to the other tenant.',
+        idempotencyKey: `foreign-programme-${randomUUID()}`,
+      },
+      select: { id: true },
+    });
+
+    const response = await cancel(ownerToken, foreign.id);
+
+    expect(response.status).toBe(404);
+    expect((response.body as ApiErrorBody).error.code).toBe('NOT_FOUND');
+
+    const row = await suite.prisma.programme.findUniqueOrThrow({ where: { id: foreign.id } });
+    expect(row.status).toBe('pending');
+    expect(row.finishedAt).toBeNull();
+  }, 30_000);
+
+  it('answers 404 for a programme that does not exist', async () => {
+    const response = await cancel(ownerToken, randomUUID());
+
+    expect(response.status).toBe(404);
+    expect((response.body as ApiErrorBody).error.code).toBe('NOT_FOUND');
+  }, 30_000);
+
+  it('refuses with 409 when the row claims an execution Temporal does not have', async (context) => {
+    if (!temporal.ok) {
+      context.skip(temporal.reason);
+    }
+
+    // The state `POST /programmes` leaves when its start failed but the row was not marked
+    // failed: `running` with `startedAt`, and nothing in Temporal under `programme-<id>`.
+    // Written directly rather than constructed through a failure, because the endpoint's
+    // contract is about the row's state and `submit` compensates that state today.
+    const a = await createTask(ownerToken, 'No execution A', ['Done when the test passes.']);
+
+    const programme = await suite.prisma.programme.create({
+      data: {
+        orgId: suite.fixtures.orgA.id,
+        projectId: suite.fixtures.projectA,
+        objective: 'A row that claims a scheduler Temporal does not have.',
+        status: 'running',
+        startedAt: new Date(),
+        idempotencyKey: `no-execution-${randomUUID()}`,
+      },
+      select: { id: true },
+    });
+
+    await suite.prisma.programmeTask.create({
+      data: {
+        orgId: suite.fixtures.orgA.id,
+        programmeId: programme.id,
+        taskId: a,
+        dependsOn: [],
+      },
+    });
+
+    const response = await cancel(ownerToken, programme.id);
+
+    expect(response.status).toBe(409);
+    expect((response.body as ApiErrorBody).error.code).toBe('EXECUTION_NOT_FOUND');
+
+    const row = await suite.prisma.programme.findUniqueOrThrow({ where: { id: programme.id } });
+
+    // Refusing means writing nothing: a programme marked cancelled whose scheduler cannot
+    // be reached is the failure `task.cancel` refuses for the same reason.
+    expect(row.status).toBe('running');
+    expect(row.finishedAt).toBeNull();
+    expect(
+      await suite.prisma.auditEvent.count({
+        where: { aggregateId: programme.id, eventType: 'programme.cancel_requested.v1' },
+      }),
+    ).toBe(0);
+  }, 30_000);
+
+  it('refuses with 503 while the orchestrator is unreachable, writing nothing', async () => {
+    const a = await createTask(ownerToken, 'Offline cancel A', ['Done when the test passes.']);
+
+    const programme = await suite.prisma.programme.create({
+      data: {
+        orgId: suite.fixtures.orgA.id,
+        projectId: suite.fixtures.projectA,
+        objective: 'A cancellation attempted while the orchestrator is down.',
+        status: 'running',
+        startedAt: new Date(),
+        idempotencyKey: `offline-cancel-${randomUUID()}`,
+      },
+      select: { id: true },
+    });
+
+    await suite.prisma.programmeTask.create({
+      data: {
+        orgId: suite.fixtures.orgA.id,
+        programmeId: programme.id,
+        taskId: a,
+        dependsOn: [],
+      },
+    });
+
+    const response = await request(offline.app.getHttpServer())
+      .post(`/v1/orgs/${suite.fixtures.orgA.id}/programmes/${programme.id}/cancel`)
+      .set(authHeaders(ownerToken, suite.fixtures.orgA.id));
+
+    expect(response.status).toBe(503);
+    expect((response.body as ApiErrorBody).error.code).toBe('ORCHESTRATOR_UNAVAILABLE');
+
+    const row = await suite.prisma.programme.findUniqueOrThrow({ where: { id: programme.id } });
+
+    expect(row.status).toBe('running');
+    expect(row.finishedAt).toBeNull();
+  }, 30_000);
+
+  it('answers a second cancellation with 200 already_cancelled and does not move finishedAt', async (context) => {
+    if (!temporal.ok) {
+      context.skip(temporal.reason);
+    }
+
+    const a = await createTask(ownerToken, 'Double cancel A', ['Done when the test passes.']);
+
+    const submitted = await submit(ownerToken, {
+      projectId: suite.fixtures.projectA,
+      objective: 'Cancel the same programme twice.',
+      tasks: [{ taskId: a, dependsOn: [] }],
+    });
+
+    expect(submitted.status).toBe(202);
+
+    const { programmeId } = (submitted.body as CreatedProgrammeBody).data;
+    startedWorkflowIds.push(`programme-${programmeId}`);
+
+    const first = await cancel(ownerToken, programmeId);
+    expect(first.status).toBe(202);
+
+    const cancelled = await suite.prisma.programme.findUniqueOrThrow({
+      where: { id: programmeId },
+    });
+
+    const second = await cancel(ownerToken, programmeId);
+
+    expect(second.status).toBe(200);
+    expect((second.body as CancelBody).data).toEqual({
+      programmeId,
+      cancellation: 'already_cancelled',
+    });
+
+    const after = await suite.prisma.programme.findUniqueOrThrow({ where: { id: programmeId } });
+
+    expect(after.status).toBe('cancelled');
+    // A second write would move this. Equality is the assertion that it did not happen.
+    expect(after.finishedAt?.getTime()).toBe(cancelled.finishedAt?.getTime());
+
+    // And no second event: the deterministic key names one cancellation.
+    expect(
+      await suite.prisma.auditEvent.count({
+        where: { aggregateId: programmeId, eventType: 'programme.cancel_requested.v1' },
+      }),
+    ).toBe(1);
   }, 30_000);
 });
