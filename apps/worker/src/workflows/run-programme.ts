@@ -72,7 +72,10 @@ import { runTaskWorkflow } from './run-task';
  *   - **concurrency** — at most `maxConcurrent` children in flight (default 1; see
  *     `RunProgrammeWorkflowInput.maxConcurrent` for why the default is not higher);
  *   - **deadline** — `deadlineAt` is a soft ceiling: no new node is dispatched after it,
- *     and the programme is finished `timed_out` with whatever it had;
+ *     and the programme is finished `timed_out` with whatever it had. The comparison is
+ *     `now >= deadline`, so the instant itself counts as exceeded. A `deadlineAt` that does
+ *     not parse is **not** "no deadline": it is treated as already exceeded, because a
+ *     malformed input must fail closed;
  *   - **history** — Continue-As-New before Temporal's own suggestion, at a checkpoint
  *     boundary where no child is in flight. The trigger is the SDK's suggestion (actual
  *     history growth) or, failing that, a checkpoint count for **this execution**
@@ -221,7 +224,9 @@ async function drive(input: RunProgrammeWorkflowInput): Promise<RunProgrammeWork
       code: 'GRAPH_INVALID',
       prose: `GRAPH_INVALID: ${reason}`,
     });
-    return summarise(state);
+    // `failed` is what was committed. Every node is still `pending` here, so a status
+    // derived from them would say `blocked` and disagree with the row.
+    return summarise(state, 'failed');
   }
 
   await reconcileInterruptedNodes(state, input);
@@ -229,6 +234,20 @@ async function drive(input: RunProgrammeWorkflowInput): Promise<RunProgrammeWork
   const deadline = Date.parse(input.deadlineAt);
   const maxConcurrent = clampConcurrency(input.maxConcurrent);
   const continueAfterCheckpoints = clampContinueAfter(input.continueAfterCheckpoints);
+
+  // Fail closed. `Date.parse` answers `NaN` for anything it cannot read, and every
+  // comparison with `NaN` is false — so treating it as "no deadline" would let a
+  // malformed input run the whole programme with no bound at all. `deadlineAt` is required
+  // in the input, which means there is no legitimate "no deadline" state to preserve.
+  if (!Number.isFinite(deadline)) {
+    await finish(state, input, 'timed_out', {
+      code: 'DEADLINE_EXCEEDED',
+      prose:
+        `DEADLINE_EXCEEDED: deadlineAt is not a date (${describeDeadlineValue(input.deadlineAt)}); ` +
+        'treated as already passed, so no node was dispatched.',
+    });
+    return summarise(state, 'timed_out');
+  }
 
   for (;;) {
     // ── Blocked cascade: dependents of a failure can never run ──────────────
@@ -247,7 +266,9 @@ async function drive(input: RunProgrammeWorkflowInput): Promise<RunProgrammeWork
         code: 'DEADLINE_EXCEEDED',
         prose: 'DEADLINE_EXCEEDED: no node was dispatched after the deadline.',
       });
-      return summarise(state);
+      // The same override as the invalid-deadline path: the verdict was decided here, not
+      // derived from nodes that are all still `pending`.
+      return summarise(state, 'timed_out');
     }
 
     if (shouldContinueAsNew(state, continueAfterCheckpoints)) {
@@ -742,13 +763,28 @@ function reasonFor(
   return { code: 'UNSPECIFIED', prose: 'Work remains that could not be scheduled.' };
 }
 
-function summarise(state: ProgrammeActivityState): RunProgrammeWorkflowResult {
+/**
+ * The result the workflow returns — counts from the node states, status from `committed`
+ * when the workflow decided it itself.
+ *
+ * Two paths commit a status they chose rather than derived: the deadline (`timed_out`) and
+ * an invalid graph (`failed`). On both, every node may still be `pending`, so a derived
+ * status would report `blocked` while the durable row says otherwise. A workflow result that
+ * contradicts its own row is the inconsistency this layer exists to remove, so those two
+ * paths pass `committed`. The normal end of the loop passes nothing: there the verdict
+ * **is** the node states. `NO_READY_NODE` also passes nothing, because its derived value is
+ * already `blocked`.
+ */
+function summarise(
+  state: ProgrammeActivityState,
+  committed?: ProgrammeRunStatus,
+): RunProgrammeWorkflowResult {
   const statuses = state.nodes.map((node) => state.status.get(node.taskId) ?? 'pending');
   const count = (status: ProgrammeNodeStatus): number =>
     statuses.filter((candidate) => candidate === status).length;
 
   return {
-    status: programmeStatus(state),
+    status: committed ?? programmeStatus(state),
     succeeded: count('succeeded'),
     failed: count('failed') + count('cancelled'),
     blocked: count('blocked') + count('waiting_for_approval') + count('pending'),
@@ -786,6 +822,22 @@ function clampContinueAfter(requested: number | undefined): number {
   }
 
   return Math.min(Math.max(Math.trunc(requested), 1), MAX_CONTINUE_AFTER_CHECKPOINTS);
+}
+
+/**
+ * The invalid `deadlineAt` as a short quoted excerpt.
+ *
+ * The reason is written to `Programme.failureReason` and to an audit event, so the value is
+ * truncated instead of echoed: a caller can send a megabyte in that field, and a log line
+ * that repeats it is a log line an operator cannot read. `JSON.stringify` supplies the
+ * quotes **and** escapes control characters, so a value containing a newline cannot forge a
+ * second line in the reason.
+ */
+function describeDeadlineValue(value: unknown): string {
+  const text = typeof value === 'string' ? value : String(value);
+  const excerpt = text.length > 40 ? `${text.slice(0, 40)}…` : text;
+
+  return JSON.stringify(excerpt);
 }
 
 function isTerminalProgrammeStatus(

@@ -697,10 +697,10 @@ describe.skipIf(!enabled)(
       });
 
       const result = (await handle.result()) as RunProgrammeWorkflowResult;
-      // `result.status` is deliberately not asserted: `RunProgrammeWorkflowResult.status` is
-      // derived from node states, and on this path every node is still `pending`, so it
-      // reports `blocked`. The **row** is the record the API returns and the record the code
-      // is written to, and that is what this test is about.
+      // The row and the return value together: this path commits `timed_out`, so the result
+      // must say `timed_out` rather than a status derived from nodes that are all still
+      // `pending` — which is what it reported before P87-012.
+      expect(result.status).toBe('timed_out');
       expect(result.checkpoints).toBe(0);
 
       const programme = await client.programme.findUniqueOrThrow({

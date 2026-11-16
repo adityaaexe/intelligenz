@@ -146,6 +146,17 @@ export interface ExecutionHarness {
    * no run id joins, and therefore what `handle.result()` returns.
    */
   describeRun(workflowId: string, runId?: string): Promise<WorkflowRunDescription | null>;
+  /**
+   * The arguments one run was **started** with, decoded from its own history.
+   *
+   * `handle.result()` proves what a workflow returned; it cannot prove what the next
+   * generation was handed. A Continue-As-New crossing re-starts the workflow with the
+   * payload recorded in `WorkflowExecutionStartedEventAttributes.input`, so reading that
+   * payload is the only way to assert a value survived the boundary rather than being
+   * recomputed. The payloads are decoded with the default `json/plain` encoding — the
+   * converter this client serialised them with — and not guessed from the code path.
+   */
+  startedWith(workflowId: string, runId: string): Promise<readonly unknown[]>;
   close(): Promise<void>;
 }
 
@@ -394,6 +405,40 @@ export async function createExecutionHarness(
 
         throw error;
       }
+    },
+
+    /**
+     * The arguments one run was started with, read from its own history.
+     *
+     * Only `json/plain` is accepted: any other encoding means the run was started with a
+     * converter this helper does not understand, and decoding it anyway would be a guess
+     * dressed as a fact.
+     */
+    async startedWith(workflowId: string, runId: string): Promise<readonly unknown[]> {
+      const handle = client.workflow.getHandle(workflowId, runId);
+      const history = await handle.fetchHistory();
+
+      const started = (history.events ?? []).find(
+        (event) => event.workflowExecutionStartedEventAttributes != null,
+      )?.workflowExecutionStartedEventAttributes;
+
+      const payloads = started?.input?.payloads ?? [];
+
+      return payloads.map((payload) => {
+        const encoding = payload.metadata?.['encoding'];
+        if (encoding !== undefined && Buffer.from(encoding).toString('utf8') !== 'json/plain') {
+          throw new Error(
+            `run ${runId} was started with encoding "${Buffer.from(encoding).toString('utf8')}", not json/plain`,
+          );
+        }
+
+        const bytes = payload.data;
+        if (bytes === undefined || bytes === null) {
+          throw new Error(`run ${runId} carries a payload with no data`);
+        }
+
+        return JSON.parse(Buffer.from(bytes).toString('utf8')) as unknown;
+      });
     },
 
     /**
