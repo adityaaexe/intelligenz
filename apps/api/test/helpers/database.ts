@@ -79,6 +79,12 @@ const TRUNCATE_TABLES = [
   'Artifact',
   'AgentRun',
   'WorkflowRun',
+  // Phase 8.6. Before `Task`: `ProgrammeTask` and `ProgrammeCheckpoint` reference it with
+  // ON DELETE RESTRICT. `CASCADE` would cover the FK, but the list is the record of what a
+  // suite expects to empty, and a programme row left behind is state a later test reads.
+  'ProgrammeCheckpoint',
+  'ProgrammeTask',
+  'Programme',
   'Task',
   'Project',
   'Workspace',

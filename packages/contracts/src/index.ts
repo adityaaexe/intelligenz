@@ -14,3 +14,4 @@ export * from './approval';
 export * from './execution';
 export * from './isolation';
 export * from './programme';
+export * from './programme-graph';

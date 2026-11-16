@@ -200,8 +200,10 @@ async function main(): Promise<void> {
     namespace: config.temporal.namespace,
     taskQueue: config.temporal.taskQueue,
     // Type-only imports keep Prisma and `node:fs` out of the sandboxed workflow bundle;
-    // the bundler follows only this path (ADR-003).
-    workflowsPath: require.resolve('./workflows/run-task'),
+    // the bundler follows only this path (ADR-003). The barrel re-exports both workflows:
+    // `runTaskWorkflow` and the Phase 8.6 parent `runProgrammeWorkflow` that dispatches it
+    // as a child.
+    workflowsPath: require.resolve('./workflows/index'),
     activities,
     maxConcurrentActivityTaskExecutions: config.maxConcurrentActivities,
     shutdownGraceTime: SHUTDOWN_GRACE_TIME,

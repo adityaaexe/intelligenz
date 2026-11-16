@@ -32,6 +32,17 @@
 //   - every Phase 3 column added to a Phase 2 table is nullable or defaulted, so
 //     existing rows survive the migration unaltered.
 //
+// Phase 8.6 adds the programme layer: three tables and two enums, all additive.
+//
+// `POST /run` starts exactly one task workflow and ends. Nothing dispatches task B when
+// task A completes, and no row says "these tasks are one objective". A `Programme` is
+// that row, `ProgrammeTask` is the dependency graph, and `ProgrammeCheckpoint` is the
+// ordered record of what the parent workflow observed.
+//
+// Deliberately back-fill-free: every existing `Task` stays valid and unparented. A
+// programme is always created with its graph in one transaction, so there is no legacy
+// row that would need an invented graph.
+//
 // Prisma 7: the connection URL lives in `prisma.config.ts`, not in this file.
 
 generator client {
@@ -113,6 +124,39 @@ enum ActorType {
   system
 }
 
+/// Lifecycle of a programme — one submitted objective, executed as a dependency graph of
+/// tasks. `blocked` is reserved for "work remains and nothing can run" (a task waiting for
+/// an approval, or a graph that never became eligible); `failed` means at least one task
+/// failed. The two are different operator situations and collapsing them hides which.
+///
+/// Append-only, same rule as `ApprovalStatus`: a Postgres enum label is positional on
+/// disk, and renaming one is a table rewrite.
+enum ProgrammeStatus {
+  pending
+  running
+  succeeded
+  failed
+  blocked
+  cancelled
+  timed_out
+}
+
+/// Per-node state inside a programme. Distinct from `TaskStatus` on purpose: a task is
+/// `ready` on the board while its programme node is `pending` behind a dependency. The two
+/// vocabularies answer different questions and are never derived from one another.
+///
+/// `waiting_for_approval` is terminal for this run's scheduler but not a failure: nothing
+/// is blocked by it except its own dependents, and a human still has to approve.
+enum ProgrammeTaskStatus {
+  pending
+  running
+  succeeded
+  failed
+  blocked
+  waiting_for_approval
+  cancelled
+}
+
 enum Environment {
   prod
   staging
@@ -177,6 +221,10 @@ model Organization {
   executionWorkspaces ExecutionWorkspace[]
   executionAttempts   ExecutionAttempt[]
   toolInvocations     ToolInvocation[]
+
+  programmes           Programme[]
+  programmeTasks       ProgrammeTask[]
+  programmeCheckpoints ProgrammeCheckpoint[]
 }
 
 model Workspace {
@@ -240,6 +288,7 @@ model Project {
   workspace    Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   tasks        Task[]
   auditEvents  AuditEvent[]
+  programmes   Programme[]
 
   @@unique([workspaceId, key])
   @@index([orgId])
@@ -303,6 +352,9 @@ model Task {
 
   executionWorkspaces ExecutionWorkspace[]
   executionAttempts   ExecutionAttempt[]
+
+  programmeTasks       ProgrammeTask[]
+  programmeCheckpoints ProgrammeCheckpoint[]
 
   @@unique([projectId, idempotencyKey])
   @@index([orgId])
@@ -888,4 +940,131 @@ model AuditEvent {
   @@index([orgId, occurredAt])
   @@index([aggregateType, aggregateId])
   @@index([orgId, idempotencyKey])
+}
+
+// ─── Programmes (Phase 8.6) ──────────────────────────────────────────────────
+//
+// The scheduling layer that did not exist. `POST /run` starts one task workflow and
+// ends; a `Programme` is the durable statement that several tasks are one objective, and
+// `ProgrammeTask.dependsOn` is the only dependency edge in the system.
+//
+// The parent workflow reads this graph, dispatches the existing `runTaskWorkflow` as
+// children, and records what it observed. It does **not** authorise execution: the claim,
+// the approval binding and the evidence capture stay inside the task workflow, untouched.
+
+/// One submitted objective, executed as a graph of existing tasks.
+///
+/// `idempotencyKey` is required, not optional like `Task.idempotencyKey`: a programme
+/// submission starts a durable parent workflow, and "submit twice while the first is
+/// being accepted" is the one duplicate that must not create two schedules. `(orgId,
+/// idempotencyKey)` makes the second submission return the first programme instead.
+model Programme {
+  id             String          @id @default(uuid())
+  orgId          String
+  projectId      String
+  /// The human statement of what this programme is for. Not parsed, not executed.
+  objective      String
+  status         ProgrammeStatus @default(pending)
+  idempotencyKey String
+  /// Why the programme stopped when it did, when the reason is not a task failure
+  /// (`ORCHESTRATOR_UNAVAILABLE` at submission, `DEADLINE_EXCEEDED`, `GRAPH_INVALID`).
+  /// A failed programme with no reason is unattributable a week later.
+  failureReason  String?
+  /// Set by the parent workflow's first activity, not by the API: "the scheduler is
+  /// running" is a fact only the scheduler can report.
+  startedAt      DateTime?
+  finishedAt     DateTime?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  project      Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  tasks       ProgrammeTask[]
+  checkpoints ProgrammeCheckpoint[]
+
+  // Submission idempotency. Scoped by org: two tenants may use the same client key.
+  @@unique([orgId, idempotencyKey])
+  // The tenant's programme list, newest first.
+  @@index([orgId, createdAt])
+  // "What is running in this project right now" — the board query.
+  @@index([projectId, status])
+}
+
+/// One node of a programme's graph.
+///
+/// `dependsOn` holds **task ids**, not `ProgrammeTask` ids. That choice is load-bearing:
+/// the graph is authored by whoever submits the programme (a human today, a planner
+/// later), and the author knows task ids because the tasks already exist. Server-minted
+/// `ProgrammeTask` ids would force a two-step "create nodes, then wire them" API for no
+/// benefit. `@@unique([programmeId, taskId])` makes the reference unambiguous.
+model ProgrammeTask {
+  id           String              @id @default(uuid())
+  orgId        String
+  programmeId  String
+  taskId       String
+  /// Task ids this node waits for. Validated for cycles, self-dependency, duplicates and
+  /// missing members before anything is dispatched; the array is stored verbatim.
+  dependsOn    String[]            @default([])
+  status       ProgrammeTaskStatus @default(pending)
+  /// How many times the programme reserved an execution attempt for this node. Written
+  /// as an assignment from the workflow's deterministic attempt number, never as `+1`,
+  /// so a retried activity cannot inflate it.
+  attemptCount Int                 @default(0)
+  startedAt    DateTime?
+  finishedAt   DateTime?
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  programme    Programme    @relation(fields: [programmeId], references: [id], onDelete: Cascade)
+  // Restrict: a task that a programme scheduled is part of that programme's record.
+  // Deleting it would leave a graph with an unresolved reference, so the delete is
+  // refused instead. Tenant teardown removes programme rows first (see the test helper).
+  task         Task         @relation(fields: [taskId], references: [id], onDelete: Restrict)
+
+  // One node per task per programme. Also the lookup the dispatcher makes before it
+  // reserves anything.
+  @@unique([programmeId, taskId])
+  // The readiness scan: "which nodes of this programme are still pending".
+  @@index([programmeId, status])
+  // Foreign-key maintenance for the Restrict reference above.
+  @@index([taskId])
+}
+
+/// Append-only record of what the parent workflow observed, in order.
+///
+/// `sequence` is 1-based, allocated by the workflow (which knows how many it has already
+/// written) and made unique per programme, so a retried write is an upsert rather than a
+/// duplicate. The checkpoint is the durable answer to "what happened, in what order" —
+/// the E2E asserts it instead of asserting that the workflow returned.
+model ProgrammeCheckpoint {
+  id          String   @id @default(uuid())
+  orgId       String
+  programmeId String
+  sequence    Int
+  taskId      String
+  /// `succeeded` | `failed` | `blocked` | `waiting_for_approval` | `already_succeeded` |
+  /// `cancelled` | `dispatch_failed`. A string, not an enum, for the same reason as
+  /// `terminationReason`: the vocabulary belongs to the scheduler and grows without a
+  /// migration.
+  outcome     String
+  /// The evidence for the outcome: the attempt and workflow run that executed the task,
+  /// the child execution as Temporal named it, and the child's own verdict. JSON because
+  /// the shape belongs to the scheduler, not to the schema.
+  evidence    Json?
+  createdAt   DateTime @default(now())
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  programme    Programme    @relation(fields: [programmeId], references: [id], onDelete: Cascade)
+  // Restrict, same reasoning as `ProgrammeTask.task`: this is the programme's history.
+  task         Task         @relation(fields: [taskId], references: [id], onDelete: Restrict)
+
+  // The workflow's deterministic sequence. A retried `recordProgrammeCheckpointActivity`
+  // hits this key and upserts instead of appending a second row.
+  @@unique([programmeId, sequence])
+  // "What happened to this task, in order" — the per-task evidence chain.
+  @@index([programmeId, taskId])
+  // Foreign-key maintenance for the Restrict reference above.
+  @@index([taskId])
 }

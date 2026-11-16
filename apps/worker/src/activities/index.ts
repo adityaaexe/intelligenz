@@ -2,6 +2,12 @@ import { completeTaskActivity } from './complete-task';
 import { emitEventActivity } from './emit-event';
 import { executeAgentActivity } from './execute-agent';
 import { persistResultActivity } from './persist-result';
+import {
+  finishProgrammeActivity,
+  loadProgrammeActivity,
+  recordProgrammeCheckpointActivity,
+  reserveProgrammeTaskActivity,
+} from './programme';
 import { recordStartActivity } from './record-start';
 import { validateTaskActivity } from './validate-task';
 
@@ -19,6 +25,11 @@ import { validateTaskActivity } from './validate-task';
  *
  * Every activity is idempotent on `taskId`. Temporal's at-least-once delivery means a
  * retried activity *will* re-run; the only question is whether re-running is safe.
+ *
+ * The four `programme*` activities (Phase 8.6) are idempotent on
+ * `(programmeId, taskId, attemptNumber)` / `(programmeId, sequence)` instead, because a
+ * programme is not a task: one node is reserved once, and a checkpoint's sequence is
+ * allocated by the workflow.
  */
 export const activities = {
   validateTaskActivity,
@@ -27,6 +38,10 @@ export const activities = {
   persistResultActivity,
   emitEventActivity,
   completeTaskActivity,
+  loadProgrammeActivity,
+  reserveProgrammeTaskActivity,
+  recordProgrammeCheckpointActivity,
+  finishProgrammeActivity,
 };
 
 export type Activities = typeof activities;

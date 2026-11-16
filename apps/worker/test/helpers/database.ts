@@ -198,6 +198,12 @@ export async function reserveAndClaim(
 async function deleteOrganizationRows(client: PrismaClient, orgId: string): Promise<void> {
   await client.toolInvocation.deleteMany({ where: { orgId } });
   await client.executionAttempt.deleteMany({ where: { orgId } });
+  // Phase 8.6: both reference `Task` with ON DELETE RESTRICT, so they must be removed
+  // before the organisation cascade reaches the tasks. Checkpoints first, then nodes, then
+  // the programme itself.
+  await client.programmeCheckpoint.deleteMany({ where: { orgId } });
+  await client.programmeTask.deleteMany({ where: { orgId } });
+  await client.programme.deleteMany({ where: { orgId } });
   await client.agentRun.updateMany({ where: { orgId }, data: { workspaceId: null } });
   await client.executionWorkspace.deleteMany({ where: { orgId } });
   await client.approvalRequest.deleteMany({ where: { orgId } });

@@ -348,10 +348,41 @@ Both `apps/api` and `apps/worker` must use these exact literals. Drift here is a
 | Activity retry | `maximumAttempts: 3`, exponential backoff, initial 1s, coefficient 2 |
 | Timeouts | `startToCloseTimeout: '60s'` per activity; `scheduleToCloseTimeout: '5m'`; workflow `runTimeout: '10m'` |
 
+### Phase 8.6 extension — the programme parent (deliberate, reviewable)
+
+| Item | Value |
+|---|---|
+| Workflow type | `runProgrammeWorkflow` — the parent that dispatches `runTaskWorkflow` as children |
+| Workflow signature | `runProgrammeWorkflow(input: { programmeId: string; orgId: string; deadlineAt: string; maxConcurrent?: number }): Promise<{ status: 'succeeded' \| 'failed' \| 'blocked' \| 'timed_out'; succeeded: number; failed: number; blocked: number; checkpoints: number }>` |
+| Workflow ID | `programme-${programmeId}` — and every activity below refuses a caller whose workflow id is anything else |
+| Activity: programme load | `loadProgrammeActivity({ programmeId, orgId })` |
+| Activity: programme reserve | `reserveProgrammeTaskActivity({ programmeId, orgId, taskId, attemptNumber, correlationId })` |
+| Activity: programme checkpoint | `recordProgrammeCheckpointActivity({ programmeId, orgId, sequence, taskId, outcome, evidence })` |
+| Activity: programme finish | `finishProgrammeActivity({ programmeId, orgId, status, reason })` |
+
+**Why the extension exists.** Until Phase 8.6 a programme was one task: `POST /run` started
+`runTaskWorkflow` and the system stopped. Nothing dispatched task B when A finished. The
+four activities above let one durable parent workflow read a dependency graph
+(`loadProgrammeActivity`), reserve a single execution attempt per eligible node
+(`reserveProgrammeTaskActivity`), record what it observed in order
+(`recordProgrammeCheckpointActivity`), and close the programme
+(`finishProgrammeActivity`). The parent only dispatches and awaits; it does **not**
+re-implement the claim, the approval binding or the evidence capture — every one of those
+stays inside `runTaskWorkflow`, which is started unchanged as a child.
+
+**Adding an activity is a contract change, and this section is what makes it legible.**
+`apps/worker/test/contract.test.ts` pins the worker's activity registry to this list with an
+exact-match assertion. A name registered in `apps/worker/src/activities/index.ts` without a
+row here fails that test — which is the point: the alternative symptom is a workflow task
+that is scheduled, never picked up, and discovered at runtime, once.
+
 Rules:
 - Activities are **idempotent** on `taskId`. Re-running `persistResultActivity` for the same task must not duplicate `Artifact` or `Evidence` rows (unique on `(taskId, kind, checksum)`).
+- The four programme activities are idempotent on `(programmeId, taskId, attemptNumber)` and `(programmeId, sequence)` instead, because a programme is not a task: one node is reserved once, and the checkpoint sequence is allocated by the workflow.
 - The workflow never writes to the database directly — only through activities.
 - The API starts the workflow with `workflowId: 'task-' + taskId` and `workflowIdReusePolicy: 'REJECT_DUPLICATE'`.
 - A missing Temporal server must surface as `503` on `/health/ready` and as a typed error on run start — never a fabricated success.
+- **Programme authority.** The four programme activities read the calling execution's workflow id from the Temporal activity context (never from the input) and refuse anything but `programme-${programmeId}`. A task execution, or a standalone activity, cannot mint an `ExecutionAttempt` or write a checkpoint.
+- **No new authorisation.** `reserveProgrammeTaskActivity` mints the same reservation `POST /run` mints (a `queued` `WorkflowRun`, one `queued` `ExecutionAttempt`, the `ready → queued` compare-and-swap), but it **does not spend an approval**: an approval-gated node is reported `waiting_for_approval`, recorded, and only its dependents block.
 
 

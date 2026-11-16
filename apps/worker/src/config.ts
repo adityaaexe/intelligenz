@@ -145,6 +145,21 @@ export const TASK_QUEUE = 'intelligenz-tasks';
 export const WORKFLOW_TYPE = 'runTaskWorkflow';
 export const WORKFLOW_ID_PREFIX = 'task-';
 
+/**
+ * Phase 8.6: the parent workflow that dispatches `runTaskWorkflow` as children.
+ *
+ * A separate id space from `task-`, for a reason a reader can check: the programme layer's
+ * activities refuse to run unless the calling execution's workflow id is exactly
+ * `programme-<programmeId>`, so a task execution can never mint a reservation or write a
+ * checkpoint. Sharing the prefix would delete that distinction.
+ *
+ * The API declares the same two literals (`apps/api/src/orchestrator/orchestrator.service.ts`)
+ * because a shared constant would drag this package's env/fs code into the worker's
+ * workflow bundle. A drift is a one-line diff in two files, exactly like `WORKFLOW_TYPE`.
+ */
+export const PROGRAMME_WORKFLOW_TYPE = 'runProgrammeWorkflow';
+export const PROGRAMME_WORKFLOW_ID_PREFIX = 'programme-';
+
 function readString(env: NodeJS.ProcessEnv, name: string, fallback: string): string {
   const value = env[name]?.trim();
 

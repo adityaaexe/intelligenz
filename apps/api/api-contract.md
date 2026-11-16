@@ -190,6 +190,55 @@ terminal even though Temporal would accept a new run.
 `409 TASK_NOT_CANCELLABLE`. `orchestrator: "not_found"` means Temporal had no
 execution to cancel, which is not an error.
 
+### Programmes (Phase 8.6)
+
+| Method | Path | Role | Body | Response |
+|---|---|---|---|---|
+| POST | `/v1/orgs/:orgId/programmes` | **MEMBER** | `{ projectId, objective, tasks: [{ taskId, dependsOn[] }] }` (1–50 nodes) + optional `Idempotency-Key` | `202` created / `200` duplicate — `{ data: Programme, meta: { created: boolean } }` |
+
+`Programme` = `{ programmeId, projectId, objective, status, failureReason,
+createdAt, startedAt, finishedAt, tasks: [{ taskId, dependsOn[], status, attemptCount }] }`.
+
+`dependsOn` is a list of **task ids** in the same submission (not node ids): the caller
+creates the tasks first, so the caller knows them. `(programmeId, taskId)` is unique.
+
+**One call starts the continuation.** The response means "the graph is valid and a parent
+workflow owns it"; the tasks have not run. The workflow id is `programme-<programmeId>`,
+and the parent dispatches the existing `runTaskWorkflow` as children — the claim, the
+approval binding and the evidence capture are unchanged. A second submission with the same
+`Idempotency-Key` returns the first programme with `200` and starts **no** second workflow.
+
+**The activity surface is extended, deliberately.** The parent workflow needs four
+activities that did not exist when §16 was written — `loadProgrammeActivity`,
+`reserveProgrammeTaskActivity`, `recordProgrammeCheckpointActivity` and
+`finishProgrammeActivity` — so it can read the graph, reserve one execution per eligible
+task, record what it observed and close the programme. They are recorded as an extension in
+`docs/engineering/PHASE-2-CONTRACT.md` §16 ("Phase 8.6 extension"), not absorbed silently:
+adding an activity *is* a contract change, and `apps/worker/test/contract.test.ts` pins the
+worker's activity registry to that §16 list with an exact-match assertion. A name
+registered without a contract row fails the suite — which is the point, because the other
+symptom is a workflow task that is scheduled, never picked up, and discovered at runtime.
+
+Rejected before anything is persisted, with `400 PROGRAMME_GRAPH_INVALID` and details keyed
+by `tasks.<taskId>` (or `graph` for a task that does not exist):
+
+- an empty graph, or a duplicate task id;
+- a self-dependency, a dependency on a task outside the programme, or a dependency cycle;
+- a task with no acceptance criteria (it could never be judged succeeded);
+- a task that is not in this organisation **and** this project (indistinguishable from one
+  that does not exist, so the endpoint is not a cross-tenant existence oracle).
+
+`404 NOT_FOUND` when the project is not in the caller's org. `503
+ORCHESTRATOR_UNAVAILABLE` when Temporal rejects the start: the programme row is kept and
+marked `failed` with that reason, never left `pending`.
+
+Per-node status is `pending | running | succeeded | failed | blocked |
+waiting_for_approval | cancelled`; programme status is `pending | running | succeeded |
+failed | blocked | cancelled | timed_out`. A node whose task needs an approval is recorded
+`waiting_for_approval` and the programme **does not spend the grant** — reserve the run
+through `POST /run` once a grant exists; only that node's dependents block. A failed node
+blocks only its dependents: independent branches keep running.
+
 ### Approvals
 
 | Method | Path | Role | Body | Response |
@@ -517,6 +566,12 @@ request that fetched it.
 Without the header, the server generates a key, which makes that request
 non-idempotent — it did not ask to be.
 
+`POST /programmes` follows the same rule with one difference: the key is scoped to
+`(orgId, idempotencyKey)` and a duplicate returns the existing programme **without**
+starting a second parent workflow. A programme is a durable scheduler; two of them for one
+objective would dispatch every node twice, and the claim would refuse the duplicates while
+the programme still looked broken.
+
 ---
 
 ## 9. Audit events
@@ -534,6 +589,8 @@ Every row in `AuditEvent` is built by one service and validated against the
 | `task.cancelled.v1` | cancellation |
 | `workflow.started.v1` | Temporal accepted the workflow |
 | `workflow.start_failed.v1` | start failed and was compensated |
+| `programme.submitted.v1` | a programme graph was accepted (carries `objective`, `tasks`, `edges`) |
+| `programme.finished.v1` | the parent workflow reached a terminal status (carries `status`, `reason`) |
 | `approval.requested.v1` | HIGH/CRITICAL task created |
 | `approval.decided.v1` | approve / reject / request changes — carries the binding (`riskClassAtApproval`, `policyVersion`, `executionProfile`, `expiresAt`) |
 | `approval.consumed.v1` | an execution spent the grant (`consumedByAttemptId` may be null at spend time) |

@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 import { Client, Connection, WorkflowFailedError, WorkflowIdReusePolicy } from '@temporalio/client';
+import type { WorkflowHandle } from '@temporalio/client';
+import type { Workflow } from '@temporalio/workflow';
 import { NativeConnection, Worker } from '@temporalio/worker';
 
 import { activities } from '../../src/activities';
@@ -83,6 +85,18 @@ export interface ExecutionHarness {
   readonly taskQueue: string;
   session(options?: SessionOptions): Promise<ExecutionSession>;
   /**
+   * Starts an arbitrary workflow on this harness's queue.
+   *
+   * The probe session above exists to run **activities** under a real execution identity.
+   * A test that needs a real *workflow* — Phase 8.6's `runProgrammeWorkflow` — starts it
+   * here, against the same worker and the same production activity registry. The workflow
+   * is only startable if the harness bundled it (`workflowsPath`).
+   */
+  start(
+    workflowType: string,
+    options: StartWorkflowOptions,
+  ): Promise<WorkflowHandle<Workflow>>;
+  /**
    * Dispatches an activity **outside any workflow** — the reviewer's N1 reproduction.
    *
    * `Client.activity` starts a standalone activity: it is a real activity task, executed
@@ -94,9 +108,25 @@ export interface ExecutionHarness {
   close(): Promise<void>;
 }
 
+export interface StartWorkflowOptions {
+  readonly workflowId?: string;
+  readonly args?: readonly unknown[];
+  /**
+   * The workflow's run budget. Typed from the client's own option so the helper cannot
+   * accept a string Temporal would reject (`Duration` is an `ms`-formatted literal).
+   */
+  readonly workflowRunTimeout?: Parameters<Client['workflow']['start']>[1]['workflowRunTimeout'];
+}
+
 export interface ExecutionHarnessOptions {
   readonly address?: string;
   readonly namespace?: string;
+  /**
+   * The workflows **module** the worker bundles. Defaults to the activity probe, which
+   * registers no production workflow. A suite that starts a real workflow passes
+   * `fileURLToPath(new URL('../src/workflows/index.ts', import.meta.url))`.
+   */
+  readonly workflowsPath?: string;
 }
 
 export async function createExecutionHarness(
@@ -114,7 +144,7 @@ export async function createExecutionHarness(
     connection: nativeConnection,
     namespace,
     taskQueue,
-    workflowsPath: PROBE_WORKFLOW_PATH,
+    workflowsPath: options.workflowsPath ?? PROBE_WORKFLOW_PATH,
     activities,
   });
 
@@ -131,6 +161,31 @@ export async function createExecutionHarness(
 
   return {
     taskQueue,
+
+    /**
+     * Starts a workflow on this worker and returns its handle.
+     *
+     * Deliberately does not await the result: the caller decides when to join, and the
+     * programme suite must be able to assert against the database *while* the parent is
+     * still running if it ever needs to.
+     */
+    async start(
+      workflowType: string,
+      startOptions: StartWorkflowOptions,
+    ): Promise<WorkflowHandle<Workflow>> {
+      if (workerFailure !== undefined) {
+        throw new Error(`probe worker died before the start: ${String(workerFailure)}`);
+      }
+
+      return client.workflow.start(workflowType, {
+        taskQueue,
+        workflowId: startOptions.workflowId ?? `probe-${randomUUID()}`,
+        args: [...(startOptions.args ?? [])],
+        ...(startOptions.workflowRunTimeout === undefined
+          ? {}
+          : { workflowRunTimeout: startOptions.workflowRunTimeout }),
+      });
+    },
 
     async session(options: SessionOptions = {}): Promise<ExecutionSession> {
       if (workerFailure !== undefined) {

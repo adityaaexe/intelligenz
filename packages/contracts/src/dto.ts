@@ -169,6 +169,41 @@ export const UpdateTaskStatusInput = z
 export type UpdateTaskStatusInput = z.infer<typeof UpdateTaskStatusInput>;
 
 /**
+ * A programme submission: one objective, expressed as a dependency graph over tasks that
+ * already exist.
+ *
+ * The graph is written against **task ids**, not node ids the server would have to mint
+ * first — the caller creates the tasks, so the caller knows them. `dependsOn` is the only
+ * edge in the system. It is validated by `validateProgrammeGraph` before anything is
+ * persisted, and validated again by the parent workflow before anything is dispatched.
+ *
+ * `objective` is not parsed and not executed. It is the sentence an operator reads on the
+ * programme page, and the reason a programme row exists at all: "these five tasks are one
+ * objective" is not information any single task row carries.
+ */
+export const SubmitProgrammeInput = z
+  .object({
+    projectId: z.uuid(),
+    objective: z.string().trim().min(1).max(500),
+    tasks: z
+      .array(
+        z
+          .object({
+            taskId: z.uuid(),
+            // Duplicate edges are tolerated by the validator (the same edge twice), so
+            // the array is not deduplicated here — refusing it would be taste, not safety.
+            dependsOn: z.array(z.uuid()).max(50).default([]),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(50),
+  })
+  .strict();
+
+export type SubmitProgrammeInput = z.infer<typeof SubmitProgrammeInput>;
+
+/**
  * Cursor pagination. `limit` is coerced because query strings are text; the
  * default lives here so every list endpoint has the same page size.
  */

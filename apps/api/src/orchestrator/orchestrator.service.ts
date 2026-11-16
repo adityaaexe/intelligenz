@@ -42,6 +42,32 @@ export const WORKFLOW_TYPE = 'runTaskWorkflow';
 export const WORKFLOW_ID_PREFIX = 'task-';
 
 /**
+ * Phase 8.6: the parent workflow. Its id space is separate from `task-` because the
+ * programme activities refuse to run under anything but `programme-<programmeId>` — a task
+ * execution must never be able to mint a reservation or write a checkpoint.
+ *
+ * The worker declares the same literals (`apps/worker/src/config.ts`); see the note on
+ * `WORKFLOW_TYPE` above for why they are copied rather than shared.
+ */
+export const PROGRAMME_WORKFLOW_TYPE = 'runProgrammeWorkflow';
+export const PROGRAMME_WORKFLOW_ID_PREFIX = 'programme-';
+
+/**
+ * A programme outlives any single task by construction: it waits for chains of 10-minute
+ * runs. The soft deadline the API passes is shorter (6h), so the workflow reports
+ * `timed_out` before Temporal kills the execution.
+ */
+export const PROGRAMME_WORKFLOW_RUN_TIMEOUT = '8h';
+
+/**
+ * The two budgets, as literals. `workflowRunTimeout` accepts an `ms`-formatted string
+ * (`Duration` in `@temporalio/common`, which this package does not depend on directly), so
+ * the accepted set is spelled from the constants rather than widening to `string` and
+ * casting at the call site.
+ */
+type WorkflowRunTimeout = typeof WORKFLOW_RUN_TIMEOUT | typeof PROGRAMME_WORKFLOW_RUN_TIMEOUT;
+
+/**
  * Contract §16: `runTimeout: '10m'`. Declared as a named literal because the worker's
  * client wrapper sets the same value and a drift must be a one-line diff.
  */
@@ -73,6 +99,17 @@ export interface RunTaskWorkflowInput {
 export interface StartedWorkflow {
   readonly workflowId: string;
   readonly runId: string;
+}
+
+/**
+ * The parent workflow's input. `deadlineAt` is an ISO timestamp computed by the API so the
+ * workflow's deadline is a property of the submission, not of whichever worker replays it.
+ */
+export interface StartProgrammeWorkflowInput {
+  readonly programmeId: string;
+  readonly orgId: string;
+  readonly deadlineAt: string;
+  readonly maxConcurrent?: number;
 }
 
 export type ProbeResult =
@@ -141,23 +178,60 @@ export class OrchestratorService implements OnApplicationShutdown {
   }
 
   async startTaskWorkflow(input: RunTaskWorkflowInput): Promise<StartedWorkflow> {
-    const client = this.getClient();
     const workflowId = `${WORKFLOW_ID_PREFIX}${input.taskId}`;
+
+    return this.start(WORKFLOW_TYPE, workflowId, [input], WORKFLOW_RUN_TIMEOUT);
+  }
+
+  /**
+   * Starts the Phase 8.6 parent workflow. Same id space discipline as a task: the id is
+   * derived from the aggregate, so a duplicate submission is refused by Temporal rather
+   * than becoming a second scheduler for one programme.
+   */
+  async startProgrammeWorkflow(input: StartProgrammeWorkflowInput): Promise<StartedWorkflow> {
+    const workflowId = `${PROGRAMME_WORKFLOW_ID_PREFIX}${input.programmeId}`;
+
+    return this.start(
+      PROGRAMME_WORKFLOW_TYPE,
+      workflowId,
+      [input],
+      PROGRAMME_WORKFLOW_RUN_TIMEOUT,
+      // A retry after a start that failed on the server side may replace a closed failed
+      // execution, but never a running one.
+      WORKFLOW_ID_REUSE_POLICY,
+    );
+  }
+
+  /**
+   * The one place a workflow start is turned into a typed outcome.
+   *
+   * The two callers differ only in type, id and budget — duplicating this block would mean
+   * two mappings from gRPC status to `OrchestratorUnavailableError`, and the one that
+   * drifted would report an outage as a 500 or a bug as a 503.
+   */
+  private async start(
+    type: string,
+    workflowId: string,
+    args: readonly unknown[],
+    workflowRunTimeout: WorkflowRunTimeout,
+    reusePolicy: WorkflowIdReusePolicy = WorkflowIdReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY,
+  ): Promise<StartedWorkflow> {
+    const client = this.getClient();
 
     try {
       const handle = await withTimeout(
-        client.workflow.start(WORKFLOW_TYPE, {
+        client.workflow.start(type, {
           taskQueue: this.temporal.taskQueue,
           workflowId,
           // Contract §16, amended by this unit: reuse is permitted only when the
           // previous execution closed as failed/cancelled/terminated. A *running*
           // duplicate is still rejected by Temporal, so a retried POST cannot fork
           // two executions — but a retry after a failure can actually run.
-          workflowIdReusePolicy: WORKFLOW_ID_REUSE_POLICY,
+          workflowIdReusePolicy: reusePolicy,
           // Contract §16 timeout table. Without it a stuck run has no ceiling; the
           // worker's client wrapper already sets it, and the two must agree.
-          workflowRunTimeout: WORKFLOW_RUN_TIMEOUT,
-          args: [input],
+          workflowRunTimeout,
+          args: [...args],
         }),
         this.config.readinessTimeoutMs * 2,
       );
