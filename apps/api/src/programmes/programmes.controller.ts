@@ -6,7 +6,7 @@ import { CorrelationId, CurrentUser } from '../common/decorators/request.decorat
 import { ZodBody } from '../common/pipes/zod-validation.pipe';
 import type { ApiResponse, AuthenticatedUser } from '../common/request-context';
 import { ProgrammesService } from './programmes.service';
-import type { ProgrammeResponse } from './programmes.response';
+import type { CancelProgrammeResponse, ProgrammeResponse } from './programmes.response';
 
 /**
  * Programme submission — one call, then the scheduler owns the objective.
@@ -45,5 +45,40 @@ export class ProgrammesController {
     response.status(result.created ? 202 : 200);
 
     return { data: result.programme, meta: { created: result.created } };
+  }
+
+  /**
+   * Stops a programme.
+   *
+   * `202` on a request that reached the orchestrator — the caller is told "the stop was
+   * accepted", not "the programme is over". A started programme is closed by its workflow,
+   * and that takes an activity; a programme that never started is closed here, in the same
+   * call, and the body says so (`cancellation: 'cancelled_before_start'`).
+   * `200` on a replay: the row was already cancelled and nothing was written.
+   *
+   * MEMBER, the same role that may submit a programme and cancel a task. Escalating this to
+   * ADMIN — on the argument that stopping a multi-task objective is broader than stopping
+   * one run — is a policy decision nobody has made; the role ladder here matches the write
+   * it undoes, and does not invent a stricter one.
+   */
+  @Roles('MEMBER')
+  @Post(':programmeId/cancel')
+  async cancel(
+    @Param('orgId') orgId: string,
+    @Param('programmeId') programmeId: string,
+    @CurrentUser() user: AuthenticatedUser,
+    @CorrelationId() correlationId: string,
+    @Res({ passthrough: true }) response: ApiResponse,
+  ): Promise<{ data: CancelProgrammeResponse }> {
+    const result = await this.programmes.cancel({
+      orgId,
+      programmeId,
+      correlationId,
+      actorId: user.userId,
+    });
+
+    response.status(result.cancellation === 'already_cancelled' ? 200 : 202);
+
+    return { data: result };
   }
 }

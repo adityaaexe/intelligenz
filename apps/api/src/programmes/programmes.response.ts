@@ -79,3 +79,30 @@ export function toFailureCode(
 
   return FAILURE_STATUSES.has(status) ? 'UNSPECIFIED' : null;
 }
+
+/**
+ * What `POST /programmes/:programmeId/cancel` answers.
+ *
+ * `cancellation` is the fact the caller acts on, and `recordedBy` is the half that makes
+ * the fact verifiable: a request that only reached a running scheduler is `requested` until
+ * the workflow records the terminal state, while a programme cancelled before it ever
+ * started carries no workflow to record anything — the API wrote it.
+ *
+ * `recordedBy` is absent for `already_cancelled`: the row was already terminal when the
+ * request arrived, so this call recorded nothing and naming a writer would be a claim about
+ * another request.
+ */
+export interface CancelProgrammeResponse {
+  readonly programmeId: string;
+  /**
+   * `already_cancelled` — the row was `cancelled` before this call; nothing was written and
+   * no orchestrator call was made.
+   * `requested` — the parent execution was cancelled; the scheduler owns the row and will
+   * write `cancelled`.
+   * `cancelled_before_start` — no scheduler ever ran (`startedAt` null), so the API wrote the
+   * terminal state itself.
+   */
+  readonly cancellation: 'already_cancelled' | 'requested' | 'cancelled_before_start';
+  /** Who writes (or already wrote) the terminal status: the workflow, or the API. */
+  readonly recordedBy?: 'workflow' | 'api';
+}

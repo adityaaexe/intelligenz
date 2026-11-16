@@ -15,7 +15,11 @@ import {
   OrchestratorUnavailableError,
   isWorkflowAlreadyStartedError,
 } from '../orchestrator/orchestrator.service';
-import { toFailureCode, type ProgrammeResponse } from './programmes.response';
+import {
+  toFailureCode,
+  type CancelProgrammeResponse,
+  type ProgrammeResponse,
+} from './programmes.response';
 
 /**
  * Programme submission — the one API call that starts autonomous continuation.
@@ -56,6 +60,26 @@ const PROGRAMME_GRAPH_INVALID = 'PROGRAMME_GRAPH_INVALID' as const;
 
 /** How long a programme may keep dispatching before it reports `timed_out`. */
 const PROGRAMME_DEADLINE_MS = 6 * 60 * 60 * 1_000;
+
+/**
+ * Statuses with nothing left to stop.
+ *
+ * `cancelled` is not in this set because a second cancellation is `200 already_cancelled`,
+ * not a refusal — idempotence and "this is over" are different answers. `pending` and
+ * `running` are the two cancellable states.
+ */
+const TERMINAL_PROGRAMME_STATUSES: ReadonlySet<string> = new Set([
+  'succeeded',
+  'failed',
+  'blocked',
+  'timed_out',
+]);
+
+/**
+ * Why a pre-start cancellation closed the row. Written only when no workflow ever ran, so
+ * the prose says exactly that instead of implying a dispatch that was stopped.
+ */
+const CANCELLED_BEFORE_START = 'Cancelled before the scheduler started; no task was dispatched.';
 
 const PROGRAMME_SELECT = {
   id: true,
@@ -301,6 +325,249 @@ export class ProgrammesService {
     if (programme === null) throw AppError.notFound('Programme');
 
     return toResponse(programme);
+  }
+
+  /**
+   * Stops a programme. `POST /programmes/:programmeId/cancel`.
+   *
+   * ## Who writes the terminal state
+   *
+   * A programme has exactly one writer for `cancelled`, and which one depends on a fact
+   * already in the row — `startedAt`, written by `loadProgrammeActivity`, the workflow's
+   * first activity:
+   *
+   * | `startedAt` | Writer | Answer |
+   * |---|---|---|
+   * | set | the parent workflow, from its non-cancellable scope | `202 requested` |
+   * | null | this service, in one guarded UPDATE | `202 cancelled_before_start` |
+   *
+   * Writing `cancelled` here for a started programme would be a second writer racing the
+   * workflow's own — and the workflow's `finishProgrammeActivity` is guarded to
+   * `pending|running`, so whichever landed second would be silently dropped while the API
+   * reported the cancellation as recorded. The reverse is why the pre-start write exists: a
+   * programme whose workflow never loaded has no execution that will ever report anything,
+   * and leaving it `pending` would claim a schedule that is doing nothing. That is the same
+   * reasoning `submit` uses when it marks a programme `failed` for a start that failed.
+   *
+   * ## Orchestrator before the row, always
+   *
+   * The cancellation request goes to Temporal first, for the reason `task.cancel` states:
+   * a row marked cancelled while its execution keeps dispatching is a programme that is
+   * stopped in the UI and working in the background. A `not_found` is a refusal, not a
+   * success — the row claims a live execution and there is none.
+   *
+   * ## What it does not do
+   *
+   * It does not spend or revoke approvals, does not release reservations and does not
+   * delete evidence. Cancellation stops future dispatch; it does not rewrite what already
+   * happened. The workflow's children are cancelled through Temporal, and a child's own
+   * cancellation path records its task — the API does not write task rows here.
+   */
+  async cancel(params: {
+    orgId: string;
+    programmeId: string;
+    correlationId: string;
+    actorId: string;
+  }): Promise<CancelProgrammeResponse> {
+    const { orgId, programmeId, correlationId, actorId } = params;
+
+    const programme = await this.prisma.programme.findFirst({
+      // Tenant scoping. Another organisation's programme is a 404, never a 403: a 403 would
+      // confirm the id is real.
+      where: { id: programmeId, orgId },
+      select: { id: true, projectId: true, status: true, startedAt: true },
+    });
+
+    if (programme === null) throw AppError.notFound('Programme');
+
+    // Idempotent: a second cancellation of a cancelled programme is a fact about the row,
+    // not a request to re-do anything. No orchestrator call, no write.
+    if (programme.status === 'cancelled') {
+      return { programmeId, cancellation: 'already_cancelled' };
+    }
+
+    if (TERMINAL_PROGRAMME_STATUSES.has(programme.status)) {
+      throw new AppError(
+        409,
+        'PROGRAMME_NOT_CANCELLABLE',
+        `A programme in status "${programme.status}" cannot be cancelled.`,
+      );
+    }
+
+    let orchestrator: 'cancelled' | 'not_found';
+
+    try {
+      orchestrator = await this.orchestrator.cancelProgrammeWorkflow(programmeId);
+    } catch (error) {
+      if (error instanceof OrchestratorUnavailableError) {
+        throw new AppError(
+          503,
+          'ORCHESTRATOR_UNAVAILABLE',
+          'The orchestrator is unavailable. The programme was not cancelled.',
+        );
+      }
+
+      throw error;
+    }
+
+    if (orchestrator === 'not_found') {
+      // The row says `pending`/`running`, so it claims a live execution — and
+      // `programme-<id>` does not exist. Writing `cancelled` would mark a programme stopped
+      // whose scheduler cannot be reached, which is the state `task.cancel` refuses for the
+      // same reason. A programme with no execution needs an operator, not a status write.
+      throw new AppError(
+        409,
+        'EXECUTION_NOT_FOUND',
+        `No execution named "programme-${programmeId}" exists in the orchestrator. ` +
+          'The programme was not cancelled: marking it cancelled locally while its ' +
+          'execution cannot be reached would produce a programme that is stopped in the ' +
+          'UI and dispatching in the background.',
+      );
+    }
+
+    // ── A started programme belongs to its workflow ────────────────────────────
+    if (programme.startedAt !== null) {
+      await this.audit.record({
+        orgId,
+        projectId: programme.projectId,
+        actor: { type: 'user', id: actorId },
+        action: 'programme.cancel_requested',
+        eventType: 'programme.cancel_requested.v1',
+        aggregateType: 'Programme',
+        aggregateId: programmeId,
+        correlationId,
+        // Deterministic: a retried request that reaches this arm again must not become a
+        // second event about one cancellation.
+        idempotencyKey: `programme.cancel_requested:${programmeId}`,
+        // Never the objective: the audit trail records who asked and what changed, not a
+        // second copy of the programme's content.
+        payload: {
+          programmeId,
+          actorId,
+          recordedBy: 'workflow',
+          previousStatus: programme.status,
+        },
+      });
+
+      return { programmeId, cancellation: 'requested', recordedBy: 'workflow' };
+    }
+
+    // ── No scheduler ever ran, so no workflow will record anything ─────────────
+    const written = await this.recordPreStartCancellation({
+      orgId,
+      programmeId,
+      projectId: programme.projectId,
+      previousStatus: programme.status,
+      correlationId,
+      actorId,
+    });
+
+    if (written) {
+      return { programmeId, cancellation: 'cancelled_before_start', recordedBy: 'api' };
+    }
+
+    // The guarded write lost. Re-read and answer for the state the row actually holds —
+    // never force the write.
+    const current = await this.prisma.programme.findFirst({
+      where: { id: programmeId, orgId },
+      select: { status: true, startedAt: true },
+    });
+
+    if (current === null) throw AppError.notFound('Programme');
+
+    if (current.status === 'cancelled') {
+      return { programmeId, cancellation: 'already_cancelled' };
+    }
+
+    if (TERMINAL_PROGRAMME_STATUSES.has(current.status)) {
+      throw new AppError(
+        409,
+        'PROGRAMME_NOT_CANCELLABLE',
+        `A programme in status "${current.status}" cannot be cancelled.`,
+      );
+    }
+
+    if (current.startedAt === null) {
+      // Still `pending` and unstarted: the guard that just missed it should have matched.
+      // Nothing here is a cancelling decision — the row raced and lost, and the honest
+      // answer is "try again", not a status write.
+      throw new AppError(
+        409,
+        'CONFLICT',
+        'The programme changed state while the cancellation was being recorded.',
+      );
+    }
+
+    // `loadProgrammeActivity` started the scheduler between the read and the write. The
+    // cancellation request reached that execution, so it owns the terminal state now.
+    await this.audit.record({
+      orgId,
+      projectId: programme.projectId,
+      actor: { type: 'user', id: actorId },
+      action: 'programme.cancel_requested',
+      eventType: 'programme.cancel_requested.v1',
+      aggregateType: 'Programme',
+      aggregateId: programmeId,
+      correlationId,
+      idempotencyKey: `programme.cancel_requested:${programmeId}`,
+      payload: {
+        programmeId,
+        actorId,
+        recordedBy: 'workflow',
+        previousStatus: current.status,
+      },
+    });
+
+    return { programmeId, cancellation: 'requested', recordedBy: 'workflow' };
+  }
+
+  /**
+   * The one terminal write the API performs for a cancellation: a programme that never
+   * started.
+   *
+   * Guarded on `status: 'pending'` **and** `startedAt: null`, so it cannot close a
+   * programme the scheduler has taken over, nor one another request already closed. The
+   * audit row commits in the same transaction: a cancellation that left no event would be
+   * unreadable a week later.
+   */
+  private async recordPreStartCancellation(params: {
+    orgId: string;
+    programmeId: string;
+    projectId: string;
+    previousStatus: string;
+    correlationId: string;
+    actorId: string;
+  }): Promise<boolean> {
+    const { orgId, programmeId, projectId, previousStatus, correlationId, actorId } = params;
+
+    return this.prisma.$transaction(async (transaction) => {
+      const updated = await transaction.programme.updateMany({
+        where: { id: programmeId, orgId, status: 'pending', startedAt: null },
+        data: {
+          status: 'cancelled',
+          finishedAt: new Date(),
+          failureCode: 'CANCELLED',
+          failureReason: CANCELLED_BEFORE_START,
+        },
+      });
+
+      if (updated.count === 0) return false;
+
+      await this.audit.recordWithin(transaction, {
+        orgId,
+        projectId,
+        actor: { type: 'user', id: actorId },
+        action: 'programme.cancel_requested',
+        eventType: 'programme.cancel_requested.v1',
+        aggregateType: 'Programme',
+        aggregateId: programmeId,
+        correlationId,
+        idempotencyKey: `programme.cancel_requested:${programmeId}`,
+        payload: { programmeId, actorId, recordedBy: 'api', previousStatus },
+      });
+
+      return true;
+    });
   }
 }
 

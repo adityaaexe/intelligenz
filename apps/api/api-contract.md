@@ -62,13 +62,14 @@ every audit row written by the request.
 | `APPROVAL_REQUIRED` | 409 | HIGH/CRITICAL task queued without an approved request |
 | `ALREADY_DECIDED` | 409 | Approval request already decided |
 | `TASK_NOT_CANCELLABLE` | 409 | Task is not `queued`/`running` |
-| `EXECUTION_NOT_FOUND` | 409 | The task looks live but Temporal has no execution under `task-<taskId>`; nothing was cancelled |
+| `PROGRAMME_NOT_CANCELLABLE` | 409 | Programme is `succeeded`/`failed`/`blocked`/`timed_out`; nothing was cancelled |
+| `EXECUTION_NOT_FOUND` | 409 | The row looks live but Temporal has no execution under `task-<taskId>` (or `programme-<programmeId>`); nothing was cancelled |
 | `WORKFLOW_ALREADY_RUNNING` | 409 | An execution for this task is still open under the deterministic workflow id |
 | `INVALID_TRANSITION` | 422 | State machine refused the edge; `details.transition` says which |
 | `RATE_LIMITED` | 429 | Too many sign-in attempts for this `(ip, email)`; `Retry-After` says when |
 | `ARTIFACT_INTEGRITY_FAILED` | 409 | The bytes on disk do not match the recorded SHA-256; nothing is served |
 | `ARTIFACT_GONE` | 410 | The artifact row exists but its file is no longer on this host |
-| `ORCHESTRATOR_UNAVAILABLE` | 503 | Temporal unreachable; nothing was started |
+| `ORCHESTRATOR_UNAVAILABLE` | 503 | Temporal unreachable; nothing was started or cancelled |
 | `INTERNAL_ERROR` | 500 | Server bug; the message is deliberately opaque |
 
 **404, never 403, for another tenant's record.** A 403 would confirm the id exists.
@@ -200,6 +201,7 @@ the run row back to `succeeded`.
 | Method | Path | Role | Body | Response |
 |---|---|---|---|---|
 | POST | `/v1/orgs/:orgId/programmes` | **MEMBER** | `{ projectId, objective, tasks: [{ taskId, dependsOn[] }] }` (1–50 nodes) + optional `Idempotency-Key` | `202` created / `200` duplicate — `{ data: Programme, meta: { created: boolean } }` |
+| POST | `/v1/orgs/:orgId/programmes/:programmeId/cancel` | **MEMBER** | — | `202 { data: { programmeId, cancellation: requested \| cancelled_before_start, recordedBy } }` / `200 { data: { programmeId, cancellation: 'already_cancelled' } }` |
 
 `Programme` = `{ programmeId, projectId, objective, status, failureReason, failureCode,
 createdAt, startedAt, finishedAt, tasks: [{ taskId, dependsOn[], status, attemptCount }] }`.
@@ -253,6 +255,27 @@ failed | blocked | cancelled | timed_out`. A node whose task needs an approval i
 `waiting_for_approval` and the programme **does not spend the grant** — reserve the run
 through `POST /run` once a grant exists; only that node's dependents block. A failed node
 blocks only its dependents: independent branches keep running.
+
+**Cancellation stops a programme, not just its tasks.** `POST /programmes/:programmeId/cancel`
+cancels the parent execution `programme-<programmeId>`; the parent's children are cancelled
+with it (SDK default `cancellationType: WAIT_CANCELLATION_COMPLETED`), so future dispatch
+stops and the in-flight child is cancelled through its own path. Codes:
+
+| Status | Code | When |
+|---|---|---|
+| `200` | — | the programme was already `cancelled`; `cancellation: 'already_cancelled'`, nothing written, no orchestrator call |
+| `202` | — | the request reached the orchestrator; `cancellation: 'requested'` (a started programme — its workflow writes `cancelled`) or `'cancelled_before_start'` (no scheduler ever ran — the API wrote `cancelled` with `failureCode: CANCELLED`) |
+| `404` | `NOT_FOUND` | no such programme **in this organisation** (never `403`) |
+| `409` | `PROGRAMME_NOT_CANCELLABLE` | `succeeded`, `failed`, `blocked` or `timed_out`; the message names the status and nothing is written |
+| `409` | `EXECUTION_NOT_FOUND` | the row is `pending`/`running` and Temporal has no execution under `programme-<id>`; nothing is written |
+| `503` | `ORCHESTRATOR_UNAVAILABLE` | Temporal could not take the cancellation; nothing is written |
+
+Who writes the terminal state is decided by `startedAt`, which only the workflow's first
+activity sets: set → the workflow records `cancelled` (the API does not write); null → the
+API records it, in one guarded `UPDATE ... WHERE status='pending' AND startedAt IS NULL`.
+Cancellation does not spend or revoke approvals and does not delete evidence. A cancelled
+programme can leave the one interrupted node's `ProgrammeTask.status` at `running`; see
+`docs/engineering/phase8.8-operations/PROGRAMME-CANCELLATION-CONTRACT.md`.
 
 ### Approvals
 
@@ -605,6 +628,7 @@ Every row in `AuditEvent` is built by one service and validated against the
 | `workflow.started.v1` | Temporal accepted the workflow |
 | `workflow.start_failed.v1` | start failed and was compensated |
 | `programme.submitted.v1` | a programme graph was accepted (carries `objective`, `tasks`, `edges`) |
+| `programme.cancel_requested.v1` | `POST /programmes/:programmeId/cancel` reached the orchestrator (carries `programmeId`, `actorId`, `recordedBy`, `previousStatus`; never the objective) |
 | `programme.finished.v1` | the parent workflow reached a terminal status (carries `status`, `reason`) |
 | `approval.requested.v1` | HIGH/CRITICAL task created |
 | `approval.decided.v1` | approve / reject / request changes — carries the binding (`riskClassAtApproval`, `policyVersion`, `executionProfile`, `expiresAt`) |

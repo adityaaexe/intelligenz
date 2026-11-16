@@ -32,6 +32,10 @@ export type ErrorCode =
   | 'WORKFLOW_ALREADY_RUNNING'
   | 'ORCHESTRATOR_UNAVAILABLE'
   | 'PROGRAMME_GRAPH_INVALID'
+  // A programme in a terminal status has nothing left to stop. Distinct from
+  // `TASK_NOT_CANCELLABLE` so a client can tell "the programme is already over" from "the
+  // task is in a state the state machine does not allow to cancel".
+  | 'PROGRAMME_NOT_CANCELLABLE'
   // Phase 8.7. A proposal is data; these are the ways a proposal, a decision about it,
   // or its materialisation can be refused. They are distinct codes because a client (and
   // an operator) must be able to tell "the planner is down" from "the planner answered

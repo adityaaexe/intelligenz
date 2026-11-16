@@ -287,15 +287,44 @@ export class OrchestratorService implements OnApplicationShutdown {
   }
 
   /**
-   * Requests cancellation. `not_found` means Temporal has no execution with that id —
-   * which is a safe state to treat as "nothing is running", not an error.
+   * Cancels the execution a task id names — `task-<taskId>`, the id `POST /run` starts and
+   * the id a programme child runs under.
+   *
+   * The caller passes the derived workflow id rather than the task id because `POST /run`
+   * and the programme's `startChild` both use the same literal prefix, and this method must
+   * not be the second place that decides what it is.
+   */
+  async cancelTaskWorkflow(workflowId: string): Promise<CancelResult> {
+    return this.cancelWorkflow(workflowId);
+  }
+
+  /**
+   * Cancels the parent execution a programme id names — `programme-<programmeId>`.
+   *
+   * The id space is the authority boundary: the programme activities refuse to run under
+   * anything else, so cancelling this id is cancelling the one execution allowed to
+   * dispatch the programme's nodes. Nothing else about the programme is written here; what
+   * the cancellation means for `Programme.status` is the caller's decision (see
+   * `ProgrammesService.cancel`).
+   */
+  async cancelProgrammeWorkflow(programmeId: string): Promise<CancelResult> {
+    return this.cancelWorkflow(`${PROGRAMME_WORKFLOW_ID_PREFIX}${programmeId}`);
+  }
+
+  /**
+   * Requests cancellation of one execution. `not_found` means Temporal has no execution
+   * with that id — which is a safe state to treat as "nothing is running", not an error.
    *
    * The SDK converts a gRPC `NOT_FOUND` into `WorkflowNotFoundError` **before** this
    * catches anything (`WorkflowClient.rethrowGrpcError`), so the status check has to name
    * that class as well: without it a cancellation of a missing execution fell through to a
    * 500, and the caller never saw the one answer that says "there was nothing to cancel".
+   *
+   * Private, and the only copy: `cancelTaskWorkflow` and `cancelProgrammeWorkflow` differ
+   * only in the id they derive, and two copies of this mapping would eventually disagree
+   * about which gRPC codes mean "unreachable" — the same argument as `start`.
    */
-  async cancelTaskWorkflow(workflowId: string): Promise<CancelResult> {
+  private async cancelWorkflow(workflowId: string): Promise<CancelResult> {
     const client = this.getClient();
 
     try {
