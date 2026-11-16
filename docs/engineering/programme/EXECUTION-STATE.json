@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "programme": "INTELLIGENZ",
   "branch": "phase-6/trust-boundary-closure",
-  "head": "0b68b9ba11c9d96e128cd143156f2868b8ba74fa",
+  "head": "7fa4dd9fadf96f5709438e7f35d4a673581b24ab",
   "phase": "8.7",
   "createdAt": "2026-11-16T03:30:00.000Z",
-  "updatedAt": "2026-11-16T11:55:00.000Z",
+  "updatedAt": "2026-11-16T12:30:00.000Z",
   "tasks": [
     {
       "id": "P83-001",
@@ -698,14 +698,14 @@
         "If harness, the test asserts the same property without depending on scheduling."
       ],
       "evidenceRequirement": {
-        "kind": "test",
-        "artifact": "apps/api/test/approval-attempt-binding.e2e-spec.ts",
-        "note": "OPEN. Failing test: \"reserves exactly one attempt and one grant, and refuses the loser with 409\". No assertion captured; not reproduced in 7 subsequent runs. The planner commit did not touch the POST /run path (verified diff)."
+        "kind": "document",
+        "artifact": "docs/engineering/phase8.8-operations/P87-011-APPROVAL-BINDING-INVESTIGATION.md",
+        "note": "NOT REPRODUCED after ~95 executions: 8 then 7 full-suite runs, 40 consecutive isolated runs of the spec, 50 batches of an n-way reproducer at 2 and 4 contenders. The lock-cycle hypothesis was disproven by measurement (FOR NO KEY UPDATE is compatible with FOR KEY SHARE). The test now attaches statuses, codes and row counts to its failure message; assertions and expected values are unchanged. Blocked on a captured occurrence, not on an unknown cause."
       },
       "owner": "node-developer",
-      "status": "planned",
+      "status": "blocked",
       "createdAt": "2026-11-16T10:00:00.000Z",
-      "updatedAt": "2026-11-16T11:45:00.000Z",
+      "updatedAt": "2026-11-16T12:30:00.000Z",
       "id": "P87-011",
       "title": "Reproduce the intermittent approval-attempt-binding e2e failure",
       "riskClass": "high"
@@ -822,6 +822,15 @@
         "docs/engineering/phase8.7-governed-planner/TELEMETRY-EVENT-CONTRACT.md",
         "docs/engineering/phase8.7-governed-planner/CONTROL-PLANE-UX-REQUIREMENTS.md",
         "docs/engineering/phase8.7-governed-planner/APPROVAL-RESUMPTION-DESIGN.md"
+      ]
+    },
+    {
+      "at": "2026-11-16T12:30:00.000Z",
+      "summary": "P87-011 investigated and not reproduced: ~95 executions clean, including 40 consecutive runs of the failing spec and 50 n-way contention batches. The plausible deadlock was disproven with a direct lock-order probe rather than assumed. The test now captures the evidence a future failure needs, with no assertion changed. The task stays blocked; it is not declared fixed.",
+      "evidence": [
+        "docs/engineering/phase8.8-operations/P87-011-APPROVAL-BINDING-INVESTIGATION.md",
+        "apps/api/test/manual/approval-binding-stress.ts",
+        "apps/api/test/manual/run-deadlock-probe.ts"
       ]
     }
   ]
