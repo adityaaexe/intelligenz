@@ -1,0 +1,605 @@
+/* ==========================================================================
+   /preview — layout only.
+
+   Every value below is a design-system token: no literal colour, no second
+   palette, no new font. Tailwind is not used here because the two structures
+   that need breakpoints (the metric band and the table→card switch) are simpler
+   to state once in CSS than to repeat per element.
+
+   There is no animation in this file. Nothing on this page moves, because
+   nothing on this page is live.
+   ========================================================================== */
+
+.pv {
+  display: flex;
+  flex-direction: column;
+  gap: var(--iz-space-16);
+  max-width: 1200px;
+  min-height: 100dvh;
+  margin: 0 auto;
+  padding: var(--iz-space-16);
+  background: var(--iz-color-canvas);
+  /* 14px base: the reading size in this app is `--iz-text-base`. Micro labels
+     are set explicitly below so they stay micro. */
+  font-size: var(--iz-text-base);
+  line-height: var(--iz-leading-base);
+}
+
+@media (min-width: 768px) {
+  .pv {
+    gap: var(--iz-space-24);
+    padding: var(--iz-space-24) var(--iz-space-32) var(--iz-space-40);
+  }
+}
+
+/* --- header ------------------------------------------------------------ */
+
+.pv-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--iz-space-4);
+}
+
+.pv-eyebrow {
+  margin: 0;
+  font-size: var(--iz-text-micro);
+  line-height: var(--iz-leading-micro);
+  font-weight: var(--iz-weight-medium);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--iz-ink-3);
+}
+
+.pv-title {
+  margin: 0;
+  font-size: var(--iz-text-xl);
+  line-height: var(--iz-leading-xl);
+  font-weight: var(--iz-weight-semibold);
+  letter-spacing: var(--iz-tracking-tighter);
+  color: var(--iz-ink-1);
+}
+
+@media (min-width: 768px) {
+  .pv-title {
+    font-size: var(--iz-text-2xl);
+    line-height: var(--iz-leading-2xl);
+  }
+}
+
+.pv-lede {
+  max-width: 76ch;
+  margin: 0;
+  font-size: var(--iz-text-base);
+  line-height: var(--iz-leading-base);
+  color: var(--iz-ink-2);
+  text-wrap: pretty;
+}
+
+/* --- banner content ---------------------------------------------------- */
+
+.pv-banner-copy {
+  margin: var(--iz-space-4) 0 0;
+  font-size: var(--iz-text-base);
+  line-height: var(--iz-leading-base);
+  color: var(--iz-ink-2);
+  text-wrap: pretty;
+}
+
+.pv-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--iz-space-4) var(--iz-space-20);
+  margin: var(--iz-space-8) 0 0;
+}
+
+.pv-meta__pair {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--iz-space-6);
+}
+
+.pv-meta dt {
+  font-size: var(--iz-text-micro);
+  line-height: var(--iz-leading-micro);
+  font-weight: var(--iz-weight-medium);
+  letter-spacing: var(--iz-tracking-micro);
+  text-transform: uppercase;
+  color: var(--iz-ink-3);
+}
+
+.pv-meta dd {
+  margin: 0;
+  font-size: var(--iz-text-sm);
+  line-height: var(--iz-leading-sm);
+  color: var(--iz-ink-1);
+}
+
+.pv-caveat {
+  max-width: 76ch;
+  margin: var(--iz-space-6) 0 0;
+  font-size: var(--iz-text-xs);
+  line-height: var(--iz-leading-xs);
+  color: var(--iz-ink-3);
+  text-wrap: pretty;
+}
+
+.pv code {
+  font-family: var(--iz-font-mono);
+  font-size: 0.95em;
+  background: var(--iz-color-surface-2);
+  border-radius: var(--iz-radius-xs);
+  padding: 1px var(--iz-space-4);
+  overflow-wrap: anywhere;
+}
+
+/* --- summary band ------------------------------------------------------ */
+
+.pv-summary {
+  grid-template-columns: minmax(0, 1fr);
+  border-bottom: 0;
+}
+
+@media (min-width: 480px) {
+  .pv-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 900px) {
+  .pv-summary {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+  }
+}
+
+.pv-note {
+  max-width: 80ch;
+  margin: var(--iz-space-8) 0 0;
+  font-size: var(--iz-text-xs);
+  line-height: var(--iz-leading-xs);
+  color: var(--iz-ink-3);
+  text-wrap: pretty;
+}
+
+.pv-footnote {
+  max-width: 80ch;
+  margin: 0;
+  font-size: var(--iz-text-xs);
+  line-height: var(--iz-leading-xs);
+  color: var(--iz-ink-3);
+  text-wrap: pretty;
+}
+
+/* --- filters -----------------------------------------------------------
+   44px tall: the phone target is the point of this page. Colour is never the
+   only marker — `aria-current` carries the state and the count is visible. */
+
+.pv-toolbar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--iz-space-8);
+  padding: var(--iz-space-12) var(--iz-space-16);
+  border-bottom: 1px solid var(--iz-border-subtle);
+}
+
+.pv-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--iz-space-8);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.pv-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--iz-space-6);
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 var(--iz-space-12);
+  border: 1px solid var(--iz-border-control);
+  border-radius: var(--iz-radius-sm);
+  background: var(--iz-color-surface-1);
+  color: var(--iz-ink-1);
+  font-size: var(--iz-text-base);
+  line-height: var(--iz-leading-base);
+  text-decoration: none;
+}
+
+.pv-filter:hover {
+  background: var(--iz-color-surface-3);
+}
+
+.pv-filter[data-active='true'] {
+  border-color: var(--iz-color-chrome);
+  background: var(--iz-color-chrome);
+  color: var(--iz-on-chrome-1);
+  font-weight: var(--iz-weight-medium);
+}
+
+/* The dark selected fill needs the on-chrome ring, not the canvas ring. */
+.pv-filter[data-active='true']:focus-visible {
+  outline-color: var(--iz-focus-on-chrome);
+}
+
+.pv-filter__count {
+  font-size: var(--iz-text-xs);
+  line-height: var(--iz-leading-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--iz-ink-3);
+}
+
+.pv-filter[data-active='true'] .pv-filter__count {
+  color: var(--iz-on-chrome-2);
+}
+
+.pv-toolbar__hint {
+  max-width: 80ch;
+  margin: 0;
+  font-size: var(--iz-text-xs);
+  line-height: var(--iz-leading-xs);
+  color: var(--iz-ink-3);
+  text-wrap: pretty;
+}
+
+/* --- table -------------------------------------------------------------
+   Wide: a real table, horizontally scrollable inside `.iz-table-scroll` when
+   the viewport cannot hold it. Narrow: rows become blocks with the header
+   repeated as `data-label` text, so no column is lost and nothing overflows. */
+
+.pv-table {
+  font-size: var(--iz-text-base);
+  line-height: var(--iz-leading-base);
+}
+
+@media (min-width: 768px) {
+  .pv-table {
+    min-width: 880px;
+  }
+}
+
+.pv-table td {
+  padding: var(--iz-space-10) var(--iz-space-12);
+  border-bottom: 1px solid var(--iz-border-subtle);
+  vertical-align: top;
+}
+
+.pv-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.pv-task {
+  min-width: 240px;
+  color: var(--iz-ink-1);
+}
+
+.pv-figure {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.pv-owner {
+  color: var(--iz-ink-2);
+}
+
+/* One line for the timestamp: `2026-11-16` over `07:00:00Z` reads as two facts. */
+.pv-table td[data-label='Updated'] {
+  white-space: nowrap;
+}
+
+.pv-id {
+  font-family: var(--iz-font-mono);
+  font-size: var(--iz-text-mono-sm);
+  white-space: nowrap;
+}
+
+.pv-absent {
+  color: var(--iz-ink-3);
+}
+
+.pv-path {
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 767.98px) {
+  .pv-table,
+  .pv-table tbody,
+  .pv-table tr,
+  .pv-table td {
+    display: block;
+    width: 100%;
+    min-width: 0;
+  }
+
+  /* Visually hidden, still a table header for a screen reader. */
+  .pv-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  /* With `display: block` on the table, a table-caption shrink-wraps into a
+     column. It is a statement about the whole board, so it takes the row. */
+  .pv-table caption {
+    display: block;
+    width: 100%;
+  }
+
+  .pv-table tr {
+    padding: var(--iz-space-6) 0;
+    border-bottom: 1px solid var(--iz-border-default);
+  }
+
+  .pv-table tbody tr:last-child {
+    border-bottom: 0;
+  }
+
+  .pv-table td {
+    display: grid;
+    grid-template-columns: 86px minmax(0, 1fr);
+    gap: var(--iz-space-8);
+    /* `.iz-table tbody td` fixes a 32px row height, which only works while the
+       cell is a table cell: as a block it clips and the next row overlaps. */
+    height: auto;
+    padding: var(--iz-space-4) var(--iz-space-16);
+    border-bottom: 0;
+    /* Grid items are blockified: without this, a pill or a code chip stretches
+       to the whole second column and its background reads as a bar. */
+    justify-items: start;
+  }
+
+  .pv-table td::before {
+    content: attr(data-label);
+    font-size: var(--iz-text-micro);
+    line-height: var(--iz-leading-base);
+    font-weight: var(--iz-weight-medium);
+    letter-spacing: var(--iz-tracking-micro);
+    text-transform: uppercase;
+    color: var(--iz-ink-3);
+  }
+
+  .pv-table td[data-label='ID'] {
+    padding-top: var(--iz-space-8);
+  }
+
+  .pv-table td[data-label='Task'] {
+    padding-bottom: var(--iz-space-8);
+    font-size: var(--iz-text-md);
+    line-height: var(--iz-leading-md);
+  }
+}
+
+/* --- blockers ---------------------------------------------------------- */
+
+.pv-blockers {
+  padding: var(--iz-space-16);
+}
+
+.pv-label {
+  margin: 0;
+  font-size: var(--iz-text-base);
+  line-height: var(--iz-leading-base);
+  font-weight: var(--iz-weight-semibold);
+  color: var(--iz-ink-1);
+}
+
+.pv-blocker-list {
+  margin: var(--iz-space-12) 0 0;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid var(--iz-border-subtle);
+}
+
+.pv-blocker {
+  padding: var(--iz-space-12) 0;
+  border-bottom: 1px solid var(--iz-border-subtle);
+}
+
+.pv-blocker__head,
+.pv-next__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--iz-space-8);
+}
+
+.pv-blocker__phase {
+  font-size: var(--iz-text-xs);
+  line-height: var(--iz-leading-xs);
+  color: var(--iz-ink-3);
+}
+
+.pv-blocker__title {
+  margin: var(--iz-space-6) 0 0;
+  font-size: var(--iz-text-base);
+  line-height: var(--iz-leading-base);
+  font-weight: var(--iz-weight-medium);
+  color: var(--iz-ink-1);
+  text-wrap: pretty;
+}
+
+.pv-blocker__artifact {
+  margin: var(--iz-space-4) 0 0;
+  font-size: var(--iz-text-sm);
+  line-height: var(--iz-leading-sm);
+  color: var(--iz-ink-2);
+}
+
+.pv-blocker__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--iz-space-4) var(--iz-space-24);
+  margin: var(--iz-space-8) 0 0;
+}
+
+.pv-blocker__meta dt {
+  font-size: var(--iz-text-micro);
+  line-height: var(--iz-leading-micro);
+  font-weight: var(--iz-weight-medium);
+  letter-spacing: var(--iz-tracking-micro);
+  text-transform: uppercase;
+  color: var(--iz-ink-3);
+}
+
+.pv-blocker__meta dd {
+  margin: 2px 0 0;
+  font-size: var(--iz-text-sm);
+  line-height: var(--iz-leading-sm);
+  color: var(--iz-ink-2);
+}
+
+.pv-derived {
+  margin-top: var(--iz-space-16);
+}
+
+.pv-h3 {
+  margin: 0;
+  font-size: var(--iz-text-sm);
+  line-height: var(--iz-leading-sm);
+  font-weight: var(--iz-weight-semibold);
+  letter-spacing: var(--iz-tracking-micro);
+  text-transform: uppercase;
+  color: var(--iz-ink-2);
+}
+
+.pv-fact-list {
+  margin: var(--iz-space-8) 0 0;
+  padding-left: var(--iz-space-20);
+  font-size: var(--iz-text-sm);
+  line-height: var(--iz-leading-sm);
+  color: var(--iz-ink-2);
+}
+
+/* --- next eligible ----------------------------------------------------- */
+
+.pv-next {
+  padding: var(--iz-space-16);
+}
+
+.pv-next__title {
+  margin: var(--iz-space-8) 0 0;
+  font-size: var(--iz-text-md);
+  line-height: var(--iz-leading-md);
+  font-weight: var(--iz-weight-medium);
+  color: var(--iz-ink-1);
+  text-wrap: pretty;
+}
+
+.pv-next__none {
+  margin: 0;
+  font-size: var(--iz-text-base);
+  line-height: var(--iz-leading-base);
+  color: var(--iz-ink-2);
+}
+
+/* --- health ------------------------------------------------------------
+   Rows, not a table: four signals with different shapes. Stacked on a phone,
+   three columns from 640px. */
+
+.pv-health {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.pv-health__row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--iz-space-4);
+  padding: var(--iz-space-12) var(--iz-space-16);
+  border-bottom: 1px solid var(--iz-border-subtle);
+}
+
+.pv-health__row:last-child {
+  border-bottom: 0;
+}
+
+@media (min-width: 640px) {
+  .pv-health__row {
+    grid-template-columns: minmax(0, 1.1fr) auto minmax(0, 1fr);
+    align-items: center;
+    gap: var(--iz-space-16);
+  }
+}
+
+.pv-health__name {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-family: var(--iz-font-mono);
+  font-size: var(--iz-text-sm);
+  line-height: var(--iz-leading-sm);
+  color: var(--iz-ink-1);
+}
+
+.pv-health__source {
+  font-family: var(--iz-font-sans);
+  font-size: var(--iz-text-micro);
+  line-height: var(--iz-leading-micro);
+  letter-spacing: var(--iz-tracking-micro);
+  text-transform: uppercase;
+  color: var(--iz-ink-3);
+}
+
+.pv-health__state {
+  display: flex;
+  justify-content: flex-start;
+}
+
+.pv-health__detail {
+  font-size: var(--iz-text-sm);
+  line-height: var(--iz-leading-sm);
+  color: var(--iz-ink-3);
+  text-wrap: pretty;
+}
+
+/* A status that has no measurement: neutral, outlined, never a green word. */
+.pv-flag {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 var(--iz-space-8);
+  border: 1px solid var(--iz-border-control);
+  border-radius: var(--iz-radius-full);
+  background: var(--iz-color-surface-2);
+  color: var(--iz-ink-2);
+  font-size: var(--iz-text-xs);
+  line-height: var(--iz-leading-xs);
+  font-weight: var(--iz-weight-medium);
+  letter-spacing: var(--iz-tracking-micro);
+}
+
+/* --- misc -------------------------------------------------------------- */
+
+.pv-empty {
+  margin: 0;
+  padding: var(--iz-space-16);
+  font-size: var(--iz-text-base);
+  line-height: var(--iz-leading-base);
+  color: var(--iz-ink-2);
+}
+
+.pv-footer {
+  margin-top: var(--iz-space-8);
+  padding-top: var(--iz-space-12);
+  border-top: 1px solid var(--iz-border-default);
+  font-size: var(--iz-text-sm);
+  line-height: var(--iz-leading-sm);
+  color: var(--iz-ink-3);
+}
+
+.pv-footer p {
+  max-width: 80ch;
+  margin: 0;
+  text-wrap: pretty;
+}
+
+.pv-footer__meta {
+  margin-top: var(--iz-space-6) !important;
+  font-size: var(--iz-text-xs);
+  line-height: var(--iz-leading-xs);
+}
