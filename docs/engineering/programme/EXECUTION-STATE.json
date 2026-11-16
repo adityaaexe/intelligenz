@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "programme": "INTELLIGENZ",
   "branch": "phase-6/trust-boundary-closure",
-  "head": "1cf3c58893c30e8e3ccf9310496d43d8019b72db",
-  "phase": "8.3",
+  "head": "b4408e8fb308ecd05899488b4c52138fd0e468ea",
+  "phase": "8.6",
   "createdAt": "2026-11-16T03:30:00.000Z",
-  "updatedAt": "2026-11-16T07:12:00.000Z",
+  "updatedAt": "2026-11-16T09:05:00.000Z",
   "tasks": [
     {
       "id": "P83-001",
@@ -303,6 +303,84 @@
       "status": "planned",
       "createdAt": "2026-11-16T03:30:00.000Z",
       "updatedAt": "2026-11-16T03:30:00.000Z"
+    },
+    {
+      "id": "P83-012",
+      "title": "Prove io.max throttles a real process on the delegated worker leaf",
+      "phase": "8.3",
+      "dependsOn": [],
+      "riskClass": "high",
+      "executionPolicy": {
+        "enforcement": "advisory",
+        "gate": "io-max-write-throttle",
+        "rationale": "A resource claim is only a control if a real process is measurably slowed; a configured io.max nobody measured proves nothing."
+      },
+      "acceptanceCriteria": [
+        "Unconstrained and constrained writes measured on the same block device",
+        "The constrained process confirmed inside 0::/intelligenz/worker",
+        "io.max restored to max and the scratch files removed"
+      ],
+      "evidenceRequirement": {
+        "kind": "measurement",
+        "artifact": "docs/engineering/phase8-host-boundary/IO-ENFORCEMENT-PROOF.md",
+        "note": "Commit 1cf3c58. 245 MB/s unconstrained vs 4.3 MB/s at wbps=4194304, a 57x reduction matching the configured 4 MiB/s, process in 0::/intelligenz/worker, io.stat attribution on 259:0."
+      },
+      "owner": "it-leader",
+      "status": "completed",
+      "createdAt": "2026-11-16T08:00:00.000Z",
+      "updatedAt": "2026-11-16T09:05:00.000Z"
+    },
+    {
+      "id": "P86-001",
+      "title": "Parent programme workflow dispatching child task workflows, with a three-task continuation proof",
+      "phase": "8.6",
+      "dependsOn": [],
+      "riskClass": "critical",
+      "executionPolicy": {
+        "enforcement": "fail-closed",
+        "gate": "programme-graph-validation",
+        "rationale": "The parent refuses to dispatch an invalid graph and never authorises execution; a programme that can dispatch around the claim or the approval gate reopens the O1 defect."
+      },
+      "acceptanceCriteria": [
+        "One submission and no further calls: three dependent tasks reach succeeded",
+        "Checkpoints recorded in dependency order, each naming the claim of its own attempt",
+        "A permanently failed node blocks only its dependents while independent branches still succeed"
+      ],
+      "evidenceRequirement": {
+        "kind": "test",
+        "artifact": "apps/worker/test/programme-execution.test.ts",
+        "note": "Commit 2321c0d. Rows read back: Programme succeeded, 3 checkpoints in order, 3 tasks each with its own claimed attempt. Isolation: B failed, C blocked at the scheduler with attemptCount 0, D succeeded."
+      },
+      "owner": "node-developer",
+      "status": "completed",
+      "createdAt": "2026-11-16T08:00:00.000Z",
+      "updatedAt": "2026-11-16T09:05:00.000Z"
+    },
+    {
+      "id": "P86-002",
+      "title": "Stop the gRPC retry timer outliving the channel so e2e exits 0",
+      "phase": "8.6",
+      "dependsOn": [],
+      "riskClass": "moderate",
+      "executionPolicy": {
+        "enforcement": "advisory",
+        "gate": "e2e-exit-status",
+        "rationale": "A suite that reports 141 passed and exits 1 is a false red, and a false red trains everyone to ignore the exit code."
+      },
+      "acceptanceCriteria": [
+        "Offline suites schedule no gRPC retry timer at all",
+        "e2e reports the same counts and exits 0 repeatedly",
+        "No unhandledRejection handler or ignore-errors flag introduced"
+      ],
+      "evidenceRequirement": {
+        "kind": "test",
+        "artifact": "apps/api/test/risk-approval.e2e-spec.ts",
+        "note": "Commit b4408e8. maxAttempts 10 gave an uncaught Channel error 3/3; maxAttempts 1 gave clean exit 3/3, and e2e fell from 75.8s to 24-40s because the retry chain no longer exists."
+      },
+      "owner": "node-developer",
+      "status": "completed",
+      "createdAt": "2026-11-16T08:00:00.000Z",
+      "updatedAt": "2026-11-16T09:05:00.000Z"
     }
   ],
   "pendingTasks": [
@@ -318,7 +396,10 @@
   ],
   "completedTasks": [
     "P83-001",
-    "P83-002"
+    "P83-002",
+    "P83-012",
+    "P86-001",
+    "P86-002"
   ],
   "history": [
     {
@@ -353,6 +434,15 @@
         "apps/worker/src/cgroup-hygiene.ts",
         "apps/worker/test/cgroup-cleanup.test.ts",
         "infra/scripts/reconcile-test-cgroups.ts"
+      ]
+    },
+    {
+      "at": "2026-11-16T09:05:00.000Z",
+      "summary": "Programme layer built and proven: one submission drives three dependent tasks with no further calls, and a failed node blocks only its dependents. I/O write throttling proven on the worker leaf; the gRPC teardown false red removed at its source.",
+      "evidence": [
+        "docs/engineering/phase8-autonomy/EXISTING-ARCHITECTURE-MAP.md",
+        "docs/engineering/phase8-host-boundary/IO-ENFORCEMENT-PROOF.md",
+        "apps/worker/test/programme-execution.test.ts"
       ]
     }
   ]

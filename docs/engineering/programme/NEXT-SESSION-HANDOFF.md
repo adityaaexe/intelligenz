@@ -215,3 +215,60 @@ reached `worker polling` and was killed by `timeout` (exit 124); in-leaf verdict
    no test run has added a third.
 5. Pick the next unblocked task from §4. P83-007 is the one that extends a proof that already
    exists, so it is the cheapest honest next step.
+
+---
+
+## Checkpoint 8.6 — the programme layer exists (2026-11-16, `b4408e8`)
+
+**This section supersedes the "first five actions" above** — the fail-closed gate and cleanup
+are done; the boundary moved.
+
+### What changed since the section above
+
+| Commit | What |
+|---|---|
+| `1cf3c58` | I/O write throttling measured on the worker leaf: 245 MB/s → 4.3 MB/s (57×) at `wbps=4194304`, process in `0::/intelligenz/worker`. `io.max` restored. |
+| `2321c0d` | **The programme layer.** `Programme` / `ProgrammeTask` (`dependsOn`) / `ProgrammeCheckpoint`, parent `runProgrammeWorkflow` dispatching CHILD `runTaskWorkflow`s, `POST /programmes`. Proven: one submission → three dependent tasks, checkpoints in order, three distinct claims. Failure isolation: a failed node blocks only its dependents. |
+| `b4408e8` | e2e false red removed: gRPC retry timer no longer outlives the channel (`TEMPORAL_RPC_MAX_ATTEMPTS`, default 10 unchanged). e2e 75.8 s → 24–40 s. |
+
+### Read this before writing code
+
+1. `docs/engineering/phase8-autonomy/EXISTING-ARCHITECTURE-MAP.md` — measured, not proposed.
+2. `apps/worker/src/workflows/run-programme.ts` — the parent. It **dispatches and awaits; it
+   never authorises.** The claim, approval binding and launch-site gate stay in `runTaskWorkflow`.
+3. `apps/worker/test/programme-execution.test.ts` — the three-task E2E. Every assertion reads
+   **database rows**, never the return value.
+4. `apps/worker/test/contract.test.ts` — exact-match on all **ten** activity names. Adding an
+   activity without updating `PHASE-2-CONTRACT.md` §16 fails here, by design.
+
+### What is NOT done, and the order I would take it
+
+1. **No planner.** A human or client supplies the graph. The validator
+   (`packages/contracts/src/programme-graph.ts`) is pure and planner-independent, so an LLM
+   planner can be added and judged by the same five rules. This is the biggest remaining gap
+   between "continues without a prompt" and "autonomous".
+2. **Approval-gated nodes do not resume.** A HIGH node records `waiting_for_approval` and the
+   programme ends `blocked`. Making the scheduler spend a grant would let it authorise
+   execution — a governance decision, not a patch.
+3. `P83-007` per-attempt `io.max` and `P83-008` per-attempt accounting — needed before
+   `maxConcurrent > 1` is safe. The seam exists (default 1, ceiling 4).
+4. `P83-003/004` — host privilege. **BLOCKED on operator authorisation**, not on code.
+   `sudo -n true` still returns root.
+5. `P83-011` — two Phase 7 documents the matrix still cites but that do not exist.
+
+### Traps that cost time last session
+
+- Do **not** set `TMPDIR` to a longer path: the broker unix socket limit is 107 bytes and a
+  longer root produced 11 false failures.
+- cgroup enforcement is tier-by-launch: run `infra/scripts/worker-with-cgroup.sh` or the worker
+  refuses (correctly).
+- A leaked `sh -c while :; do :; done` from a cpu-budget run spun for 36.7 h before it was
+  found. Check `ps` before blaming the host.
+- `oom3-687854` is empty but its two-segment name is produced by no code path — refused, not
+  guessed.
+
+### Verify a cold start in one command
+
+```bash
+pnpm -w typecheck && pnpm -w lint && pnpm -w test && pnpm --filter @intelligenz/api test:e2e && pnpm programme:check
+```
