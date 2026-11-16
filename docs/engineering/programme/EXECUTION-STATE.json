@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "programme": "INTELLIGENZ",
   "branch": "phase-6/trust-boundary-closure",
-  "head": "d7a817d61a06847eb14dbae628972af4bb8a4c79",
-  "phase": "8.8",
+  "head": "430c39db2317c825cc6a04aca1179a7a373bb5e6",
+  "phase": "8.9",
   "createdAt": "2026-11-16T03:30:00.000Z",
-  "updatedAt": "2026-11-16T12:50:00.000Z",
+  "updatedAt": "2026-11-16T17:45:00.000Z",
   "tasks": [
     {
       "id": "P83-001",
@@ -755,14 +755,14 @@
         "The cancellation handler still never overwrites a completed node."
       ],
       "evidenceRequirement": {
-        "kind": "test",
-        "artifact": "apps/worker/test/programme-cancellation.test.ts",
-        "note": "OPEN, disclosed by P87-010 as known limitation 6.2. Current test asserts stranded <= 1; the target is 0."
+        "kind": "document",
+        "artifact": "docs/engineering/phase8.9-operator-preview/P88-001-CANCELLATION-RESIDUE.md",
+        "note": "Root cause located, implementation NOT done. reserveProgrammeTaskActivity sets ProgrammeTask.status=running inside the reservation transaction (~:434) and only a checkpoint can move it, so a cancellation between reservation and checkpoint leaves the node running for ever. Fix design: settle in-flight nodes inside finishProgrammeActivity, one transaction, no new activity. This cycle chose the preview deliverable instead; recorded, not passed."
       },
       "owner": "node-developer",
-      "status": "planned",
+      "status": "ready",
       "createdAt": "2026-11-16T12:50:00.000Z",
-      "updatedAt": "2026-11-16T12:50:00.000Z",
+      "updatedAt": "2026-11-16T17:45:00.000Z",
       "id": "P88-001",
       "title": "Settle the interrupted node when a programme is cancelled"
     },
@@ -904,6 +904,90 @@
       "updatedAt": "2026-11-16T12:50:00.000Z",
       "id": "P88-006",
       "title": "Control-centre design in Figma"
+    },
+    {
+      "phase": "8.9",
+      "dependsOn": [],
+      "riskClass": "high",
+      "executionPolicy": {
+        "enforcement": "fail-closed",
+        "gate": "preview-no-data-before-auth",
+        "rationale": "The existing overview is client-side and would call localhost:4100 from the phone; a server-rendered route keeps the API private."
+      },
+      "acceptanceCriteria": [
+        "Renders ledger counts with the formula shown and never counts blocked/planned as complete.",
+        "Unavailable dependencies render as NOT CHECKED or UNKNOWN, never healthy.",
+        "Shared secrets and internal endpoints do not appear in the HTML.",
+        "No mutating control, no client JS, no polling.",
+        "Mobile layout without horizontal overflow."
+      ],
+      "evidenceRequirement": {
+        "kind": "test",
+        "artifact": "apps/web/src/lib/preview-data.test.ts",
+        "note": "Commit 430c39d. 30/30 unit tests, web typecheck 0, lint 0, next build pass, 200 with auth. Zero occurrences of password, DATABASE_URL, JWT_SECRET, 127.0.0.1 or localhost:4100 in the rendered body. Mobile measured headless at 360/390/412px."
+      },
+      "owner": "frontend-react",
+      "status": "completed",
+      "createdAt": "2026-11-16T17:45:00.000Z",
+      "updatedAt": "2026-11-16T17:45:00.000Z",
+      "id": "P89-001",
+      "title": "Server-rendered read-only operator preview"
+    },
+    {
+      "phase": "8.9",
+      "dependsOn": [],
+      "riskClass": "high",
+      "executionPolicy": {
+        "enforcement": "fail-closed",
+        "gate": "tunnel-email-gate",
+        "rationale": "A public tunnel without a gate would expose the app to the internet; Quick Tunnel --allowed-mail is the gate this version supports."
+      },
+      "acceptanceCriteria": [
+        "Only 3100 is tunneled; API, DB, Redis and Temporal are not exposed.",
+        "Unauthenticated requests are intercepted before the origin and return no application data.",
+        "The URL is read from the process output, never fabricated.",
+        "The process is identifiable and stopped by recorded PID only."
+      ],
+      "evidenceRequirement": {
+        "kind": "measurement",
+        "artifact": "docs/engineering/phase8.9-operator-preview/PREVIEW-SECURITY-REVIEW.md",
+        "note": "cloudflared 2026.11.0 verified to support --allowed-mail. Unauthenticated /preview returns 302 to login.trycloudflare.com with 0 bytes and 0 ledger strings. Ports 3000/4000 untouched. The authorised-email leg is NOT verified by the agent: it needs the operator mailbox."
+      },
+      "owner": "frontend-react",
+      "status": "completed",
+      "createdAt": "2026-11-16T17:45:00.000Z",
+      "updatedAt": "2026-11-16T17:45:00.000Z",
+      "id": "P89-002",
+      "title": "Access-restricted temporary Cloudflare preview"
+    },
+    {
+      "phase": "8.9",
+      "dependsOn": [
+        "P89-002"
+      ],
+      "riskClass": "low",
+      "executionPolicy": {
+        "enforcement": "advisory",
+        "gate": "operator-acceptance",
+        "rationale": "Layout was measured in headless Chrome only; the tunnel URL and the email OTP path can only be proven on the operator device."
+      },
+      "acceptanceCriteria": [
+        "Operator opens the URL on Android and completes the email gate.",
+        "Basic auth accepts the preview credential.",
+        "Data renders and no horizontal scroll is observed.",
+        "Any failure is reported with the exact step."
+      ],
+      "evidenceRequirement": {
+        "kind": "attestation",
+        "artifact": "docs/engineering/phase8.9-operator-preview/VERIFICATION-MATRIX.md",
+        "note": "NOT RUN. Requires the operator phone and mailbox."
+      },
+      "owner": "frontend-react",
+      "status": "planned",
+      "createdAt": "2026-11-16T17:45:00.000Z",
+      "updatedAt": "2026-11-16T17:45:00.000Z",
+      "id": "P89-003",
+      "title": "Verify the preview from a real mobile device"
     }
   ],
   "pendingTasks": [
@@ -923,7 +1007,8 @@
     "P88-003",
     "P88-004",
     "P88-005",
-    "P88-006"
+    "P88-006",
+    "P89-003"
   ],
   "completedTasks": [
     "P83-001",
@@ -940,7 +1025,9 @@
     "P87-007",
     "P87-008",
     "P87-010",
-    "P87-012"
+    "P87-012",
+    "P89-001",
+    "P89-002"
   ],
   "history": [
     {
@@ -1015,6 +1102,15 @@
         "docs/engineering/phase8.8-operations/PROGRAMME-CANCELLATION-CONTRACT.md",
         "docs/engineering/phase8.8-operations/DEADLINE-SEMANTICS-AND-PROOF.md",
         "docs/engineering/phase9-observability/PHASE9-TELEMETRY-CONTRACT.md"
+      ]
+    },
+    {
+      "at": "2026-11-16T17:45:00.000Z",
+      "summary": "Phase 8.9: a server-rendered read-only preview shipped at /preview and was exposed through an email-restricted Cloudflare Quick Tunnel, verified at the gate and checked for secret leakage. P88-001 root cause was located and documented but not implemented; P88-003 and P88-002 were not started. Production remains NO-GO.",
+      "evidence": [
+        "docs/engineering/phase8.9-operator-preview/PHASE89-REPORT.md",
+        "docs/engineering/phase8.9-operator-preview/PREVIEW-SECURITY-REVIEW.md",
+        "docs/engineering/phase8.9-operator-preview/P88-001-CANCELLATION-RESIDUE.md"
       ]
     }
   ]

@@ -389,3 +389,51 @@ pnpm -w typecheck && pnpm -w lint && pnpm -w test && pnpm --filter @intelligenz/
 ```bash
 pnpm -w typecheck && pnpm -w lint && pnpm -w test && pnpm --filter @intelligenz/api test:e2e && pnpm programme:check
 ```
+
+---
+
+## Checkpoint 8.9 — an operator preview, and the reliability work it displaced (2026-11-16, `430c39d`)
+
+### Verified state
+
+| Fact | Value |
+|---|---|
+| Branch | `phase-6/trust-boundary-closure` |
+| Code head | `430c39d` (web preview) |
+| Worktree | clean after the documentation commit |
+| Ledger | VALID, phase 8.9, 35 tasks (17 completed, 6 blocked, 11 planned, 1 ready) |
+| Web gates | typecheck 0, lint 0, 30/30 preview tests, next build pass |
+| Production | **NO-GO** |
+
+### The preview
+
+- Page: `/preview` — **server-rendered**, reads the ledger from disk and `127.0.0.1:4100/health/ready`. No browser→API call, which is why the API stays private.
+- URL: `https://sci-imagination-velocity-nhs.trycloudflare.com` (ephemeral — if it is dead, read the current one from `/tmp/opencode/preview/cloudflared.log`).
+- Gate 1: Cloudflare `--allowed-mail` (verified to exist in cloudflared **2026.11.0**).
+- Gate 2: HTTP Basic on `/preview` only; credentials in `/tmp/opencode/preview-credentials.txt` (mode 600, outside the repo). Rotate by editing the file and restarting `next start`; no rebuild needed.
+- Stop: `kill "$(cat /tmp/opencode/preview/cloudflared.pid)"` after `ps` identity check.
+- Documents: `docs/engineering/phase8.9-operator-preview/` — report, data contract, security review, verification matrix, P88-001 residue.
+
+### What is NOT done, in priority order
+
+1. **P88-001 is `ready`, not done.** Root cause: `reserveProgrammeTaskActivity` writes `ProgrammeTask.status='running'` inside the reservation transaction, and only a checkpoint can clear it; a cancellation in between strands the node. The fix design (settle in-flight nodes inside `finishProgrammeActivity`, one transaction, no new activity) is in `P88-001-CANCELLATION-RESIDUE.md`. Target: the cancellation test asserts **0** stranded nodes, not `<= 1`.
+2. **P88-003** — `P2034`/`P2028` still unmapped; a transaction conflict answers 500.
+3. **P88-002** — deadline still invisible to operators.
+4. **P87-011** — still blocked on a captured occurrence; no new evidence.
+5. **P87-009** — still BLOCKED_POLICY on D1–D3.
+6. **P89-003** — the preview has not been opened from a real phone; headless only. The authorised-email leg is the operator's first visit.
+7. Phase 9 ingestion — NOT RUN (no SDK/tool/project identity).
+
+### New traps
+
+- **Never stop processes by pattern.** A `pkill -f "pnpm start"` during this cycle killed the API and could have hit anything. Use the recorded PID.
+- The web app is a **client-side SPA** for its existing screens: `src/lib/api.ts` calls `http://localhost:4100` **from the browser**. Any tunnel of 3100 alone breaks those screens on a phone. `/preview` exists because it fetches server-side; do not "fix" it by exposing 4100.
+- `next start` serves a **prebuilt** `.next`: a new route needs a rebuild, and Basic-auth env vars are read at **runtime** (restart, not rebuild).
+- `cloudflared` is a user binary at `~/.local/bin/cloudflared`, not a system package.
+- The ledger's `head` names the last code commit; the checkout can be newer by documentation commits. The preview shows both rather than assuming they match.
+
+### Verify a cold start in one command
+
+```bash
+pnpm -w typecheck && pnpm -w lint && pnpm -w test && pnpm --filter @intelligenz/api test:e2e && pnpm programme:check
+```
