@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "programme": "INTELLIGENZ",
   "branch": "phase-6/trust-boundary-closure",
-  "head": "b4408e8fb308ecd05899488b4c52138fd0e468ea",
-  "phase": "8.6",
+  "head": "0b68b9ba11c9d96e128cd143156f2868b8ba74fa",
+  "phase": "8.7",
   "createdAt": "2026-11-16T03:30:00.000Z",
-  "updatedAt": "2026-11-16T09:05:00.000Z",
+  "updatedAt": "2026-11-16T11:55:00.000Z",
   "tasks": [
     {
       "id": "P83-001",
@@ -381,6 +381,362 @@
       "status": "completed",
       "createdAt": "2026-11-16T08:00:00.000Z",
       "updatedAt": "2026-11-16T09:05:00.000Z"
+    },
+    {
+      "phase": "8.7",
+      "dependsOn": [],
+      "executionPolicy": {
+        "enforcement": "fail-closed",
+        "gate": "authority-review",
+        "rationale": "The new ability to mint an ExecutionAttempt from the scheduler was unreviewed; a boundary nobody challenged is a boundary nobody knows."
+      },
+      "acceptanceCriteria": [
+        "HEAD, branch, worktree and the 18 models / 9 migrations / 10 activities are verified from the filesystem, not the report.",
+        "An independent reviewer answers ten authority questions with file:line citations.",
+        "The lead re-verifies every load-bearing claim before accepting it; disagreements are recorded, not smoothed.",
+        "Authority verdicts are recorded per boundary as ENFORCED / PARTIAL / UNENFORCED, never as a single overall PASS."
+      ],
+      "evidenceRequirement": {
+        "kind": "review",
+        "artifact": "docs/engineering/phase8.7-governed-planner/PHASE87-REPORT.md",
+        "note": "Review delivered 11 findings. Six load-bearing facts re-verified by the lead, including the SDK child-id default, the cancel target, the checkpoint upsert predicate and the reservation check order."
+      },
+      "owner": "reviewer",
+      "status": "completed",
+      "createdAt": "2026-11-16T10:00:00.000Z",
+      "updatedAt": "2026-11-16T10:20:00.000Z",
+      "id": "P87-001",
+      "title": "Reconcile the 8.6 baseline and commission an independent authority review",
+      "riskClass": "critical"
+    },
+    {
+      "phase": "8.7",
+      "dependsOn": [
+        "P87-001"
+      ],
+      "executionPolicy": {
+        "enforcement": "fail-closed",
+        "gate": "regression-test-per-defect",
+        "rationale": "Two HIGH defects made a lost activity response wedge a task, and made a cancelled task report success. Both were reachable without any attacker."
+      },
+      "acceptanceCriteria": [
+        "A retried reservation that finds its own committed rows answers `reserved`, not `not_runnable`.",
+        "A programme child runs under `task-<taskId>`, so cancellation reaches it and the checkpoint names an execution an operator can re-probe.",
+        "A cancel that Temporal answers `not_found` refuses with 409 and writes nothing locally.",
+        "A reservation whose child never starts is compensated: run and attempt failed, task back to `ready` under a CAS.",
+        "A terminal programme refuses a reservation, and `load` reports the status it committed.",
+        "A task held elsewhere is recorded `blocked`, not `failed`; a genuinely failed task stays `failed`.",
+        "A checkpoint sequence collision cannot relabel another task row.",
+        "The PROGRAMME_AUTHORITY_REFUSED arm has a test that fails if the equality check is removed."
+      ],
+      "evidenceRequirement": {
+        "kind": "test",
+        "artifact": "apps/worker/test/programme-execution.test.ts",
+        "note": "Commit 34eaedf. 11 tests (3 pre-existing + 8 new), each named after the defect. Lead re-ran: 11/11. Full suite 1024 passed / 15 skipped; API e2e 142; typecheck 0; lint 0."
+      },
+      "owner": "node-developer",
+      "status": "completed",
+      "createdAt": "2026-11-16T10:00:00.000Z",
+      "updatedAt": "2026-11-16T10:30:00.000Z",
+      "id": "P87-002",
+      "title": "Close the seven programme authority defects the review found",
+      "riskClass": "critical"
+    },
+    {
+      "phase": "8.7",
+      "dependsOn": [
+        "P87-002"
+      ],
+      "executionPolicy": {
+        "enforcement": "fail-closed",
+        "gate": "deterministic-validation",
+        "rationale": "A proposal is untrusted data. If validation is part of the planner, the planner can pass itself."
+      },
+      "acceptanceCriteria": [
+        "A strict, versioned proposal schema; unknown fields are refused so provenance cannot be smuggled in.",
+        "Graph rules are delegated to `validateProgrammeGraph`; no second cycle detector exists.",
+        "Title and goal caps match `CreateTaskInput`, so a plan that validates can actually be materialised.",
+        "A schema-valid but unschedulable proposal is reported with structured issues, never silently repaired.",
+        "The canonical content hash is stable under task reordering and changes when one criterion changes."
+      ],
+      "evidenceRequirement": {
+        "kind": "test",
+        "artifact": "packages/contracts/src/plan.test.ts",
+        "note": "Commit fced403. 24 contract tests plus 9 existing graph tests, re-run by the lead. `node:crypto` lives in a separate non-barrel subpath because contracts is bundled into the Temporal sandbox."
+      },
+      "owner": "node-developer",
+      "status": "completed",
+      "createdAt": "2026-11-16T10:00:00.000Z",
+      "updatedAt": "2026-11-16T10:45:00.000Z",
+      "id": "P87-003",
+      "title": "Define the proposal contract and reuse the one graph validator",
+      "riskClass": "critical"
+    },
+    {
+      "phase": "8.7",
+      "dependsOn": [
+        "P87-003"
+      ],
+      "executionPolicy": {
+        "enforcement": "fail-closed",
+        "gate": "approval-creates-no-execution",
+        "rationale": "Plan approval must never become execution authority. The test is row counts: approve writes none."
+      },
+      "acceptanceCriteria": [
+        "Approval creates zero Task, zero Programme and zero ExecutionAttempt rows, asserted by counts before and after.",
+        "The approver is the JWT subject; no body field can name an approver, a status or a hash.",
+        "Four-eyes is enforced through the existing `allowsSelfApproval` policy and audited on refusal.",
+        "Submission refuses a changed proposal (hash), an expired approval, and a proposal that no longer validates.",
+        "Duplicate submission yields one programme; duplicate proposal with the same Idempotency-Key calls the model once.",
+        "The planner’s risk class is a claim; the server derives the effective class and never spends a grant.",
+        "An unconfigured provider answers 503 and writes no row."
+      ],
+      "evidenceRequirement": {
+        "kind": "test",
+        "artifact": "apps/api/test/plans.e2e-spec.ts",
+        "note": "Commit 0a222ba. 17 e2e tests against a 127.0.0.1 stub with no internet. Lead re-ran the suite: 159 passed. Provider is `http-llm` only; there is no heuristic fallback planner."
+      },
+      "owner": "node-developer",
+      "status": "completed",
+      "createdAt": "2026-11-16T10:00:00.000Z",
+      "updatedAt": "2026-11-16T11:00:00.000Z",
+      "id": "P87-004",
+      "title": "Persist plans and separate the approval decision from submission",
+      "riskClass": "critical"
+    },
+    {
+      "phase": "8.7",
+      "dependsOn": [
+        "P87-002"
+      ],
+      "executionPolicy": {
+        "enforcement": "advisory",
+        "gate": "reason-code-vocabulary",
+        "rationale": "Prose that embeds task ids cannot be filtered or charted; \"blocked because an approval is pending\" and \"blocked because a dependency failed\" were only distinguishable by parsing English."
+      },
+      "acceptanceCriteria": [
+        "A closed code vocabulary; NULL means the row predates the column and is read as UNSPECIFIED, never as success.",
+        "The code is written in the same conditional UPDATE as the terminal status, and cleared on success.",
+        "The code rides the `programme.finished.v1` audit payload so telemetry can read it without a second write.",
+        "A succeeded programme returns null, not UNSPECIFIED."
+      ],
+      "evidenceRequirement": {
+        "kind": "test",
+        "artifact": "apps/api/test/programmes-failure-code.test.ts",
+        "note": "Commit 0b68b9b. Includes an exact-ten-codes drift guard; worker tests assert APPROVAL_PENDING, TASK_FAILED and DEADLINE_EXCEEDED on real programmes."
+      },
+      "owner": "node-developer",
+      "status": "completed",
+      "createdAt": "2026-11-16T10:00:00.000Z",
+      "updatedAt": "2026-11-16T11:10:00.000Z",
+      "id": "P87-005",
+      "title": "Give a programme stop reason a machine-readable code",
+      "riskClass": "moderate"
+    },
+    {
+      "phase": "8.7",
+      "dependsOn": [
+        "P87-002"
+      ],
+      "executionPolicy": {
+        "enforcement": "fail-closed",
+        "gate": "continuation-crossing",
+        "rationale": "The mechanism existed and had never been crossed. A boundary asserted to exist is not a boundary proved to work."
+      },
+      "acceptanceCriteria": [
+        "A real workflow crosses the boundary at least twice and finishes succeeded.",
+        "The checkpoint sequence is carried forward, not restarted at zero.",
+        "Every checkpoint names the attempt that claimed it, across the boundary.",
+        "A negative control with the boundary above the checkpoint count does not cross, so the positive assertion is not always true.",
+        "The crossing is established from the execution history, not from a code path or a log line."
+      ],
+      "evidenceRequirement": {
+        "kind": "test",
+        "artifact": "apps/worker/test/programme-continue-as-new.test.ts",
+        "note": "Commit 0b68b9b. 3 runs, 2 crossings, history link read from `WorkflowExecutionContinuedAsNew` (describe() does not expose it in SDK 1.25.0). The test forced a real fix: the backstop compared the cumulative sequence, which would have continued for ever after the first crossing."
+      },
+      "owner": "node-developer",
+      "status": "completed",
+      "createdAt": "2026-11-16T10:00:00.000Z",
+      "updatedAt": "2026-11-16T11:20:00.000Z",
+      "id": "P87-006",
+      "title": "Prove the Continue-As-New boundary by crossing it",
+      "riskClass": "high"
+    },
+    {
+      "phase": "8.7",
+      "dependsOn": [
+        "P87-004"
+      ],
+      "executionPolicy": {
+        "enforcement": "advisory",
+        "gate": "no-content-in-telemetry",
+        "rationale": "PostHog has never ingested an event from this project. A dashboard built now would be a drawing, and a property carrying an objective would ship user content to a third party."
+      },
+      "acceptanceCriteria": [
+        "Twelve events mapped to the transition that triggers them, each marked existing or proposed.",
+        "Every property is an enum, count, internal id or bucketed duration; no prompts, goals, criteria, paths, notes or hashes.",
+        "Deduplication is the audit idempotency key as `$insert_id`; the audit log is the source of truth.",
+        "Product and operational classes are separated so blocked work cannot inflate adoption."
+      ],
+      "evidenceRequirement": {
+        "kind": "document",
+        "artifact": "docs/engineering/phase8.7-governed-planner/TELEMETRY-EVENT-CONTRACT.md",
+        "note": "Design only. No projector exists and no event was sent. States plainly that ingested_event=false means no adoption claim is possible."
+      },
+      "owner": "it-leader",
+      "status": "completed",
+      "createdAt": "2026-11-16T10:00:00.000Z",
+      "updatedAt": "2026-11-16T11:25:00.000Z",
+      "id": "P87-007",
+      "title": "Define the telemetry event contract without emitting anything",
+      "riskClass": "moderate"
+    },
+    {
+      "phase": "8.7",
+      "dependsOn": [
+        "P87-004"
+      ],
+      "executionPolicy": {
+        "enforcement": "advisory",
+        "gate": "proposed-never-looks-approved",
+        "rationale": "The most likely user error is reading a clean proposed plan as an authorised one."
+      },
+      "acceptanceCriteria": [
+        "Every plan and programme status has a label, a tone and an explicit \"never\" list.",
+        "Approve is disabled for a non-admin, a proposer, an invalid plan, and its reason is shown rather than hidden.",
+        "Approval and submission are never one gesture.",
+        "A blocked programme shows its reason code and states that approving the task does not resume the programme.",
+        "Status is conveyed by text plus colour; the dependency table is the accessible representation."
+      ],
+      "evidenceRequirement": {
+        "kind": "document",
+        "artifact": "docs/engineering/phase8.7-governed-planner/CONTROL-PLANE-UX-REQUIREMENTS.md",
+        "note": "Requirements only. No Figma file key was supplied, no file was created, no credits spent, no UI code changed."
+      },
+      "owner": "designer",
+      "status": "completed",
+      "createdAt": "2026-11-16T10:00:00.000Z",
+      "updatedAt": "2026-11-16T11:30:00.000Z",
+      "id": "P87-008",
+      "title": "Specify the control-plane UX without building it",
+      "riskClass": "moderate"
+    },
+    {
+      "phase": "8.7",
+      "dependsOn": [
+        "P87-004"
+      ],
+      "executionPolicy": {
+        "enforcement": "fail-closed",
+        "gate": "governance-decision-D1-D3",
+        "rationale": "Whether a stopped programme may be re-opened is a scheduling-authority decision, not inferable from the approval policy. Implementing it without the decision would invent governance."
+      },
+      "acceptanceCriteria": [
+        "A policy decision records who may re-open a blocked programme and whether that is the same row.",
+        "Whether an approval decision may cause a dispatch attempt is decided, not assumed.",
+        "Resume count and deadline behaviour are decided.",
+        "Any implementation re-enters through the reservation authority check and never spends a grant.",
+        "Duplicate resume and duplicate approval cannot produce two executions."
+      ],
+      "evidenceRequirement": {
+        "kind": "document",
+        "artifact": "docs/engineering/phase8.7-governed-planner/APPROVAL-RESUMPTION-DESIGN.md",
+        "note": "BLOCKED. Three independent blockers verified: the workflow closed under ALLOW_DUPLICATE_FAILED_ONLY, nothing observes a decision, and the terminal row is refused by the reservation. D1-D3 are blocking; no endpoint or schema field was added."
+      },
+      "owner": "it-leader",
+      "status": "blocked",
+      "createdAt": "2026-11-16T10:00:00.000Z",
+      "updatedAt": "2026-11-16T11:35:00.000Z",
+      "id": "P87-009",
+      "title": "Resume an approval-gated programme node after a valid decision",
+      "riskClass": "critical"
+    },
+    {
+      "phase": "8.7",
+      "dependsOn": [
+        "P87-002"
+      ],
+      "executionPolicy": {
+        "enforcement": "fail-closed",
+        "gate": "programme-cancel",
+        "rationale": "Cancellation of a programme is reachable only out of band today; the workflow half works but no API route names programme-<id>, so journey 8 is partial."
+      },
+      "acceptanceCriteria": [
+        "POST /programmes/:id/cancel reaches programme-<id> and does not write the terminal status locally.",
+        "The non-cancellable scope records `cancelled` with code CANCELLED and no further node is dispatched.",
+        "A not_found answer refuses rather than writing a local cancellation.",
+        "A test asserts the durable terminal row and that no task started after it."
+      ],
+      "evidenceRequirement": {
+        "kind": "test",
+        "artifact": "apps/api/test/programmes.e2e-spec.ts",
+        "note": "NOT DONE. Deferred deliberately rather than added unverified at the end of a session. The child-cancellation half is proven by commit 34eaedf."
+      },
+      "owner": "node-developer",
+      "status": "planned",
+      "createdAt": "2026-11-16T10:00:00.000Z",
+      "updatedAt": "2026-11-16T11:40:00.000Z",
+      "id": "P87-010",
+      "title": "Add a programme cancellation endpoint that stops dispatch",
+      "riskClass": "high"
+    },
+    {
+      "phase": "8.7",
+      "dependsOn": [
+        "P87-004"
+      ],
+      "executionPolicy": {
+        "enforcement": "fail-closed",
+        "gate": "reproduced-before-classified",
+        "rationale": "One failure in eight full-suite runs, then seven consecutive passes and a clean isolated run. Calling it flaky without the assertion would be a guess; calling it fixed would be a lie."
+      },
+      "acceptanceCriteria": [
+        "The failing assertion is captured from a real failing run.",
+        "The mechanism is identified as product (a status code under contention) or harness (interleaving).",
+        "If product, the specific defect is fixed and a regression test fails without the fix.",
+        "If harness, the test asserts the same property without depending on scheduling."
+      ],
+      "evidenceRequirement": {
+        "kind": "test",
+        "artifact": "apps/api/test/approval-attempt-binding.e2e-spec.ts",
+        "note": "OPEN. Failing test: \"reserves exactly one attempt and one grant, and refuses the loser with 409\". No assertion captured; not reproduced in 7 subsequent runs. The planner commit did not touch the POST /run path (verified diff)."
+      },
+      "owner": "node-developer",
+      "status": "planned",
+      "createdAt": "2026-11-16T10:00:00.000Z",
+      "updatedAt": "2026-11-16T11:45:00.000Z",
+      "id": "P87-011",
+      "title": "Reproduce the intermittent approval-attempt-binding e2e failure",
+      "riskClass": "high"
+    },
+    {
+      "phase": "8.7",
+      "dependsOn": [
+        "P87-005"
+      ],
+      "executionPolicy": {
+        "enforcement": "advisory",
+        "gate": "result-matches-row",
+        "rationale": "On the deadline path the row says timed_out while the returned result derives blocked from node states. A return value that contradicts the durable row is the class of inconsistency this programme exists to remove."
+      },
+      "acceptanceCriteria": [
+        "The deadline path returns status timed_out, matching the row.",
+        "No other terminal path returns a status the row does not hold.",
+        "A test asserts the return value and the row together."
+      ],
+      "evidenceRequirement": {
+        "kind": "test",
+        "artifact": "apps/worker/test/programme-execution.test.ts",
+        "note": "OPEN, disclosed by P87-006. Pre-existing; deliberately not fixed at the end of the session without its own verification."
+      },
+      "owner": "node-developer",
+      "status": "planned",
+      "createdAt": "2026-11-16T10:00:00.000Z",
+      "updatedAt": "2026-11-16T11:50:00.000Z",
+      "id": "P87-012",
+      "title": "Make the workflow return value agree with the terminal row on the deadline path",
+      "riskClass": "moderate"
     }
   ],
   "pendingTasks": [
@@ -392,14 +748,26 @@
     "P83-008",
     "P83-009",
     "P83-010",
-    "P83-011"
+    "P83-011",
+    "P87-009",
+    "P87-010",
+    "P87-011",
+    "P87-012"
   ],
   "completedTasks": [
     "P83-001",
     "P83-002",
     "P83-012",
     "P86-001",
-    "P86-002"
+    "P86-002",
+    "P87-001",
+    "P87-002",
+    "P87-003",
+    "P87-004",
+    "P87-005",
+    "P87-006",
+    "P87-007",
+    "P87-008"
   ],
   "history": [
     {
@@ -443,6 +811,17 @@
         "docs/engineering/phase8-autonomy/EXISTING-ARCHITECTURE-MAP.md",
         "docs/engineering/phase8-host-boundary/IO-ENFORCEMENT-PROOF.md",
         "apps/worker/test/programme-execution.test.ts"
+      ]
+    },
+    {
+      "at": "2026-11-16T11:55:00.000Z",
+      "summary": "Phase 8.7: the programme authority boundary was independently reviewed and seven defects were closed; a proposal-only planner was added with plan approval kept separate from submission and from per-task approval; a programme stop reason became machine-readable; the Continue-As-New boundary was crossed in a real test, which exposed a would-be infinite continuation loop and forced its fix. Approval resumption is blocked on governance decisions D1-D3 and was not invented.",
+      "evidence": [
+        "docs/engineering/phase8.7-governed-planner/PHASE87-REPORT.md",
+        "docs/engineering/phase8.7-governed-planner/PROGRAMME-TRANSITIONS.md",
+        "docs/engineering/phase8.7-governed-planner/TELEMETRY-EVENT-CONTRACT.md",
+        "docs/engineering/phase8.7-governed-planner/CONTROL-PLANE-UX-REQUIREMENTS.md",
+        "docs/engineering/phase8.7-governed-planner/APPROVAL-RESUMPTION-DESIGN.md"
       ]
     }
   ]

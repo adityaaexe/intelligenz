@@ -272,3 +272,62 @@ are done; the boundary moved.
 ```bash
 pnpm -w typecheck && pnpm -w lint && pnpm -w test && pnpm --filter @intelligenz/api test:e2e && pnpm programme:check
 ```
+
+---
+
+## Checkpoint 8.7 — governed planner, and the authority review that came first (2026-11-16, `0b68b9b`)
+
+**This section supersedes Checkpoint 8.6's "what is not done" list.** The planner exists,
+the programme authority boundary was reviewed and repaired, and the Continue-As-New
+boundary has been crossed in a test.
+
+### Verified state
+
+| Fact | Value |
+|---|---|
+| Branch | `phase-6/trust-boundary-closure` |
+| Code head | `0b68b9ba11c9d96e128cd143156f2868b8ba74fa` |
+| Worktree | clean |
+| Models / migrations | 19 / 10 (both dev and `_test` up to date) |
+| Activities | 10 (contract test asserts exact match) |
+| Ledger | VALID, phase 8.7, 26 tasks (13 completed, 5 blocked, 8 planned) |
+| Suite | 96 files, 1064 passed, 15 skipped (skip budget = baseline) |
+| API E2E | 159 passed, exit 0 ×3, 21 s each |
+| Production | **NO-GO** |
+
+### What changed
+
+| Commit | What |
+|---|---|
+| `34eaedf` | Seven authority defects closed. Children now run under `task-<taskId>`, so cancellation reaches them; a retried reservation answers `reserved`; a child that never starts is compensated; a terminal programme refuses reservation; held-elsewhere is `blocked`, not `failed`; a checkpoint cannot be relabelled; the `PROGRAMME_AUTHORITY_REFUSED` arm has a test. |
+| `fced403` | Proposal contract: strict schema, reuses `validateProgrammeGraph`, canonical hash. |
+| `0a222ba` | `POST/GET /plans`, approve/submit/reject. Approval creates no execution rows; four-eyes via `org-policy`; hash-bound; no retries inside the provider. |
+| `0b68b9b` | `Programme.failureCode`; Continue-As-New crossed (3 runs, 2 crossings) with a negative control. The test forced a fix to the per-execution counter that would otherwise have continued for ever. |
+
+### Read these before writing code
+
+1. `docs/engineering/phase8.7-governed-planner/PHASE87-REPORT.md` — the full report, including what is NOT proven.
+2. `docs/engineering/phase8.7-governed-planner/PROGRAMME-TRANSITIONS.md` — the seven statuses and every legal edge, with writers.
+3. `apps/api/src/plans/plans.service.ts` — `approve()` deliberately contains no call to tasks, programmes or the orchestrator. Do not add one.
+4. `apps/worker/test/programme-continue-as-new.test.ts` — the only proof the boundary works. Do not "simplify" it to a helper assertion.
+
+### What is NOT done, in the order I would take it
+
+1. **P87-011 — an unexplained E2E failure.** `approval-attempt-binding.e2e-spec.ts` → "reserves exactly one attempt and one grant" failed once in eight runs, passed seven times after, and passed in isolation. The assertion was never captured. Reproduce it before trusting a green suite; a flaky authority test is worse than a red one.
+2. **P87-010 — no programme cancel endpoint.** Cancelling a task reaches a programme child now, but nothing cancels `programme-<id>`. The workflow's cancellation arm exists and is untested.
+3. **P87-012 — the deadline path returns a status the row does not hold** (`blocked` vs `timed_out`). Small, pre-existing, disclosed.
+4. **P87-009 — approval resumption is BLOCKED on decisions D1–D3** in `APPROVAL-RESUMPTION-DESIGN.md`. Do not implement it without them.
+5. **P83-007/008 remain open.** `maxConcurrent` is still 1. Do not raise it.
+6. **No real planner was run.** The `http-llm` provider is unconfigured; every planner test used a local stub. "The planner works" means the governed pipeline works, not that a model produced a good plan.
+
+### New traps
+
+- `packages/contracts` is bundled into the Temporal workflow sandbox. A `node:crypto` import anywhere in the barrel breaks worker start. `plan-hash.ts` is a separate subpath export for exactly this reason; keep it out of `index.ts`.
+- `describe()` in `@temporalio/client` 1.25.0 does **not** expose `continuedExecutionRunId`. Read the link from `WorkflowExecutionContinuedAsNew.newExecutionRunId` in the closing run's history.
+- `Plan` has RESTRICT foreign keys; any suite that drops tenants must delete plans first (`apps/api/test/helpers/tenancy.ts`).
+
+### Verify a cold start in one command
+
+```bash
+pnpm -w typecheck && pnpm -w lint && pnpm -w test && pnpm --filter @intelligenz/api test:e2e && pnpm programme:check
+```
