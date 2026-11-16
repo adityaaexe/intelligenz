@@ -2786,3 +2786,297 @@ F-G13, F-G15, F-G16 and the F-G4 consequence are **measured**, not reasoned. The
 reasoned items are the reachability qualifiers on G-04/G-05 (they need a live writer during
 capture, which G-06 excludes by assumption, not by code) and F-G19 (not agent-reachable in
 this deployment).
+
+---
+
+# Round 3 — Gate G probe verification at `c6eb96f`
+
+**Measured at:** `c6eb96f42265260b736066df2192ca6a219681e5` (code `39063b9a24c64a1b9004fd69725afa340270148f`, docs `c6eb96f`), parent `cfc1f26cd4600a96fd2aa7722f128e4988a7cecf`. Clean tree (`git status --short` empty).
+**Reviewer:** independent subagent. I did not write any change in these two commits.
+**Method:** five standalone `tsx` scripts under `/var/tmp/probe-gate-g/`, importing the **source** modules directly (`packages/workspace-manager/src/{snapshot,manifest}.ts`). No test framework, no PostgreSQL, no `vitest`, no `pnpm` script. Scratch trees under `/var/tmp/probe-gate-g/*`. Total probe wall time **183 ms**; the pre-fix replay **~60 ms**. No probe came near the 2-minute abandonment bound; none was abandoned.
+
+Reproduce: `node_modules/.bin/tsx /var/tmp/probe-gate-g/probe.mts` (all five), `.../probe2.mts` (F-G20 withdrawal detail), `.../probe3-prefix.mts` (parent-commit replay). Raw output in `/var/tmp/probe-gate-g/results.json`.
+
+**Concurrency note.** The tree was clean when this review started and was **not** clean when it
+ended: another process wrote `apps/worker/test/helpers/database.ts`, `apps/worker/test/isolation-gate.test.ts`,
+`packages/database/prisma/seed.ts`, `vitest.config.mts` and an untracked `apps/worker/h602-measure-harness.mts`
+while I was reading. I made none of those edits — this section is the only file I touched. Every
+probe imports `packages/workspace-manager/src/*`, which is unmodified in the working tree, so the
+results are pinned to `c6eb96f` content and not to a half-finished edit. The `hookTimeout` reading
+below is `git show HEAD:vitest.config.mts`, not the working copy.
+
+## Verdict
+
+**Gate G is FAIL.** The five probed defects are not the reason. Two rows decide it and neither is touched by these commits: **G-16** (the reaper deletes `evidence/` while leaving `authoritative: true` rows — measured in round 2) and **G-20** (F-G20 is a detection with an explicit, documented unprevented window). **G-13** also remains PARTIAL — carried from the matrix, not re-probed here: `verifyManifestFile` does not parse the body, so `complete:false` under an `authoritative:true` envelope still verifies.
+
+What changed is narrower and real: **F-G11, F-G4, F-G1, F-G17 are closed at this SHA and F-G20 is a working, tested detection.** All five behaved as the code claims when I attacked them, and every negative control held.
+
+| Probe | Claim | Result |
+|---|---|---|
+| **F-G11** | nested `.git` is content, named as an anomaly, inside the entry bound | **PASS** |
+| **F-G4** | same-size rewrite with `mtime` restored at ns precision is contested via `ctime` | **PASS** (in-capture window; see scope note) |
+| **F-G20** | parent swapped for a link ⇒ `complete:false`, subtree withdrawn, off-tree hash absent | **PASS** (detection; prevention not claimed and not present) |
+| **F-G1** | `.git/hooks -> /etc` ⇒ zero `/etc` content, target recorded, no traversal | **PASS** |
+| **F-G17** | file swapped to FIFO after `lstat` ⇒ refusal, not a hang | **PASS** |
+
+## The five probes, with the output I produced
+
+### F-G11 — `changeCount` is no longer 0 for a nested `.git`
+
+```
+mkdir repo/sub/.git/objects/ab; write repo/sub/.git/objects/ab/cdef "ORIGINAL"
+snapshot A; rewrite that file "REWRITTEN"; add sub/.git/HEAD; snapshot B; buildChangeManifest
+→ changeCount: 2
+→ ["added:sub/.git/HEAD", "modified:sub/.git/objects/ab/cdef"]
+→ digestA b5bf67f5a6260ec2 ≠ digestB dc5dd534d1cd48db
+→ nestedFileDescribed: true, nestedFileShaChanged: true
+→ anomalies: ["nested-git:sub/.git"]
+→ entries: sub/.git, sub/.git/HEAD, sub/.git/objects, sub/.git/objects/ab, sub/.git/objects/ab/cdef
+```
+
+Entry bound, the half that matters for "it cannot explode the walk": a 40-file nested `.git` walked with `maxEntries: 5` gives `entryCount: 5, complete: false, stopReason: "max-entries"`. The nested tree is bounded by the same counter as everything else — `snapshot.ts:949` excludes `.git` only when `relativeDirectory === ''`, and `:968` records it as an anomaly at any other depth. Test coverage incl. both controls: `snapshot-nested-git.test.ts:48,81,100,117`.
+
+### F-G4 — `ctime` is the discriminator, and the negative control is clean
+
+```
+4096-byte file; mtime taken from a reference file; in-place 16-byte write; touch -r restores it
+→ sizeUnchanged: true
+→ mtimeIdenticalNs: true      (before and after both 2026-11-16T04:45:15.077Z)
+→ ctimeMoved: true
+→ hashRegularFile(path, staleLstat) → UnstableEntryError:
+   "ctime moved from 1794804315106.895 to 1794804315141.895 before the read"
+→ two-snapshot: changeCount 1, digests differ  (detected by content hash, complete: true)
+→ negative control: complete true / true, digests equal, changeCount 0
+```
+
+**Scope note, because the matrix's own sentence is looser than the code.** `ctime` is compared between the walk's `lstat` and the descriptor (`snapshot.ts:399-406`, `:415-424`), so it detects a rewrite **inside the capture window**. A rewrite that finishes *before* the walk's `lstat` is not — and cannot be — detected by `ctime`; it is detected because the bytes hashed are different, which is what my two-snapshot run shows. That is the correct behaviour, but it means "the change is detected via `ctime`" is only true of the in-window case.
+
+I replayed the parent commit to check the docstring's stronger claim. At `cfc1f26`, `hashRegularFile` has no `ctimeMs` comparison at all (`grep ctimeMs` → 0 hits); given the same stale `lstat` it **accepted** the rewrite and returned `sha256(new bytes)`, not the baseline digest:
+
+```
+preFixResult: { accepted: true, sha: "59247dc5…93e" }
+preFixShaIsBaselineSha: false
+preFixShaIsNewContentSha: true
+```
+
+So the defect the test describes is real and the fix is load-bearing, but `snapshot-race.test.ts:137`'s "a final digest equal to the baseline" holds only under the interleaving where the write lands after the read and before the post-read `fstat` — it is not what a single-file replay produces. Documentation precision, not a code defect: at HEAD both interleavings are refused because `ctimeMs` is compared before *and* after the read. The suite has no end-to-end two-snapshot test for F-G4 (the matrix says so); my probe supplies one but it lives outside the suite.
+
+### F-G20 — the subtree is read through the link, then withdrawn
+
+Swap performed in the `afterDirectoryListed` seam: between `readdir(parent)` and the child's `lstat`, `parent` is renamed to `parent-real` and replaced by a symlink to an outside tree containing `OUTSIDE-SECRET`.
+
+```
+→ complete: false, stopReason: "parent-replaced"
+→ entries: ["root.txt:file:5"]   ← the `parent` entry and every child withdrawn
+→ totalBytes: 5                  ← recomputed; the 15 outside bytes were counted and removed
+→ outsideHashInSerialisedBody: false, inFullSnapshot: false
+→ "outside-only" path: absent, link target: absent
+→ negative control (same tree, same seam, no swap): complete true, stopReason null, 3 entries
+```
+
+Variant B — parent replaced by a *real directory* of the same shape (different `dev`/`ino`, no link) — also gives `parent-replaced` with the subtree withdrawn. `totalBytes` re-derived as 5 is the proof the children were read and then withdrawn rather than never read: `snapshot.ts:1055` (`directoryIdentityVerdict`), `:1061-1082` (filter + splice + `totalBytes` recompute). Tests: `snapshot-race.test.ts:264,291,308`.
+
+This is detection after the fact. `open` is path-based everywhere (no `openat2(RESOLVE_BENEATH)`), so the swap inside `listDirectory`'s own `lstat`→`readdir` window remains undetected by either check, exactly as `TRUSTED-SNAPSHOT-DESIGN.md` limitation 9 states. I did not reproduce that window and am not claiming it is closed.
+
+### F-G1 — `.git/hooks -> /etc`
+
+```
+→ hooksDirectoryLinkTarget: "/etc"
+→ hooksEnumerated: []
+→ anomaly: ["hooks-directory-link:/etc"]
+→ entries under .git/: 0
+→ sha256(/etc/passwd) in serialised body: false
+→ "/etc/passwd" string in snapshot: false
+→ complete: true        ← anomaly does not downgrade, by design
+→ positive control: hooks ["pre-commit:file:299001868fb8"], sha256 of the fixture "299001868fb8", complete true
+```
+
+`listDirectory` is the only descent path and it `lstat`s first (`snapshot.ts:500-520`, used at `:756`). Tests `snapshot-escape.test.ts:63,97`. The positive control matters: the negative result is not "hooks are never enumerated".
+
+### F-G17 — FIFO after `lstat` returns; hard timeout not hit
+
+```
+hashRegularFile(fifo, staleLstat) raced against 5 000 ms
+→ { outcome: "refused", name: "UnstableEntryError",
+    message: "… changed during capture: is no longer a regular file (opened a special file or directory)" }
+→ walk over a tree containing a pre-existing FIFO: complete true,
+   entry { path: "pre-existing.fifo", kind: "special", sizeBytes: 0, sha256: null }
+```
+
+`O_NONBLOCK` (`snapshot.ts:380`) plus the `isFile()` refusal before any read (`:392-398`) is what returns instead of blocking.
+
+**What I did not do:** race the walk's internal `lstat`→`open` window from a second process. I exercised `hashRegularFile` — the exact function the walk calls at `snapshot.ts:1027` — with a stale `lstat`, which is the same state the walk holds when the swap lands. The refusal is therefore the same code path, but the *timing* of the walk-level race was not reproduced.
+
+## Read-only checks (no execution)
+
+### F-G13 / F-G18 / F-G19 — the code is right, the assertions are properties
+
+| Property | Code | Test | Asserts the property? |
+|---|---|---|---|
+| incomplete manifest ⇒ `EVIDENCE_INCOMPLETE` | `evidence.ts:459-472` builds the failure only when `manifest.complete` is false; `execute-agent.ts:1197-1210` records each gap, downgrades `succeeded → failed`, and sets `EVIDENCE_ERROR_CODES[code]` (`shared/evidence.ts:88-92`) | `evidence-capture-failure.test.ts:555` — 9 GiB sparse `truncate` through the real adapter | **Yes.** Asserts `status: failed`, `code: EVIDENCE_INCOMPLETE`, `code !== EVIDENCE_MISSING`, `retryable: false`, `evidence.authoritative: false`, `stopReason: final-incomplete`, **and** the event's counts reached. The `!==` assertion is the one that stops "one code for two facts" from creeping back. |
+| `completeTask` refuses `succeeded` on a terminal non-success attempt | `complete-task.ts:33-72`; called at `:113`, i.e. after authority and before the write | `:763` | **Yes, and better than most.** It asserts the task is still `queued`, not merely "not succeeded" — that rules out the `status IN (queued,running,verifying)` predicate doing the work by accident. Reached-at-all is proven separately by N8: `PRE_DISPATCH_TERMINAL_STATUSES = {failed, cancelled}` (`claim.ts:591`) means a `succeeded` with no claim is refused by authority before this guard runs. |
+| failed baseline ⇒ `EVIDENCE_BASELINE_FAILED` | `evidence.ts:369-385` returns the failure instead of silence; `execute-agent.ts:786-788` stores it; the same `gaps` branch fails the attempt | `:663` | **Yes.** `chmod 000` before the lease, so the baseline genuinely precedes the agent; asserts `failed`, the code, `phase: 'initial'`, `initialManifestDigest: null` (no invented anchor), the attempt row, and zero authoritative artifacts. |
+
+**The caveat that matters:** all three are inside `describe.skipIf(!temporalEnabled)` (`:251, :555, :663, :763, :908`), as are 37 `it`s across the suite. On a host without Temporal these tests skip and assert nothing while the summary still reads green. That is the same class of failure the `hookTimeout` change was made to remove — a silent skip standing in for a proof — and it has not been removed, only moved. Whether they ran here is the subject of the last section.
+
+### F-G14 — yes, I can construct an anomaly with no `attempt.evidence_anomaly.v1`
+
+Three paths, in descending severity:
+
+1. **Baseline failed + anomaly present.** `captureFinalEvidenceOutcome` writes the final snapshot to disk and *then* returns `{summary: null, failure: null}` when `initial === null` (`evidence.ts:437-444`). `recordEvidenceAnomalies` is only reached in the success path's `else` branch, i.e. when `finalEvidence !== null` (`execute-agent.ts:971`), and on the thrown path only inside `if (lease !== undefined && finalEvidence === null)` (`:1254-1272`). So `chmod 000` on one directory (F-G19's own arrangement) **plus** `.git/hooks -> /etc` fails the attempt with `EVIDENCE_BASELINE_FAILED` and the anomaly exists only in `final-snapshot.json` on disk — never as an event. Construction is trivial and agent-reachable, though the attempt is already failing, so nothing false is reported as success. **Low.**
+2. **Audit write failure.** `recordEvidenceAnomalies` catches every error except `P2002` and logs (`:664-668`). Any anomaly can therefore leave no event if the insert fails. Documented ("Never throws: an audit write is not allowed to replace the run's outcome"); the trade is explicit. **Informational.**
+3. **Throw between capture and record.** `recordFinalSnapshot` (`:942-946`) sits between the capture and `recordEvidenceAnomalies` (`:971`). If it throws, the catch block sees `finalEvidence !== null`, so it does not re-enter the recording branch. Anomaly in the digest, on disk, and never in an event. Infrastructure-shaped, not agent-shaped. **Low.**
+
+None of these produces a false success. The three tests at `:908` cover the success path (authority + `changeCount: 0` + event), the nested-`.git` case, and a clean-run control that asserts **zero** anomaly events — a good control, because without it the other two would only prove "every run writes one".
+
+### `hookTimeout` 10 s → 60 s, and what the 15 skips actually are
+
+`vitest.config.mts:15` is `hookTimeout: 60_000`, with the reason in the comment above it (the first Temporal suite compiles the workflow bundle with webpack, ~5 s, and the 10 s default turned that into a `Hook timed out` that skipped every test in the file). `apps/api/vitest.config.mts:24` already used 60 s for the same class. A real-Temporal suite does its start-up in `beforeAll` and gates its tests on `temporalEnabled` (`evidence-capture-points.test.ts:180-190`) — e.g. `evidence-capture-failure.test.ts:61` computes `temporalEnabled = enabled && await temporalReachable()`.
+
+Two things I will not certify:
+
+1. **"No file can now be skipped by a hook timeout without a visible signal" is not established.** The raise removes one *known* cause. A hook that exceeds 60 s still leaves the file's tests reported as skipped; vitest reports the file as failed (the hook error is an unhandled error at suite level), so the skip is accompanied by a failure — but a summary that counts only failed *tests* shows `0 failed` beside the skips. The mechanism is mitigated, not eliminated. I did not execute a hook timeout to confirm how this version reports it.
+2. **"The 15 skips are live-Temporal only" cannot be true of a full-suite run.** 37 `it`s sit behind `describe.skipIf(!temporalEnabled)` — counted by brace-matching each block and printing its title, not estimated: `evidence-capture-failure` 10 (`:251,555,663,763,908`), `execution-boundary` 14 (`:707,867,912,1467,1743`), `execution-persistence` 5, `isolation-gate` 4, `approval-attempt-binding` 2, `evidence-capture-points` 1, `execution-identity` 1. **With Temporal unreachable, at least 37 tests skip.** 15 skipped therefore means Temporal *was* reachable and the Temporal-gated suites ran; the 15 are one of the other gates — `TIER !== 'full'` (`cgroup.test.ts:139` 8 its, `cpu-budget.test.ts:587,626` 3), `SET === null` (`io-limits.test.ts:152,200` 3), `P4_REAL_MODEL !== '1'` (`broker-run.test.ts:264` 1), `!bwrapAvailable` (`sandbox-env-isolation.test.ts:65` 5). Which subset sums to 15 depends on this host; I did not measure it.
+
+   This also makes `TEST-RESULTS.md:42-45` false on its face — "15 tests skip, all for one reason: they need a live Temporal server", followed by a list (isolation-gate ×4, execution-persistence ×5, approval-grant ×2, approval-attempt-binding ×1, boundary ×3) that is a subset of the 37 blocks. Those five groups *are* Temporal-gated, so if they skipped, the other ~22 Temporal-gated tests in the same run would have skipped too. The sentence is inherited, not measured. The useful half of the contract's premise holds regardless: the 917-passed figure is evidence the Temporal suites ran, and nothing in these two commits adds a skip.
+
+   One consequence worth flagging to whoever owns the skip budget: a baseline of `15`, set from a run whose skips were attributed to Temporal, is a ceiling derived from the wrong set. With Temporal live the true count is lower, so a *new* skip hides under it — the same "15 is green" hazard the reporter exists to remove.
+
+## Findings
+
+No new **Critical** or **High**. Three **Low**, two **Informational**.
+
+| ID | Sev | Finding |
+|---|---|---|
+| R3-01 | Low | An anomaly in a final snapshot is never recorded as an event when the baseline failed (`execute-agent.ts:971` + `evidence.ts:437-444`). Attempt still fails, so no false success; the anomaly is on disk only. |
+| R3-02 | Low | Anomaly recording is ordered after `recordFinalSnapshot` (`:942` vs `:971`); a throw there loses the event on the success path, while the catch path skips recording because `finalEvidence !== null`. |
+| R3-03 | Low | G-17's three properties are proven only where Temporal is reachable. 37 `it`s — including F-G13/F-G18/F-G19/F-G14 — skip silently without it, and a green summary cannot distinguish "asserted" from "never ran". `TEST-RESULTS.md:42-45` compounds this by attributing all 15 skips to Temporal when 15 is below the 37 that gate would produce. |
+| R3-04 | Info | `snapshot-race.test.ts:137`'s "a final digest equal to the baseline" describes one interleaving; a single-file replay at `cfc1f26` accepted the rewrite and returned the *new* bytes' digest. Measured, and the defect is the same either way. |
+| R3-05 | Info | `hookTimeout` removes the known 5 s trigger, not the class. A >60 s hook still skips a file's tests; the visible signal is the failed suite, not a failed test count. |
+
+## What Gate G still does not establish
+
+- **Prevention of the parent swap.** Detection only. Path-based `open` throughout; the `listDirectory` `lstat`→`readdir` window is unaddressed and admitted.
+- **The reaper.** G-16 unchanged by these commits: evidence bytes deleted, authority row kept. This is the row that decides the gate.
+- **`verifyManifestFile`.** Still does not parse the body (G-13); `complete:false` inside an `authoritative:true` envelope verifies. Not agent-reachable, still false as a claim about the verifier.
+- **`ctime` on coarse filesystems.** The code says a 1-second-granularity filesystem can hide a change inside one tick (`snapshot.ts:861-863`); no test measures that.
+- **The walk-level F-G17 race.** I proved the refusal at the function the walk calls, not by racing the walk.
+- **A signature.** The manifest digest is content identity. No key, no non-repudiation.
+
+## What I would refuse to ship
+
+1. **`Gate G = PASS`.** On this evidence it would be a statement about five probes, not about the gate. G-16 and G-20 are open and neither is touched here.
+2. **Any sentence saying the parent swap is "prevented".** It is detected, the subtree is withdrawn, the attempt fails — that is a good outcome, and it is not prevention. The design says so; the matrix should not drift.
+3. **`TEST-RESULTS.md`'s "15 skips, all Temporal" sentence, and any skip budget derived from it.** The inventory says 37 `it`s sit behind that gate; the sentence and the baseline are both off by the same mis-attribution. Fix the attribution before the number becomes a threshold.
+
+**Verified by execution:** F-G11 (`changeCount`, anomaly, bound), F-G4 (both directions, negative control, and the `cfc1f26` replay), F-G20 (two swap variants, withdrawal via `totalBytes`, negative control), F-G1 (link target, absence of `/etc` content, positive control), F-G17 (stale-stat refusal under a 5 s timeout, pre-existing FIFO in a full walk).
+**Verified by reading only:** F-G13, F-G18, F-G19 (code + the tests that assert them), F-G14's three gaps, the skip composition, and the `hookTimeout` effect. Nothing in this section is presented as executed.
+
+---
+
+## Follow-up — two FAIL grounds checked against `c6eb96f`, both withdrawn
+
+Read only: no probe re-run, no test run, no PostgreSQL. Both grounds were taken from the
+`PHASE6-GATE-MATRIX.md` rows, which are measured at `cfc1f26`. `39063b9` changed the code under
+two of those rows and I did not re-read them before using them as grounds. That is the error in
+both cases: a row measured at the parent does not carry to the child any more than an
+uncommitted fix does.
+
+### Ground 1 — "G-16: the reaper deletes `evidence/` while leaving `authoritative: true`" — **WITHDRAWN**
+
+The measured path is closed at this SHA, and it was closed in `cfc1f26`, which is why `39063b9`
+does not touch it.
+
+- `apps/worker/src/reaper.ts:514` and `:924` both pass `keepEvidence: true`.
+- `packages/workspace-manager/src/reclaim.ts:224` makes `keepEvidence` independent of
+  `keepArtifacts`; `:235-237` derive `evidencePresent = keepEvidence && evidenceExist` and
+  `evidenceRemoved = evidenceExist && !keepEvidence`.
+- `:239-252`: the preserve branch is taken on **evidence alone** (`preserved = artifactsPresent ||
+  evidencePresent`), and `evidence/` is skipped by the `rm` loop whenever `evidencePresent`.
+- `:253-257`: the recursive `rm` of the whole workspace runs only when `preserved` is false.
+
+So `evidenceRemoved: true` is reachable only from a caller that explicitly passes
+`keepEvidence: false`, and the reaper never does. `removed: true, evidenceKept: false` — the
+round-2 measurement — is not reproducible on the reaper path at `c6eb96f`. Tests:
+`apps/worker/test/reaper.test.ts:412` (evidence kept beside a preserved artifact, URI stays
+readable) and `:476` (the removal path, where the caller asked for removal).
+
+What the G-16 row still contains is narrower and is a **decision, not the defect I named**, and
+`reaper.ts:531-556` states it in its own words:
+
+1. `cleaned`, `quarantined` and `cleanup_failed` rows are excluded from the candidate query
+   (`:891` selects `completed`/`failed` with `cleanedAt: null`), so a row that already reached
+   `cleaned` is never revisited; its bytes can disappear afterwards and it keeps
+   `authoritative: true`.
+2. `revokeUnbackedAuthority` skips any URI that does not start with the recorded `rootPath`
+   (`:545-549`), because a `stat` from the wrong base would demote rows whose bytes are fine.
+
+The compensating control is the read path, not the column: `410 ARTIFACT_GONE`, and
+`integrity: 'unknown'` computed from bytes on every request (`reaper.ts:551-556`). That is
+`EVIDENCE-INDEX.md` §"Artifact authority after the bytes are gone" (F-G16, Option B). Withdrawn as
+a FAIL ground; the G-16 **row** should be re-scored at `c6eb96f` to "residual by decision", not
+FAIL. I did not execute the reaper to confirm this — it is read-only, as instructed — so the
+evidence is the three call sites and the two tests, not a fresh `reclaimWorkspace` run.
+
+### Ground 2 — "G-13: the verifier still doesn't parse the manifest body" — **WITHDRAWN**
+
+False at this SHA. `verifyManifestFile` parses the body and compares it to the record:
+
+- `apps/worker/src/activities/evidence.ts:129-176` `parseManifestBody`; called at `:228`.
+- `:231-233` re-derives `manifestDigest(parsed.body)` and refuses a body that derives a different
+  digest — so a rewritten body with a matching envelope is refused.
+- `:239` body `complete` vs summary `complete`; `:246` `complete` vs `stopReason`; `:252`
+  `authoritative && !complete` refused.
+- `:258-264` both snapshot digests vs the summary.
+- `:272-290` both snapshot digests vs `ExecutionWorkspace` (`expected.initialManifestDigest`,
+  `expected.finalManifestDigest`), which is the row the worker wrote before the agent existed.
+- Live path, not dead: `apps/worker/src/activities/persist-result.ts:103`, outside the
+  transaction, throwing `EVIDENCE_INTEGRITY_FAILED` (`:105-110`).
+
+The comment at `evidence.ts:181-191` says in as many words that an earlier version checked only
+self-consistency and that "the body is now parsed" — the +117 lines `39063b9` added to this file
+are that change. `complete: false` inside an envelope claiming `authoritative: true` now returns
+`'an authoritative manifest cannot describe an incomplete walk'` (`:252`).
+
+**The one residual I can still defend, and it is not this claim:** `workspaceEvidenceBinding`
+(`persist-result.ts:513-527`) resolves the binding by `orderBy: { createdAt: 'desc' }` /
+`attemptNumber: 'desc'` — the *newest* run and attempt, not the execution in context. So the
+digests are compared against the newest `ExecutionWorkspace`, not necessarily this attempt's. That
+is F-G10 / matrix row **G-15** (already PARTIAL: "Replay binding uses the newest attempt/run
+rather than the execution in context"), not a body-parsing gap. G-13's row should move to Verified
+with that qualifier; the sentence "`verifyManifestFile` never parses the body" is a `cfc1f26`
+statement and cannot be cited at `c6eb96f`.
+
+### Confirmations requested
+
+**F-G14 — all three still hold at `c6eb96f`.** Line numbers corrected: the early return is
+`evidence.ts:433-438` (`summary: null, failure: null` when `initial === null`); the success-path
+anomaly call is `execute-agent.ts:971` (inside `finalEvidence !== null`); `recordFinalSnapshot` is
+`:950`, i.e. before `:971`; the thrown path enters only when `finalEvidence === null` (`:1253`) and
+records at `:1272`. So #1 (baseline failed + anomaly ⇒ no event) and #3 (throw between `:950` and
+`:971` ⇒ no event) are unchanged, and #2 (audit insert failure is logged, `:664-668`) is unchanged.
+Fixing #1 and #3 as intended is sufficient; nothing else in that list needs a code change.
+
+**`hookTimeout` — yes, class statement, not "60 s is too short".** The claim is that the *mechanism*
+persists: a hook exceeding whatever the timeout is still leaves the file's tests reported as
+skipped, so the skip count is the signal that has to be read. 60 s is ample for the measured ~5 s
+bundle compile. No objection to the value.
+
+### What the verdict becomes
+
+With both grounds withdrawn, **Gate G's FAIL rests on G-20 alone**: F-G20 is a High that is
+detected, not prevented, and the window admitted in `TRUSTED-SNAPSHOT-DESIGN.md` limitation 9 is
+real. Stated precisely so the record is usable: an attacker can still cause a digest of an off-tree
+file to be computed mid-walk; the snapshot comes back `complete: false` with `stopReason:
+parent-replaced`, the subtree is withdrawn, and the attempt fails — so the off-tree digest never
+becomes persisted authority. The ground is therefore "an unprevented TOCTOU exists", not "false
+evidence is accepted". Whether that is High is the whole call: on the stricter reading F-G20 stays
+open and the gate is **FAIL on G-20**; on the "no accepted false authority" reading F-G20 closes by
+detection and I have no remaining *code* ground to offer. The documentation row **G-21** is the
+other open row in the matrix and I have **not** re-audited it at `c6eb96f`, so I am not substituting
+it for a verdict here.
+
+Two corrections to my own round-3 section, for the record: `F-G3`/G-16 is **not** untouched-and-broken
+(it is fixed, and its residual is the documented decision), and G-13's verifier **does** parse the
+body. My `c6eb96f` verdict should have rested on G-20 from the start; the other two sentences were
+inherited from `cfc1f26` and should not have been cited at this SHA.

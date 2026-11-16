@@ -187,28 +187,138 @@ export async function reserveAndClaim(
 }
 
 /**
- * Removes one tenant and everything it owns, in dependency order.
+ * Removes everything an organisation owns, in dependency order.
  *
  * `ExecutionAttempt.orgId` and `ExecutionWorkspace.orgId` are `Restrict`, so the
  * organization cannot be deleted until those rows are gone. `AgentRun.workspaceId`
  * is `SetNull`, so it must be nulled before the workspace rows are removed.
+ * `ApprovalRequest.task` and `AuditEvent.organization` are `Restrict` too: the history
+ * must outlive the aggregate, so it has to be removed explicitly before the org.
  */
-export async function dropTenant(client: PrismaClient, fixture: TenantFixture): Promise<void> {
-  const orgId = fixture.orgId;
-
+async function deleteOrganizationRows(client: PrismaClient, orgId: string): Promise<void> {
   await client.toolInvocation.deleteMany({ where: { orgId } });
   await client.executionAttempt.deleteMany({ where: { orgId } });
   await client.agentRun.updateMany({ where: { orgId }, data: { workspaceId: null } });
   await client.executionWorkspace.deleteMany({ where: { orgId } });
-  // `ApprovalRequest.task` and `AuditEvent.organization` are `Restrict`: the history
-  // must outlive the aggregate, so it has to be removed explicitly before the org.
   await client.approvalRequest.deleteMany({ where: { orgId } });
   await client.auditEvent.deleteMany({ where: { orgId } });
   await client.organization.delete({ where: { id: orgId } });
+}
+
+/**
+ * Removes one tenant and everything it owns.
+ *
+ * A failure here propagates: the caller decides whether one tenant's failure should end
+ * the rest of the teardown (`dropAllTenants` does not).
+ */
+export async function dropTenant(client: PrismaClient, fixture: TenantFixture): Promise<void> {
+  await deleteOrganizationRows(client, fixture.orgId);
 
   // `User` is not owned by an organisation — deleting the organisation removes the
-  // membership, not the account. Leaving the row behind makes the seed test's global
-  // `User` count depend on which suites ran first, which is exactly the kind of
-  // order-dependent assertion this suite is supposed to avoid.
-  await client.user.delete({ where: { id: fixture.userId } }).catch(() => undefined);
+  // membership, not the account. Leaving the row behind is what made the seed test's
+  // `User` count depend on which suites ran first.
+  try {
+    await client.user.delete({ where: { id: fixture.userId } });
+  } catch (error) {
+    // Named, not swallowed. The organisation is already gone, so nothing in this run can
+    // observe the account; `dropResidualTenants()` reclaims it on the next run by the
+    // `<label>-<suffix>@example.test` shape `createTenant()` mints.
+    console.error(
+      `[tenant-cleanup] residual user ${fixture.userId} (${fixture.orgId}) could not be deleted: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+}
+
+/**
+ * Drops every tenant in `fixtures`, independently.
+ *
+ * A bare `for` over `dropTenant()` ends at the first throw, so one foreign-key surprise,
+ * lock wait or serialization error abandons every tenant after it. Each attempt is
+ * isolated here, every failure is named, and the aggregate is thrown at the end so a
+ * residual tenant cannot be reported as a clean teardown.
+ */
+export async function dropAllTenants(
+  client: PrismaClient,
+  fixtures: readonly TenantFixture[],
+): Promise<void> {
+  const failures: { readonly orgId: string; readonly error: unknown }[] = [];
+
+  for (const fixture of fixtures) {
+    try {
+      await dropTenant(client, fixture);
+    } catch (error) {
+      failures.push({ orgId: fixture.orgId, error });
+      console.error(
+        `[tenant-cleanup] residual tenant ${fixture.orgId} could not be deleted: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  if (failures.length > 0) {
+    throw new AggregateError(
+      failures.map((failure) => failure.error),
+      `[tenant-cleanup] ${failures.length} tenant(s) survived teardown: ${failures
+        .map((failure) => failure.orgId)
+        .join(', ')}`,
+    );
+  }
+}
+
+/**
+ * Reclaims tenants a previous run could not delete.
+ *
+ * This is the only cleanup that survives SIGKILL, an OOM kill and a hook timeout — an
+ * `afterAll` cannot run when the process is gone. It runs *before* a suite creates its
+ * own fixtures, so an aborted run heals on the next run of the same file instead of
+ * poisoning an unrelated suite.
+ *
+ * **Age-guarded on purpose.** A concurrent run of the same file leaves exactly the same
+ * rows as an abandoned one; the only discriminator is age. A live run's fixtures are
+ * seconds old, an abandoned run's are at least one hook timeout old, so rows younger
+ * than `minimumAgeMs` are left alone. Without the guard this sweep would be a new
+ * cross-run hazard of the kind it exists to fix.
+ */
+export async function dropResidualTenants(
+  client: PrismaClient,
+  prefix: string,
+  options: { readonly minimumAgeMs?: number } = {},
+): Promise<{ readonly organizations: number; readonly users: number }> {
+  const minimumAgeMs = options.minimumAgeMs ?? 5 * 60_000;
+  const cutoff = new Date(Date.now() - minimumAgeMs);
+
+  const organizations = await client.organization.findMany({
+    where: { slug: { startsWith: prefix }, createdAt: { lt: cutoff } },
+    select: { id: true, slug: true },
+    orderBy: { createdAt: 'asc' },
+  });
+
+  let dropped = 0;
+
+  for (const organization of organizations) {
+    try {
+      await deleteOrganizationRows(client, organization.id);
+      dropped += 1;
+    } catch (error) {
+      console.error(
+        `[tenant-cleanup] residual tenant ${organization.slug} (${organization.id}) could not be reclaimed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  // Accounts are not owned by the organisation, so an aborted run can leave one behind
+  // after its organisation is already gone.
+  const users = await client.user.deleteMany({
+    where: {
+      email: { startsWith: prefix, endsWith: '@example.test' },
+      createdAt: { lt: cutoff },
+    },
+  });
+
+  return { organizations: dropped, users: users.count };
 }

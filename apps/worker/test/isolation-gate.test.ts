@@ -20,7 +20,8 @@ import type { ExecuteAgentActivityInput } from '../src/shared/contracts';
 import {
   createTask,
   createTenant,
-  dropTenant,
+  dropAllTenants,
+  dropResidualTenants,
   reserveAndClaim,
   testDatabaseUrl,
   useTestDatabase,
@@ -134,6 +135,19 @@ beforeAll(async () => {
 
   const database = useTestDatabase();
   client = database.client;
+
+  // Self-healing sweep, before this run owns anything. `afterAll` cannot clean a process
+  // that was SIGKILLed, an OOM victim or a hook that timed out — those tenants are the
+  // ones that turn an unrelated suite red on the next run. Age-guarded so a concurrent
+  // run of this file is not swept out from under its own assertions.
+  const reclaimed = await dropResidualTenants(client, 'isolation-');
+
+  if (reclaimed.organizations > 0 || reclaimed.users > 0) {
+    console.warn(
+      `[isolation-gate] reclaimed ${reclaimed.organizations} tenant(s) and ${reclaimed.users} account(s) left by a previous run`,
+    );
+  }
+
   artifactRoot = await mkdtemp(join(tmpdir(), 'intelligenz-isolation-test-'));
 
   process.env['DATABASE_URL'] = database.url;
@@ -152,10 +166,31 @@ beforeAll(async () => {
 afterAll(async () => {
   if (!enabled) return;
 
-  await harness?.close();
-  for (const fixture of tenants) await dropTenant(client, fixture);
-  await client.$disconnect();
+  // `close()` is non-throwing by design, but cleanup must not depend on that: the tenant
+  // drop is in its own `finally` so a close that throws anyway cannot skip it, and the
+  // disconnect is in a `finally` around both.
+  try {
+    await harness?.close();
+  } finally {
+    try {
+      // Independent attempts: one tenant's failure no longer abandons the tenants after
+      // it, and the survivors are thrown as an aggregate rather than swallowed.
+      await dropAllTenants(client, tenants);
+    } finally {
+      await client.$disconnect();
+    }
+  }
 });
+
+if (!enabled) {
+  console.warn('[isolation-gate] suite skipped — TEST_DATABASE_URL is not set');
+} else if (!temporalEnabled) {
+  console.warn(
+    `[isolation-gate] suite skipped — no Temporal server at ${
+      process.env['TEMPORAL_ADDRESS']?.trim() || 'localhost:7233'
+    }`,
+  );
+}
 
 describe.skipIf(!temporalEnabled)('isolation tier gate', () => {
   it('refuses a vm profile, ends the attempt failed, and launches nothing', async () => {

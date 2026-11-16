@@ -540,7 +540,12 @@ export async function seed(prisma: SeedPrisma): Promise<SeedSummary> {
     prisma.organization.count({ where: { id: organization.id } }),
     prisma.workspace.count({ where: { orgId: organization.id } }),
     prisma.project.count({ where: { orgId: organization.id } }),
-    prisma.user.count(),
+    // Scoped like every other field above. `user.count()` is table-global, and this
+    // seed runs beside suites that create users of their own, so a global aggregate
+    // turned "the fixture has four users" into "nothing else in the database has any".
+    // A user in this fixture is a user with a membership in this organisation — the
+    // same statement `memberships` makes one line below.
+    prisma.user.count({ where: { memberships: { some: { orgId: organization.id } } } }),
     prisma.membership.count({ where: { orgId: organization.id } }),
     prisma.task.count({ where: { orgId: organization.id } }),
     prisma.workflowRun.count({ where: { orgId: organization.id } }),

@@ -39,13 +39,29 @@ per-attempt ceiling. It is not a failure: the run exited 0 with 0 failed.
 
 ## Skipped, not passed
 
-**15 tests skip**, all for one reason: they need a live Temporal server and the suite is
-runnable without one. They are counted as *skipped*, never as passed. The suites affected:
-`isolation-gate` (×4), `execution-persistence` (×5), `approval-grant` (×2),
-`approval-attempt-binding` (×1), and boundary dispatch tests.
+**15 tests skip.** An earlier version of this section said they were "all live-Temporal",
+which was **false**, and an independent review caught it by counting the gates: there are
+**51 `skipIf` sites** in the suite, gated on at least four different conditions —
+`!temporalEnabled`, `!databaseEnabled`, `TIER !== 'full'` (cgroup enforcement), and bwrap
+tier gates. The 15 that skip on this host are the **environment-limited** ones: cgroup
+enforcement, I/O limits, and the bwrap tier probes — not the Temporal ones.
 
-To keep the floor honest, the gate **decisions** in those areas are DB-only and ungated, so
-a machine without Temporal still fails if the decision logic regresses.
+The consequence of the wrong attribution was worse than a wrong sentence. If Temporal had
+been *down*, at least 37 tests would have skipped; 15 is only possible with Temporal
+**live**, which means the evidence suites (`F-G2`, `F-G13`, `F-G14`, `F-G18`, `F-G19`) and
+the claim/identity suites did execute. That is the honest reading, and it is the opposite
+of what this document previously claimed.
+
+It also means a **skip budget of 15 is a ceiling computed from the wrong set** — a new skip
+would hide underneath it. The correct guard is per-gate, not a single number: fail if
+`temporalEnabled` is true and a Temporal-gated test skips, and fail if a `TIER === 'full'`
+test appears in the skipped list on a host that claims the full tier.
+
+Skips are counted as *skipped*, never as passed. Two mechanisms can skip a whole file while
+the summary reads as a pass: a hook exceeding `hookTimeout` (was 10 s, now 60 s — one known
+trigger removed, the **class** not fixed), and an abort under `EDQUOT` from the `/tmp`
+tmpfs quota. Both are recorded in `HARNESS-HYGIENE.md`; neither is a green result.
+
 
 ## Progression across Phase 6
 
