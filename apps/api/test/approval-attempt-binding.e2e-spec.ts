@@ -107,6 +107,17 @@ function errorOf(body: unknown): ErrorEnvelope['error'] {
   return (body as ErrorEnvelope).error;
 }
 
+/**
+ * The code, or `null` when the body carries no error envelope.
+ *
+ * `errorOf` is the judge's accessor and must keep throwing on a body that is not an error.
+ * This one exists only for diagnostic messages, where an unexpected body *is* the evidence
+ * and must not replace the assertion failure with a `TypeError`.
+ */
+function codeOrNull(body: unknown): string | null {
+  return (body as Partial<ErrorEnvelope> | null | undefined)?.error?.code ?? null;
+}
+
 function dataOf<T>(body: unknown): T {
   return (body as { data: T }).data;
 }
@@ -202,32 +213,66 @@ describe('1. two simultaneous POST /run — one attempt, one consumption', () =>
     const responses = await Promise.all([runOffline(taskId), runOffline(taskId)]);
     const statuses = responses.map((response) => response.status).sort((a, b) => a - b);
 
-    // One wins the reservation and reaches the (offline) orchestrator; the other loses the
-    // task compare-and-swap *or* the approval CAS. Order is not deterministic; the multiset
-    // is.
-    expect(statuses).toEqual([409, 503]);
-
     const refusal = responses.find((response) => response.status === 409);
+    const refusalCode = refusal === undefined ? null : errorOf(refusal.body).code;
 
-    expect(['CONFLICT', 'APPROVAL_CONSUMED']).toContain(errorOf(refusal?.body).code);
-
-    // The two rows that would double if the reservation were not atomic.
-    expect(await suite.prisma.executionAttempt.count({ where: { orgId: orgId(), taskId } })).toBe(1);
-    expect(await suite.prisma.workflowRun.count({ where: { orgId: orgId(), taskId } })).toBe(1);
+    // P87-011: this test failed once in eight runs and left nothing behind but its name,
+    // so not even the assertion that failed could be identified. Everything the assertions
+    // below judge is therefore read once, here, and attached to them as evidence. These
+    // are pure reads issued after both responses settled: moving them ahead of the
+    // assertions cannot change any outcome, it only makes a failure say what it saw.
+    const attempts = await suite.prisma.executionAttempt.count({
+      where: { orgId: orgId(), taskId },
+    });
+    const workflowRuns = await suite.prisma.workflowRun.count({
+      where: { orgId: orgId(), taskId },
+    });
+    const consumptions = await suite.prisma.approvalRequest.count({
+      where: { id: approvalId, consumedAt: { not: null } },
+    });
 
     const approval = await suite.prisma.approvalRequest.findUniqueOrThrow({
       where: { id: approvalId },
     });
 
-    expect(approval.consumedAt).not.toBeNull();
-    expect(approval.consumedByAttemptId).not.toBeNull();
+    const auditRows = await suite.prisma.auditEvent.count({
+      where: { aggregateId: approvalId, eventType: 'approval.consumed.v1' },
+    });
+
+    // Plain JSON. Vitest prints it on failure and ignores it on success.
+    const evidence = JSON.stringify({
+      statuses,
+      responses: responses.map((response) => ({
+        status: response.status,
+        code: codeOrNull(response.body),
+      })),
+      refusalCode,
+      taskId,
+      approvalId,
+      attempts,
+      workflowRuns,
+      consumptions,
+      auditRows,
+      consumedAt: approval.consumedAt,
+      consumedByAttemptId: approval.consumedByAttemptId,
+    });
+
+    // One wins the reservation and reaches the (offline) orchestrator; the other loses the
+    // task compare-and-swap *or* the approval CAS. Order is not deterministic; the multiset
+    // is.
+    expect(statuses, evidence).toEqual([409, 503]);
+
+    expect(['CONFLICT', 'APPROVAL_CONSUMED'], evidence).toContain(refusalCode);
+
+    // The two rows that would double if the reservation were not atomic.
+    expect(attempts, evidence).toBe(1);
+    expect(workflowRuns, evidence).toBe(1);
+
+    expect(approval.consumedAt, evidence).not.toBeNull();
+    expect(approval.consumedByAttemptId, evidence).not.toBeNull();
 
     // One consumption, one audit event — not two.
-    expect(
-      await suite.prisma.auditEvent.count({
-        where: { aggregateId: approvalId, eventType: 'approval.consumed.v1' },
-      }),
-    ).toBe(1);
+    expect(auditRows, evidence).toBe(1);
   });
 });
 

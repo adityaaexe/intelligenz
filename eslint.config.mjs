@@ -108,6 +108,16 @@ export default tseslint.config(
       'prefer-const': 'error',
     },
   },
+  // ── Operator tools: stdout is the report ─────────────────────────────────────
+  {
+    // `apps/api/test/manual/**` are reproducers an operator runs by hand. No suite collects
+    // them (only `*.e2e-spec.ts` is included), nothing ships them, and printing the evidence
+    // to stdout is their entire interface. `no-console` exists to keep production code on
+    // `pino` (contract §2); here the console *is* the deliverable, and routing it through a
+    // logger would hide the output the tool exists to produce.
+    files: ['apps/api/test/manual/**/*.ts'],
+    rules: { 'no-console': 'off' },
+  },
   // ── SEC-403: no unsanctioned spawns on the sandbox boundary ─────────────────
   {
     files: SPAWN_BOUNDARY_FILES,
