@@ -14,9 +14,9 @@ export * from './approval';
 export * from './execution';
 export * from './isolation';
 export * from './programme';
+export * from './programme-reason';
 export * from './programme-graph';
 export * from './plan';
 // `./plan-hash` is intentionally NOT re-exported here: it imports `node:crypto`, and this
 // barrel is bundled into the Temporal workflow sandbox. Import it from
 // `@intelligenz/contracts/plan-hash` in Node-side code only.
-

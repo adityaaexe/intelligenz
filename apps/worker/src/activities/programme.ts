@@ -666,8 +666,10 @@ export async function recordProgrammeCheckpointActivity(
  * Moves the programme to its terminal status, once.
  *
  * Conditional on `pending`/`running`, so a retried activity — or a late checkpoint racing
- * the finish — cannot reopen or re-close a finished programme. `failureReason` is written
- * only for a non-success: a succeeded programme has no reason to record.
+ * the finish — cannot reopen or re-close a finished programme. `failureReason` and
+ * `failureCode` are written in the same UPDATE, and both are cleared for a success: a
+ * succeeded programme has no reason and no code, and a stale code left beside a `succeeded`
+ * row would make "no failure" indistinguishable from "unclassified failure".
  */
 export async function finishProgrammeActivity(
   input: FinishProgrammeInput,
@@ -676,6 +678,7 @@ export async function finishProgrammeActivity(
 
   const prisma = db();
   const finishedAt = new Date();
+  const succeeded = input.status === 'succeeded';
 
   const changed = await prisma.programme.updateMany({
     where: {
@@ -686,7 +689,8 @@ export async function finishProgrammeActivity(
     data: {
       status: input.status,
       finishedAt,
-      failureReason: input.status === 'succeeded' ? null : input.reason,
+      failureReason: succeeded ? null : input.reason,
+      failureCode: succeeded ? null : input.code,
     },
   });
 
@@ -707,6 +711,12 @@ export async function finishProgrammeActivity(
           payload: {
             status: input.status,
             reason: input.reason,
+            /**
+             * The `reason_code` the telemetry projection reads (Phase 8.7 contract §
+             * `programme_blocked` / `programme_cancelled`). `null` for a success: the
+             * projector must split on `status`, not on the absence of a code.
+             */
+            code: input.code,
             finishedAt: finishedAt.toISOString(),
           },
           occurredAt: finishedAt,

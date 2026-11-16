@@ -1,4 +1,8 @@
-import { validateProgrammeGraph, type ProgrammeGraphNode } from '@intelligenz/contracts';
+import {
+  validateProgrammeGraph,
+  type ProgrammeGraphNode,
+  type ProgrammeReasonCode,
+} from '@intelligenz/contracts';
 import {
   CancellationScope,
   continueAsNew,
@@ -70,8 +74,11 @@ import { runTaskWorkflow } from './run-task';
  *   - **deadline** — `deadlineAt` is a soft ceiling: no new node is dispatched after it,
  *     and the programme is finished `timed_out` with whatever it had;
  *   - **history** — Continue-As-New before Temporal's own suggestion, at a checkpoint
- *     boundary where no child is in flight. The next execution reloads everything from
- *     Postgres, so no state is lost.
+ *     boundary where no child is in flight. The trigger is the SDK's suggestion (actual
+ *     history growth) or, failing that, a checkpoint count for **this execution**
+ *     (`continueAfterCheckpoints`, clamped, default 200). The next execution reloads
+ *     everything from Postgres, so no state is lost — and the checkpoint count it reloads
+ *     is what keeps the sequence numbering monotonic instead of restarting at 0.
  *
  * ## Failure isolation
  *
@@ -105,11 +112,19 @@ const DEFAULT_MAX_CONCURRENT = 1;
 const MAX_MAX_CONCURRENT = 4;
 
 /**
- * Continue-As-New after this many checkpoints even if the SDK has not suggested it yet.
- * One checkpoint is a handful of history events; 200 leaves a wide margin below the
- * 10k-event/50MB defaults while keeping one execution for ordinary programmes.
+ * Continue-As-New after this many checkpoints recorded **in the current execution**, even
+ * if the SDK has not suggested it yet. One checkpoint is a handful of history events; 200
+ * leaves a wide margin below the 10k-event/50MB defaults while keeping one execution for
+ * ordinary programmes.
+ *
+ * Counted per execution, not cumulatively across generations: the checkpoint total is
+ * reloaded after a crossing (it has to be, it is the sequence number), so comparing it to
+ * this bound would continue as new again immediately, forever, without recording anything.
  */
-const CONTINUE_AFTER_CHECKPOINTS = 200;
+const DEFAULT_CONTINUE_AFTER_CHECKPOINTS = 200;
+
+/** The ceiling a caller-supplied `continueAfterCheckpoints` is clamped to. */
+const MAX_CONTINUE_AFTER_CHECKPOINTS = 10_000;
 
 /** Node states that make a dependent unrunnable. `pending`/`running` do not. */
 const FAILED_DEPENDENCY_STATES: ReadonlySet<ProgrammeNodeStatus> = new Set([
@@ -124,7 +139,15 @@ type ProgrammeActivityState = {
   readonly nodes: readonly ProgrammeNode[];
   readonly status: Map<string, ProgrammeNodeStatus>;
   readonly recorded: ReadonlyMap<string, string>;
+  /** The next checkpoint's sequence number. Reloaded after Continue-As-New, never 0 again
+   * once a checkpoint exists — `@@unique([programmeId, sequence])` would refuse the write. */
   sequence: number;
+  /**
+   * Checkpoints recorded by **this** execution. The Continue-As-New backstop reads this,
+   * not `sequence`: `sequence` is carried across generations, so measuring it would make a
+   * crossed programme cross again on its first loop iteration, for ever.
+   */
+  recordedThisExecution: number;
 };
 
 export async function runProgrammeWorkflow(
@@ -144,6 +167,7 @@ export async function runProgrammeWorkflow(
           orgId: input.orgId,
           status: 'cancelled',
           reason: 'The programme workflow was cancelled; no further task was dispatched.',
+          code: 'CANCELLED',
         })
         .catch((finishError: unknown) => {
           log.error('could not record programme cancellation', {
@@ -171,6 +195,7 @@ async function drive(input: RunProgrammeWorkflowInput): Promise<RunProgrammeWork
       loaded.checkpoints.map((checkpoint) => [checkpoint.taskId, checkpoint.outcome]),
     ),
     sequence: loaded.checkpointCount,
+    recordedThisExecution: 0,
   };
 
   // A programme that already reached a terminal status has no work to schedule. Defensive:
@@ -192,7 +217,10 @@ async function drive(input: RunProgrammeWorkflowInput): Promise<RunProgrammeWork
     // can be started directly and the parent must not trust that it was.
     const reason = graph.issues.map((issue) => issue.message).join(' ');
 
-    await finish(state, input, 'failed', `GRAPH_INVALID: ${reason}`);
+    await finish(state, input, 'failed', {
+      code: 'GRAPH_INVALID',
+      prose: `GRAPH_INVALID: ${reason}`,
+    });
     return summarise(state);
   }
 
@@ -200,6 +228,7 @@ async function drive(input: RunProgrammeWorkflowInput): Promise<RunProgrammeWork
 
   const deadline = Date.parse(input.deadlineAt);
   const maxConcurrent = clampConcurrency(input.maxConcurrent);
+  const continueAfterCheckpoints = clampContinueAfter(input.continueAfterCheckpoints);
 
   for (;;) {
     // ── Blocked cascade: dependents of a failure can never run ──────────────
@@ -214,21 +243,20 @@ async function drive(input: RunProgrammeWorkflowInput): Promise<RunProgrammeWork
     if (open.length === 0) break;
 
     if (workflowInfo().unsafe.now() >= deadline) {
-      await finish(
-        state,
-        input,
-        'timed_out',
-        'DEADLINE_EXCEEDED: no node was dispatched after the deadline.',
-      );
+      await finish(state, input, 'timed_out', {
+        code: 'DEADLINE_EXCEEDED',
+        prose: 'DEADLINE_EXCEEDED: no node was dispatched after the deadline.',
+      });
       return summarise(state);
     }
 
-    if (shouldContinueAsNew(state)) {
+    if (shouldContinueAsNew(state, continueAfterCheckpoints)) {
       // No child is in flight here — the loop only reaches this point between rounds.
       // The next execution reloads the graph, the node states and the checkpoint count.
       log.info('continuing programme as new', {
         programmeId,
         checkpoints: state.sequence,
+        checkpointsThisExecution: state.recordedThisExecution,
         historySize: workflowInfo().historySize,
       });
 
@@ -245,12 +273,11 @@ async function drive(input: RunProgrammeWorkflowInput): Promise<RunProgrammeWork
       // Nothing is runnable and nothing failed: every remaining node is waiting on a node
       // that is also waiting. A validated graph cannot reach this state, so it is a bug,
       // not a plan — reported as blocked instead of spinning.
-      await finish(
-        state,
-        input,
-        'blocked',
-        'NO_READY_NODE: the remaining nodes are waiting on each other; the graph was not schedulable.',
-      );
+      await finish(state, input, 'blocked', {
+        code: 'NO_READY_NODE',
+        prose:
+          'NO_READY_NODE: the remaining nodes are waiting on each other; the graph was not schedulable.',
+      });
       return summarise(state);
     }
 
@@ -590,6 +617,7 @@ async function checkpoint(
   release?: ProgrammeReservationRelease,
 ): Promise<void> {
   state.sequence += 1;
+  state.recordedThisExecution += 1;
 
   await programmeActivities.recordProgrammeCheckpointActivity({
     programmeId: input.programmeId,
@@ -608,22 +636,30 @@ async function checkpoint(
   state.status.set(node.taskId, NODE_STATUS_BY_OUTCOME[outcome]);
 }
 
+/** A terminal verdict in both forms the row needs: prose for a person, a code for a query. */
+interface ProgrammeFinishReason {
+  readonly code: ProgrammeReasonCode | null;
+  readonly prose: string;
+}
+
 async function finish(
   state: ProgrammeActivityState,
   input: RunProgrammeWorkflowInput,
   status: ProgrammeRunStatus | 'cancelled',
-  reason: string,
+  reason: ProgrammeFinishReason,
 ): Promise<void> {
   await programmeActivities.finishProgrammeActivity({
     programmeId: input.programmeId,
     orgId: input.orgId,
     status,
-    reason,
+    reason: reason.prose,
+    code: reason.code,
   });
 
   log.info('programme finished', {
     programmeId: input.programmeId,
     status,
+    code: reason.code,
     checkpoints: state.sequence,
   });
 }
@@ -645,24 +681,65 @@ function programmeStatus(state: ProgrammeActivityState): ProgrammeRunStatus {
   return 'succeeded';
 }
 
-function reasonFor(status: ProgrammeRunStatus, state: ProgrammeActivityState): string {
-  if (status === 'succeeded') return 'Every task in the programme succeeded.';
+/**
+ * The verdict as prose and as a code.
+ *
+ * The order is the precedence the codes carry: a failure outranks a waiting approval, which
+ * outranks a blocked branch, because that is the order in which an operator has to act on
+ * them. `UNSPECIFIED` is the last line and is expected to be unreachable from here — the
+ * loop cannot end with a pending node — but a terminal row that says "unclassified" is
+ * honest, while one that guesses `DEPENDENCY_BLOCKED` would not be.
+ */
+function reasonFor(
+  status: ProgrammeRunStatus,
+  state: ProgrammeActivityState,
+): ProgrammeFinishReason {
+  if (status === 'succeeded') {
+    return { code: null, prose: 'Every task in the programme succeeded.' };
+  }
 
-  const failed = state.nodes.filter((node) => state.status.get(node.taskId) === 'failed');
+  const broken = state.nodes.filter((node) => {
+    const nodeStatus = state.status.get(node.taskId);
+    return nodeStatus === 'failed' || nodeStatus === 'cancelled';
+  });
   const waiting = state.nodes.filter(
     (node) => state.status.get(node.taskId) === 'waiting_for_approval',
   );
 
-  if (failed.length > 0) {
-    const failedIds = failed.map((node) => node.taskId);
-    return `Task failure in ${failedIds.join(', ')}; dependents were blocked, independent branches ran.`;
+  if (broken.length > 0) {
+    const brokenIds = broken.map((node) => node.taskId);
+    // A cancelled node is not a failed one, and the sentence says which happened rather than
+    // calling both "failure". The code is the same either way: `TASK_FAILED` is the code for
+    // "a node's work did not succeed", and its cause is on the checkpoint.
+    const noun = broken.some((node) => state.status.get(node.taskId) === 'failed')
+      ? 'failure'
+      : 'cancellation';
+
+    return {
+      code: 'TASK_FAILED',
+      prose: `Task ${noun} in ${brokenIds.join(', ')}; dependents were blocked, independent branches ran.`,
+    };
   }
 
   if (waiting.length > 0) {
-    return `Waiting for approval on ${waiting.map((node) => node.taskId).join(', ')}.`;
+    return {
+      code: 'APPROVAL_PENDING',
+      prose: `Waiting for approval on ${waiting.map((node) => node.taskId).join(', ')}.`,
+    };
   }
 
-  return 'Work remains that could not be scheduled.';
+  const blocked = state.nodes.filter((node) => state.status.get(node.taskId) === 'blocked');
+
+  if (blocked.length > 0) {
+    return {
+      code: 'DEPENDENCY_BLOCKED',
+      prose: `Work remains that could not be scheduled: ${blocked
+        .map((node) => node.taskId)
+        .join(', ')}.`,
+    };
+  }
+
+  return { code: 'UNSPECIFIED', prose: 'Work remains that could not be scheduled.' };
 }
 
 function summarise(state: ProgrammeActivityState): RunProgrammeWorkflowResult {
@@ -679,14 +756,36 @@ function summarise(state: ProgrammeActivityState): RunProgrammeWorkflowResult {
   };
 }
 
-function shouldContinueAsNew(state: ProgrammeActivityState): boolean {
-  return workflowInfo().continueAsNewSuggested || state.sequence >= CONTINUE_AFTER_CHECKPOINTS;
+function shouldContinueAsNew(
+  state: ProgrammeActivityState,
+  continueAfterCheckpoints: number,
+): boolean {
+  // The suggestion first: it is the server telling us the history this execution is
+  // actually accumulating. The count is the deterministic backstop for a history that grows
+  // without the suggestion arriving, and it is per execution — see the constant's comment.
+  return (
+    workflowInfo().continueAsNewSuggested || state.recordedThisExecution >= continueAfterCheckpoints
+  );
 }
 
 function clampConcurrency(requested: number | undefined): number {
   if (requested === undefined || !Number.isFinite(requested)) return DEFAULT_MAX_CONCURRENT;
 
   return Math.min(Math.max(Math.trunc(requested), 1), MAX_MAX_CONCURRENT);
+}
+
+/**
+ * The Continue-As-New backstop, bounded.
+ *
+ * A directly started execution may pass anything; `0`, a negative number or `Infinity` would
+ * otherwise disable the bound silently, which is the one thing a backstop may not do.
+ */
+function clampContinueAfter(requested: number | undefined): number {
+  if (requested === undefined || !Number.isFinite(requested)) {
+    return DEFAULT_CONTINUE_AFTER_CHECKPOINTS;
+  }
+
+  return Math.min(Math.max(Math.trunc(requested), 1), MAX_CONTINUE_AFTER_CHECKPOINTS);
 }
 
 function isTerminalProgrammeStatus(

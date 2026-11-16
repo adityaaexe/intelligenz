@@ -97,6 +97,8 @@ interface CreatedProgrammeBody {
     objective: string;
     status: string;
     failureReason: string | null;
+    /** The machine-readable reason. `null` while nothing has failed. */
+    failureCode: string | null;
     createdAt: string;
     tasks: { taskId: string; dependsOn: string[]; status: string; attemptCount: number }[];
   };
@@ -157,6 +159,9 @@ describe('programme submission', () => {
 
     expect(body.meta.created).toBe(true);
     expect(body.data.status).toBe('pending');
+    // A programme that has not finished has no failure code — and `UNSPECIFIED` would be a
+    // claim about a failure that has not happened.
+    expect(body.data.failureCode).toBeNull();
     expect(body.data.projectId).toBe(suite.fixtures.projectA);
     expect(body.data.objective).toBe('Submit two dependent tasks as one objective.');
     expect(body.data.tasks).toHaveLength(2);

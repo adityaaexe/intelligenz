@@ -201,8 +201,18 @@ the run row back to `succeeded`.
 |---|---|---|---|---|
 | POST | `/v1/orgs/:orgId/programmes` | **MEMBER** | `{ projectId, objective, tasks: [{ taskId, dependsOn[] }] }` (1–50 nodes) + optional `Idempotency-Key` | `202` created / `200` duplicate — `{ data: Programme, meta: { created: boolean } }` |
 
-`Programme` = `{ programmeId, projectId, objective, status, failureReason,
+`Programme` = `{ programmeId, projectId, objective, status, failureReason, failureCode,
 createdAt, startedAt, finishedAt, tasks: [{ taskId, dependsOn[], status, attemptCount }] }`.
+
+`failureReason` is prose for a person and embeds task ids, so it is not stable enough to
+filter on. `failureCode` is the machine-readable companion, written in the same conditional
+UPDATE that closes the programme; it is one of `TASK_FAILED`, `APPROVAL_PENDING`,
+`DEPENDENCY_BLOCKED`, `NO_READY_NODE`, `DEADLINE_EXCEEDED`, `ORCHESTRATOR_UNAVAILABLE`,
+`START_FAILED`, `GRAPH_INVALID`, `CANCELLED`, `UNSPECIFIED`. It is `null` exactly when there
+is no failure to name — a `succeeded` programme, or one still `pending`/`running`. A
+terminal non-success with no stored code (a row written before the column existed, or closed
+by an older worker) is reported as `UNSPECIFIED`, which reads as "cannot say why", never as
+success.
 
 `dependsOn` is a list of **task ids** in the same submission (not node ids): the caller
 creates the tasks first, so the caller knows them. `(programmeId, taskId)` is unique.

@@ -15,7 +15,7 @@ import {
   OrchestratorUnavailableError,
   isWorkflowAlreadyStartedError,
 } from '../orchestrator/orchestrator.service';
-import type { ProgrammeResponse } from './programmes.response';
+import { toFailureCode, type ProgrammeResponse } from './programmes.response';
 
 /**
  * Programme submission — the one API call that starts autonomous continuation.
@@ -64,6 +64,7 @@ const PROGRAMME_SELECT = {
   objective: true,
   status: true,
   failureReason: true,
+  failureCode: true,
   createdAt: true,
   startedAt: true,
   finishedAt: true,
@@ -252,6 +253,10 @@ export class ProgrammesService {
         data: {
           status: 'failed',
           failureReason: unavailable ? 'ORCHESTRATOR_UNAVAILABLE' : 'START_FAILED',
+          // The same fact as a code, so a programme that never started is still filterable
+          // by *why*. Without this, the one case the API itself classifies would be the one
+          // case it reported as `UNSPECIFIED`.
+          failureCode: unavailable ? 'ORCHESTRATOR_UNAVAILABLE' : 'START_FAILED',
           finishedAt: new Date(),
         },
       });
@@ -306,6 +311,7 @@ function toResponse(row: ProgrammeRow): ProgrammeResponse {
     objective: row.objective,
     status: row.status,
     failureReason: row.failureReason,
+    failureCode: toFailureCode(row.status, row.failureCode),
     createdAt: row.createdAt.toISOString(),
     startedAt: row.startedAt?.toISOString() ?? null,
     finishedAt: row.finishedAt?.toISOString() ?? null,

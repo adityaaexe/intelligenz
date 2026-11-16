@@ -10,6 +10,8 @@
  * the same vocabulary written down where the sandbox can see it.
  */
 
+import type { ProgrammeReasonCode } from '@intelligenz/contracts';
+
 /** The scheduler's verdict for the programme as a whole. Mirrors `ProgrammeStatus`. */
 export type ProgrammeRunStatus = 'succeeded' | 'failed' | 'blocked' | 'timed_out';
 
@@ -57,6 +59,28 @@ export interface RunProgrammeWorkflowInput {
    * chains do not need it; parallel branches do.
    */
   readonly maxConcurrent?: number;
+  /**
+   * The deterministic backstop for Continue-As-New: after this many checkpoints recorded
+   * **in the current execution**, continue as new even when the SDK has not suggested it.
+   *
+   * `workflowInfo().continueAsNewSuggested` remains the **primary** trigger — it reflects
+   * actual history growth, which is the resource being protected, and this number cannot.
+   * The backstop exists because a suggestion is advisory and a little late by design.
+   *
+   * It lives in the input for two reasons, and neither is a client feature:
+   *
+   *   1. a test can cross the boundary without generating 200 real checkpoints, so the
+   *      mechanism is exercised rather than asserted to exist;
+   *   2. `continueAsNew(input)` carries the input into the next generation, so every run of
+   *      one programme uses the same value instead of falling back to the default after the
+   *      first crossing.
+   *
+   * The API never sends it: `ProgrammesService.submit` passes `programmeId`, `orgId` and
+   * `deadlineAt` and nothing else, and the workflow clamps whatever it is given to
+   * `[1, 10_000]` (default 200) so a directly started execution cannot disable the bound by
+   * sending 0 or a negative number.
+   */
+  readonly continueAfterCheckpoints?: number;
 }
 
 /** What the parent reports. Counts, not a log: the rows are the record. */
@@ -255,6 +279,13 @@ export interface FinishProgrammeInput {
   readonly status: ProgrammeRunStatus | 'cancelled';
   /** Why, in one line. Recorded in `Programme.failureReason` only for non-success. */
   readonly reason: string;
+  /**
+   * The machine-readable form of `reason`, written to `Programme.failureCode` in the same
+   * conditional UPDATE. `null` exactly when the status is `succeeded`: a success has no
+   * failure code, and inventing one would make "no failure" indistinguishable from
+   * "unclassified failure" for every consumer of the column.
+   */
+  readonly code: ProgrammeReasonCode | null;
 }
 
 export interface FinishProgrammeResult {

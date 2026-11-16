@@ -97,6 +97,7 @@ describe('programme activities refuse a call with no execution identity', () => 
         orgId: ORG_ID,
         status: 'succeeded',
         reason: 'test',
+        code: null,
       }),
     ).rejects.toMatchObject(refusal);
   });

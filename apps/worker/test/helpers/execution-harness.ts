@@ -1,8 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-import { Client, Connection, WorkflowFailedError, WorkflowIdReusePolicy, WorkflowNotFoundError } from '@temporalio/client';
-import type { WorkflowHandle } from '@temporalio/client';
+import {
+  Client,
+  Connection,
+  WorkflowFailedError,
+  WorkflowIdReusePolicy,
+  WorkflowNotFoundError,
+} from '@temporalio/client';
+import type { WorkflowHandleWithFirstExecutionRunId } from '@temporalio/client';
 import type { Workflow } from '@temporalio/workflow';
 import { NativeConnection, Worker } from '@temporalio/worker';
 
@@ -98,7 +104,7 @@ export interface ExecutionHarness {
   start(
     workflowType: string,
     options: StartWorkflowOptions,
-  ): Promise<WorkflowHandle<Workflow>>;
+  ): Promise<WorkflowHandleWithFirstExecutionRunId<Workflow>>;
   /**
    * Dispatches an activity **outside any workflow** — the reviewer's N1 reproduction.
    *
@@ -126,7 +132,33 @@ export interface ExecutionHarness {
   describeWorkflow(
     workflowId: string,
   ): Promise<{ readonly status: string; readonly runId: string } | null>;
+  /**
+   * One run of a workflow id, **by run id**, including the Continue-As-New link.
+   *
+   * `describe()` in SDK 1.25.0 does not return `continuedExecutionRunId` — that field lives
+   * on `WorkflowExecutionStartedEventAttributes`, not on the visibility record. The link a
+   * crossing produces is observable instead as the run's own close status
+   * (`CONTINUED_AS_NEW`) plus the `WorkflowExecutionContinuedAsNew` event in its history,
+   * whose `newExecutionRunId` is the next run. This method reads both, so a test can walk
+   * the chain rather than assume it.
+   *
+   * `runId` omitted describes the **latest** run under the id — what a client handle with
+   * no run id joins, and therefore what `handle.result()` returns.
+   */
+  describeRun(workflowId: string, runId?: string): Promise<WorkflowRunDescription | null>;
   close(): Promise<void>;
+}
+
+/** What Temporal reports about one run, reduced to what a test can assert on. */
+export interface WorkflowRunDescription {
+  /** `RUNNING` | `COMPLETED` | `FAILED` | `CANCELLED` | `CONTINUED_AS_NEW` | … */
+  readonly status: string;
+  readonly runId: string;
+  /**
+   * The run this one continued into. **Empty** when it did not continue as new — a
+   * completed run, a failed one, or a running one that has not crossed yet.
+   */
+  readonly continuedAsNewRunId: string;
 }
 
 export interface StartWorkflowOptions {
@@ -193,7 +225,7 @@ export async function createExecutionHarness(
     async start(
       workflowType: string,
       startOptions: StartWorkflowOptions,
-    ): Promise<WorkflowHandle<Workflow>> {
+    ): Promise<WorkflowHandleWithFirstExecutionRunId<Workflow>> {
       if (workerFailure !== undefined) {
         throw new Error(`probe worker died before the start: ${String(workerFailure)}`);
       }
@@ -320,6 +352,42 @@ export async function createExecutionHarness(
         const description = await client.workflow.getHandle(workflowId).describe();
 
         return { status: description.status.name, runId: description.runId };
+      } catch (error) {
+        if (error instanceof WorkflowNotFoundError) return null;
+        if ((error as { code?: unknown }).code === GRPC_NOT_FOUND) return null;
+
+        throw error;
+      }
+    },
+
+    /**
+     * One run by run id, including the Continue-As-New link.
+     *
+     * The link is read from the run's own history, not from `describe()`: the installed
+     * `@temporalio/client` 1.25.0 exposes no `continuedExecutionRunId` on
+     * `WorkflowExecutionDescription` (the field is on the *started event*, not on the
+     * visibility record). `status === 'CONTINUED_AS_NEW'` alone says a crossing happened;
+     * the `WorkflowExecutionContinuedAsNew` event says **which run** it crossed into, which
+     * is what lets a test follow the chain to the execution whose result it awaited.
+     */
+    async describeRun(workflowId: string, runId?: string): Promise<WorkflowRunDescription | null> {
+      try {
+        const handle = client.workflow.getHandle(workflowId, runId);
+        const description = await handle.describe();
+        const status = description.status.name;
+
+        let continuedAsNewRunId = '';
+
+        if (status === 'CONTINUED_AS_NEW') {
+          const history = await handle.fetchHistory();
+          const continued = (history.events ?? []).find(
+            (event) => event.workflowExecutionContinuedAsNewEventAttributes != null,
+          )?.workflowExecutionContinuedAsNewEventAttributes;
+
+          continuedAsNewRunId = continued?.newExecutionRunId ?? '';
+        }
+
+        return { status, runId: description.runId, continuedAsNewRunId };
       } catch (error) {
         if (error instanceof WorkflowNotFoundError) return null;
         if ((error as { code?: unknown }).code === GRPC_NOT_FOUND) return null;

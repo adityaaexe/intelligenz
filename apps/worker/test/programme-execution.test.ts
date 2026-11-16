@@ -141,6 +141,7 @@ async function createReadyTask(
   fixture: TenantFixture,
   title: string,
   goal: string,
+  riskClass: 'LOW' | 'HIGH' = 'LOW',
 ): Promise<string> {
   const task = await client.task.create({
     data: {
@@ -150,7 +151,7 @@ async function createReadyTask(
       title: `${title} ${randomUUID().slice(0, 8)}`,
       goal,
       status: 'ready',
-      riskClass: 'LOW',
+      riskClass,
       acceptanceCriteria: ['The reported test passes and the change is described.'],
       createdById: fixture.userId,
       idempotencyKey: `programme-${randomUUID()}`,
@@ -172,6 +173,8 @@ async function submitProgramme(options: {
   readonly fixture: TenantFixture;
   readonly objective: string;
   readonly nodes: readonly { readonly taskId: string; readonly dependsOn: readonly string[] }[];
+  /** Overrides the one-hour budget. A past value is the deadline-expiry arrangement. */
+  readonly deadlineAt?: string;
 }): Promise<{ readonly programmeId: string; readonly handle: WorkflowHandle<Workflow> }> {
   const { fixture } = options;
   const programmeId = await createProgrammeRow(options);
@@ -189,7 +192,7 @@ async function submitProgramme(options: {
       {
         programmeId,
         orgId: fixture.orgId,
-        deadlineAt: new Date(Date.now() + 3_600_000).toISOString(),
+        deadlineAt: options.deadlineAt ?? new Date(Date.now() + 3_600_000).toISOString(),
       },
     ],
   });
@@ -323,11 +326,15 @@ describe.skipIf(!enabled)('THREE-TASK-E2E — one submission, then only the data
         startedAt: true,
         finishedAt: true,
         failureReason: true,
+        failureCode: true,
       },
     });
 
     expect(programme.status).toBe('succeeded');
     expect(programme.failureReason).toBeNull();
+    // A success has no failure code — not `NONE`, not `UNSPECIFIED`. The API answers `null`
+    // for this row, which is the only way a caller can tell "no failure" from "unclassified".
+    expect(programme.failureCode).toBeNull();
     expect(programme.startedAt).not.toBeNull();
     expect(programme.startedAt!.getTime()).toBeGreaterThanOrEqual(submittedAt.getTime() - 1_000);
     expect(programme.finishedAt).not.toBeNull();
@@ -518,11 +525,14 @@ describe.skipIf(!enabled)('one failure does not stop independent branches', () =
 
     const programme = await client.programme.findUniqueOrThrow({
       where: { id: programmeId },
-      select: { status: true, failureReason: true },
+      select: { status: true, failureReason: true, failureCode: true },
     });
 
     expect(programme.status).toBe('failed');
     expect(programme.failureReason).toContain('independent branches ran');
+    // The code says why without the prose: a node's task failed. `DEPENDENCY_BLOCKED`
+    // would be the wrong answer here even though C is blocked — the cause is B's failure.
+    expect(programme.failureCode).toBe('TASK_FAILED');
 
     const nodes = await client.programmeTask.findMany({
       where: { programmeId },
@@ -596,6 +606,144 @@ describe.skipIf(!enabled)('one failure does not stop independent branches', () =
     expect(sequenceOf(c)).toBeGreaterThan(sequenceOf(b));
   }, 300_000);
 });
+
+// ─── The terminal reason: prose and a code ───────────────────────────────────
+
+/**
+ * `Programme.failureReason` is a sentence that embeds task ids, so an operator can read it
+ * and the API cannot filter on it. These tests are about the second half: the code written
+ * in the same conditional UPDATE, which is what a dashboard groups by and what the Phase 8.7
+ * telemetry contract projects as `reason_code`.
+ *
+ * The mapping they pin is the one an operator acts on:
+ *
+ *   - a node whose task failed   → `TASK_FAILED` (not `DEPENDENCY_BLOCKED`, though its
+ *     dependents are blocked — the cause outranks the symptom);
+ *   - a node waiting for approval → `APPROVAL_PENDING`;
+ *   - the deadline                → `DEADLINE_EXCEEDED`;
+ *   - a success                   → `null`, because a success has no failure code.
+ */
+describe.skipIf(!enabled)(
+  'PROGRAMME-REASON — the terminal reason is prose plus a stable code',
+  () => {
+    it('records APPROVAL_PENDING when a node waits on an approval the programme will not spend', async () => {
+      const fixture = await tenant('programme-reason-approval');
+      // HIGH risk, so the reservation refuses it: a programme does not spend a grant.
+      const gated = await createReadyTask(
+        fixture,
+        'Reason — approval gated',
+        'Requires a human decision. [simulate:ok]',
+        'HIGH',
+      );
+
+      const { programmeId, handle } = await submitProgramme({
+        fixture,
+        objective: 'Prove an approval-gated node is reported as an approval, not as a failure.',
+        nodes: [{ taskId: gated, dependsOn: [] }],
+      });
+
+      const result = (await handle.result()) as RunProgrammeWorkflowResult;
+      expect(result.status).toBe('blocked');
+
+      const programme = await client.programme.findUniqueOrThrow({
+        where: { id: programmeId },
+        select: { status: true, failureReason: true, failureCode: true, startedAt: true },
+      });
+
+      expect(programme.status).toBe('blocked');
+      expect(programme.failureCode).toBe('APPROVAL_PENDING');
+      // The prose is not degraded: it still names the node that is waiting.
+      expect(programme.failureReason).toContain(gated);
+      expect(programme.failureReason).toContain('Waiting for approval');
+
+      const node = await client.programmeTask.findFirstOrThrow({
+        where: { programmeId, taskId: gated },
+        select: { status: true, attemptCount: true },
+      });
+
+      expect(node.status).toBe('waiting_for_approval');
+      // Nothing was reserved: the refusal happens before the transaction that mints rows.
+      expect(node.attemptCount).toBe(0);
+      expect(
+        await client.executionAttempt.count({ where: { orgId: fixture.orgId, taskId: gated } }),
+      ).toBe(0);
+      expect(
+        (await client.task.findUniqueOrThrow({ where: { id: gated }, select: { status: true } }))
+          .status,
+      ).toBe('ready');
+
+      const checkpoints = await client.programmeCheckpoint.findMany({
+        where: { programmeId },
+        select: { outcome: true },
+      });
+
+      expect(checkpoints.map((row) => row.outcome)).toEqual(['waiting_for_approval']);
+    }, 300_000);
+
+    it('records DEADLINE_EXCEEDED, with nothing dispatched, when the deadline has already passed', async () => {
+      const fixture = await tenant('programme-reason-deadline');
+      const taskId = await createReadyTask(
+        fixture,
+        'Reason — deadline already passed',
+        'Dispatch must not start. [simulate:ok]',
+      );
+
+      const { programmeId, handle } = await submitProgramme({
+        fixture,
+        objective: 'Prove a past deadline closes the programme without dispatching a node.',
+        nodes: [{ taskId, dependsOn: [] }],
+        // Already expired: the first loop iteration is the only one that matters.
+        deadlineAt: new Date(Date.now() - 60_000).toISOString(),
+      });
+
+      const result = (await handle.result()) as RunProgrammeWorkflowResult;
+      // `result.status` is deliberately not asserted: `RunProgrammeWorkflowResult.status` is
+      // derived from node states, and on this path every node is still `pending`, so it
+      // reports `blocked`. The **row** is the record the API returns and the record the code
+      // is written to, and that is what this test is about.
+      expect(result.checkpoints).toBe(0);
+
+      const programme = await client.programme.findUniqueOrThrow({
+        where: { id: programmeId },
+        select: {
+          status: true,
+          failureReason: true,
+          failureCode: true,
+          startedAt: true,
+          finishedAt: true,
+        },
+      });
+
+      expect(programme.status).toBe('timed_out');
+      expect(programme.failureCode).toBe('DEADLINE_EXCEEDED');
+      expect(programme.failureReason).toContain('DEADLINE_EXCEEDED');
+      // `loadProgrammeActivity` ran, so the scheduler did start; it then refused to dispatch.
+      expect(programme.startedAt).not.toBeNull();
+      expect(programme.finishedAt).not.toBeNull();
+
+      expect(await client.programmeCheckpoint.count({ where: { programmeId } })).toBe(0);
+      expect(await client.executionAttempt.count({ where: { orgId: fixture.orgId, taskId } })).toBe(
+        0,
+      );
+      expect(
+        (await client.task.findUniqueOrThrow({ where: { id: taskId }, select: { status: true } }))
+          .status,
+      ).toBe('ready');
+
+      // The telemetry projection reads `reason_code` from this event's payload. If the code
+      // were only in the column, the projection would have to join the table to get it.
+      const finished = await client.auditEvent.findFirstOrThrow({
+        where: { aggregateId: programmeId, eventType: 'programme.finished.v1' },
+        select: { payload: true },
+      });
+
+      expect(finished.payload).toMatchObject({
+        status: 'timed_out',
+        code: 'DEADLINE_EXCEEDED',
+      });
+    }, 300_000);
+  },
+);
 
 // ─── AUTH-02/03: the child's workflow id ─────────────────────────────────────
 
@@ -734,6 +882,17 @@ describe.skipIf(!enabled)('AUTH-02/03 — a programme child runs under the task 
 
       expect(checkpoint.outcome).toBe('cancelled');
       expect(checkpoint.evidence).toMatchObject({ childWorkflowId: `task-${taskId}` });
+
+      // The programme's reason is a cancellation, not an unclassified failure: the node
+      // status is `cancelled`, which maps to `TASK_FAILED` with cancellation prose.
+      const cancelledProgramme = await client.programme.findUniqueOrThrow({
+        where: { id: programmeId },
+        select: { status: true, failureCode: true, failureReason: true },
+      });
+
+      expect(cancelledProgramme.status).toBe('failed');
+      expect(cancelledProgramme.failureCode).toBe('TASK_FAILED');
+      expect(cancelledProgramme.failureReason).toContain('Task cancellation in');
 
       expect(
         (

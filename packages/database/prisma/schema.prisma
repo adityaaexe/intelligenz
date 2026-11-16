@@ -1002,6 +1002,16 @@ model Programme {
   /// (`ORCHESTRATOR_UNAVAILABLE` at submission, `DEADLINE_EXCEEDED`, `GRAPH_INVALID`).
   /// A failed programme with no reason is unattributable a week later.
   failureReason  String?
+  /// The machine-readable companion to `failureReason`: one of
+  /// `PROGRAMME_REASON_CODES` (`@intelligenz/contracts`), written in the same conditional
+  /// UPDATE that closes the programme. `failureReason` stays prose because an operator
+  /// reads it; this column is what the API filters, groups and projects to telemetry.
+  ///
+  /// NULL means **"this row predates the column"**, and must be read as `UNSPECIFIED` for
+  /// a terminal non-success — never as success. A succeeded programme also holds NULL,
+  /// because a success has no failure code; the API distinguishes the two by status and
+  /// answers `null` for success, `UNSPECIFIED` for a terminal failure with no code.
+  failureCode    String?
   /// Set by the parent workflow's first activity, not by the API: "the scheduler is
   /// running" is a fact only the scheduler can report.
   startedAt      DateTime?

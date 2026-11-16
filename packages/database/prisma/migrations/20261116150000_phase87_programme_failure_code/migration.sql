@@ -1,0 +1,24 @@
+-- Phase 8.7: the terminal reason gets a code.
+--
+-- Additive and back-fill-free. `failureReason` is prose written for a person and embeds
+-- task ids (`reasonFor` in the worker's `run-programme.ts`), so "blocked because an
+-- approval is pending" and "blocked because a dependency failed" were distinguishable only
+-- by parsing English or by re-deriving every node's state. The API could not filter on it
+-- and the telemetry contract had no stable enum.
+--
+-- `failureCode` is that enum, stored as TEXT rather than a Postgres enum: the vocabulary
+-- belongs to the scheduler, and a code a newer worker writes must be readable by an older
+-- API without a migration in between.
+--
+-- No default, no backfill, deliberately. A default would have written a code onto rows
+-- nobody classified. Existing rows stay NULL, which the API reports as `UNSPECIFIED` for a
+-- terminal non-success — an explicit "this build cannot say why" rather than a value that
+-- could be mistaken for a clean success.
+--
+-- NULL is therefore overloaded by design and separated by status, not by value:
+--   * succeeded programme          → NULL, and the API answers `null` (no failure code);
+--   * terminal failure, no code    → NULL in the row, `UNSPECIFIED` on the wire;
+--   * non-terminal (pending/running) → NULL, no failure has happened yet.
+
+-- AlterTable
+ALTER TABLE "Programme" ADD COLUMN "failureCode" TEXT;
