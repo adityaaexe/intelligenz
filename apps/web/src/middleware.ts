@@ -2,12 +2,19 @@ import type { NextRequest } from 'next/server';
 import { NextResponse } from 'next/server';
 
 /**
- * HTTP Basic auth for `/preview` only.
+ * HTTP Basic auth for `/preview`, plus tunnel landing redirection.
  *
  * The preview is the only route that renders live programme data without a
- * session, so it is the only route behind a second gate. The matcher is scoped:
- * `/` and `/login` must keep working exactly as before, and a challenge on
- * every route would be a product-wide change disguised as a preview.
+ * session, so it is the only route behind a second gate. `/` and `/login` are
+ * matched only so the tunnel can be redirected; they stay unauthenticated and
+ * untouched on every other host.
+ *
+ * A visitor arriving through a Cloudflare quick tunnel is sent to the preview.
+ * The tenant app is not exposed publicly: `/login` would make the phone's
+ * browser call `NEXT_PUBLIC_API_URL` directly, which is a localhost address or,
+ * if opened, a mutating API behind a public URL. The read-only preview is the
+ * intended surface for that URL. Only the `.trycloudflare.com` suffix matches —
+ * the tunnel hostname changes on every restart and must never be hardcoded.
  *
  * The gate **fails closed**. With `PREVIEW_USER` or `PREVIEW_PASSWORD` missing
  * or empty, every preview request is 503 — never an unauthenticated page. There
@@ -19,9 +26,28 @@ import { NextResponse } from 'next/server';
 
 const REALM = 'INTELLIGENZ preview';
 
+/** Suffix only. Quick-tunnel hostnames are random per restart. */
+const TUNNEL_HOST_SUFFIX = '.trycloudflare.com';
+
 export const config = {
-  matcher: ['/preview', '/preview/:path*'],
+  matcher: ['/', '/login', '/preview', '/preview/:path*'],
 };
+
+/** Lower-cased host without the port. `[::1]:3100` keeps its brackets. */
+function normalizeHost(hostHeader: string | null): string {
+  const host = (hostHeader ?? '').trim().toLowerCase();
+  if (host.length === 0) return '';
+
+  const closingBracket = host.lastIndexOf(']');
+  if (closingBracket >= 0) return host.slice(0, closingBracket + 1);
+
+  const colon = host.indexOf(':');
+  return colon >= 0 ? host.slice(0, colon) : host;
+}
+
+function isTunnelHost(host: string): boolean {
+  return host.length > TUNNEL_HOST_SUFFIX.length && host.endsWith(TUNNEL_HOST_SUFFIX);
+}
 
 interface Credentials {
   readonly user: string;
@@ -82,6 +108,22 @@ function plainResponse(body: string, status: number, extraHeaders?: Record<strin
 }
 
 export function middleware(request: NextRequest): NextResponse {
+  const pathname = request.nextUrl.pathname;
+  const isPreviewPath = pathname === '/preview' || pathname.startsWith('/preview/');
+
+  // Tunnel root and login send the visitor to the read-only preview. `/preview`
+  // is deliberately not a source here — redirecting it to itself would loop.
+  if (
+    (pathname === '/' || pathname === '/login') &&
+    isTunnelHost(normalizeHost(request.headers.get('host')))
+  ) {
+    return NextResponse.redirect(new URL('/preview', request.url), 307);
+  }
+
+  // `/` and `/login` are only in the matcher for the tunnel case above; on every
+  // other host they must stay exactly as unauthenticated as they were before.
+  if (!isPreviewPath) return NextResponse.next();
+
   // Bracket access on purpose: a non-public variable read at runtime survives
   // bundling as a real lookup. `PREVIEW_*` is not `NEXT_PUBLIC_*`, so it is never
   // inlined into a client bundle either way — but this keeps the intent explicit.

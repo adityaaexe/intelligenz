@@ -437,3 +437,19 @@ pnpm -w typecheck && pnpm -w lint && pnpm -w test && pnpm --filter @intelligenz/
 ```bash
 pnpm -w typecheck && pnpm -w lint && pnpm -w test && pnpm --filter @intelligenz/api test:e2e && pnpm programme:check
 ```
+
+### Preview follow-up (2026-11-17) — the tunnel lands on the dashboard
+
+Opening the tunnel root used to show the tenant app's `/login`, whose **client bundle** calls
+`NEXT_PUBLIC_API_URL=http://localhost:4100` from the visitor's browser. On a phone that is the
+phone itself, so it failed with "The API could not be reached." The API is deliberately not
+exposed to make login work: that would put the mutating app on a public ingress.
+
+Instead, `apps/web/src/middleware.ts` redirects `/` and `/login` to `/preview` **only** when the
+Host ends in `.trycloudflare.com` (307). Every other host — localhost, 127.0.0.1, any real
+domain — is unchanged. `/preview` keeps Basic auth; the matcher widening is paired with an
+`if (!isPreviewPath) return NextResponse.next()` so `/` and `/login` never reach the auth block.
+
+Consequence to remember: **the full app is not reachable through the tunnel, by design.** If
+someone needs it remotely, that is a separate decision with its own exposure review — not a
+middleware tweak.
