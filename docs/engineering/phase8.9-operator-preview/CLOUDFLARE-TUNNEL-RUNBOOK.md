@@ -15,21 +15,28 @@ The preview page is **server-rendered**: it reads the programme ledger and API r
 the server. The browser never calls the API, so the API does not need to be exposed and is
 not.
 
-## 2. Two gates
+## 2. One gate
 
-1. **Cloudflare Quick Tunnel email gate** — `--allowed-mail` restricts the tunnel to an
-   allowlist. Cloudflare authenticates the visitor before the request reaches this host.
-2. **HTTP Basic auth** on `/preview` only, credentials from `PREVIEW_USER` /
-   `PREVIEW_PASSWORD`. If either is unset the route answers **503** and never falls through.
+**Cloudflare Access, restricted by `--allowed-mail`.** It authenticates the visitor before the
+request reaches this host. There is **no** application-level credential on `/preview`: the Basic
+gate was removed on 2026-11-17 (see `PREVIEW-SECURITY-REVIEW.md` §3) because it was the step the
+operator could not pass on a phone, and its password had appeared in a chat transcript.
 
-The Basic credential is generated locally for the preview and written to a `0600` file
-outside the repository. It is not committed, not logged, and not in this document.
+What replaces it is a network boundary, not a secret:
+
+- web origin binds `127.0.0.1:3100` (`pnpm start:preview`), not `*:3100`;
+- API binds `127.0.0.1:4100` (start it with `API_HOST=127.0.0.1`), not `0.0.0.0:4100`;
+- the only public ingress is the tunnel.
+
+Verify both bindings before starting the tunnel: a LAN address on 3100 or 4100 means the tunnel
+is not the only way in.
 
 ## 3. Start
 
 ```bash
 # 0. prerequisites (verify, do not assume)
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3100/preview   # 401 or 503 expected
+ss -ltnp | grep -E ':3100|:4100'        # both must be 127.0.0.1
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3100/preview   # 200 expected
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:4100/health/ready
 
 # 1. start the tunnel, detached, with its log and pid recorded
@@ -52,23 +59,28 @@ Do **not** fabricate a URL. If the log does not contain one, the tunnel did not 
 ```bash
 URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/opencode/preview/cloudflared.log | head -1)
 
-# unauthenticated request: Cloudflare's gate answers, not the app
-curl -s -o /dev/null -w '%{http_code}\n' "$URL/preview"        # expect 302 (Access) or 401
+# unauthenticated request: Cloudflare Access answers, not the app
+curl -s -o /dev/null -w '%{http_code}\n' "$URL/preview"        # expect 302 to login.trycloudflare.com
+curl -s "$URL/preview" | grep -c 'TEMPORARY PREVIEW'            # expect 0 — no data before auth
 
 # the tunnel itself is healthy
-cloudflared tunnel info --help >/dev/null 2>&1 || true
 tail -20 /tmp/opencode/preview/cloudflared.log
 ```
+
+Then, from a browser: open the URL, sign in with the allowed email, and expect the page — no
+second prompt. If the browser shows the app login form instead, the rewrite did not fire; check
+that the request carries `cf-connecting-ip` and that `Host` is the tunnel hostname.
 
 Acceptance:
 
 - the public URL responds;
 - an unauthenticated request does **not** return ledger data;
-- with the authorised email, Cloudflare's login completes;
-- then Basic auth prompts, and the page renders;
-- `/` and `/login` still work and are not behind Basic auth;
-- no secret appears in the HTML (grep the rendered body for `PREVIEW_PASSWORD`, the API host,
-  and `DATABASE_URL`).
+- with the authorised email, Cloudflare's login completes and the page renders — **no second prompt**;
+- `/` and `/login` reached through the tunnel render the preview (internal rewrite), while on
+  localhost they still render the app unchanged;
+- no secret appears in the HTML (grep the rendered body for `PREVIEW_PASSWORD`, `DATABASE_URL`,
+  and the API host — all should be absent; `PREVIEW_PASSWORD` is absent because the variable is
+  no longer read anywhere).
 
 ## 5. Status
 

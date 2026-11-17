@@ -14,7 +14,8 @@ design.
 | Origin | `http://127.0.0.1:3100` (Next.js `next start`) |
 | Tunnel | Cloudflare Quick Tunnel, `cloudflared 2026.11.0` |
 | Restriction | `--allowed-mail adi3814x@gmail.com` (verified present in argv) |
-| Inner gate | HTTP Basic on `/preview` only |
+| Inner gate | **none** — the Basic gate was removed on 2026-11-17 (§3); Cloudflare Access is the only authentication |
+| Bindings | web `127.0.0.1:3100`, API `127.0.0.1:4100` — loopback only |
 
 **Not exposed:** `4100` API, `5432` Postgres, `6379` Redis, `7233`/`8233` Temporal, SSH, any
 worker or host endpoint. Only 3100 is tunneled.
@@ -39,18 +40,39 @@ set-cookie: __Secure-cloudflared-qt-auth-state-…; HttpOnly; Secure; SameSite=N
 mailbox, so "the authorised user reaches the page" is proven only up to the gate. The
 operator's first visit is the acceptance test for that leg.
 
-## 3. Gate 2 — HTTP Basic on `/preview` only (observed)
+## 3. Superseded: the second gate was removed (2026-11-17)
 
-| Condition | Result |
+The preview previously required HTTP Basic auth as a second gate. **It has been removed**, for
+two reasons recorded rather than hidden:
+
+1. It was the step the operator could not get past on a phone, so the stronger gate (Cloudflare
+   Access, bound to one mailbox) was unusable behind it.
+2. Its password had been transmitted in a chat transcript, which made it the weakest credential
+   in the path — weaker than the email OTP.
+
+The authentication model is now **one gate**: Cloudflare Access with `--allowed-mail`, verified
+above. There is no application-level credential on `/preview`, and no `PREVIEW_*` environment
+variable is read anywhere in the web app.
+
+What replaces the second gate is a **network boundary**, not a secret:
+
+| Control | State |
 |---|---|
-| `PREVIEW_USER`/`PREVIEW_PASSWORD` unset | **503** `Preview is not configured.` — no page, no challenge |
-| Credentials set, no `Authorization` | **401**, `WWW-Authenticate: Basic realm="INTELLIGENZ preview"` |
-| Wrong password | **401** |
-| Correct credentials | **200**, 176 kB rendered page |
-| `/` and `/login` without auth | **200**, no challenge — matcher is scoped, not app-wide |
+| Web origin | `127.0.0.1:3100` — loopback only; LAN request returns `000` (connection refused) |
+| API origin | `127.0.0.1:4100` — loopback only; LAN request returns `000` |
+| Public ingress | the tunnel only, behind Cloudflare Access |
 
-The matcher is `['/preview', '/preview/:path*']`. Comparison is constant-time; the password is
-never logged, echoed, or placed in a header. There is no development bypass.
+Before this change the API listened on `0.0.0.0:4100`, so anything on the LAN could reach it and
+bypass the tunnel entirely. That is fixed; the subagent review that found it is credited in the
+commit.
+
+A rewrite, not a redirect, sends a tunnel visitor from `/` and `/login` to `/preview`: a redirect
+must name an absolute origin, and the forwarded `Host` is exactly what is uncertain behind a
+tunnel. `cf-connecting-ip` is the authoritative signal that a request came through Cloudflare.
+
+**The trade-off, stated:** anyone who controls the authorised mailbox can view the page. The page
+is read-only, renders no tenant data, holds no session, and has no mutating control. If any of
+those stop being true, an application-level gate becomes mandatory again.
 
 ## 4. Data leaving the origin
 
@@ -65,7 +87,7 @@ Leak checks on the rendered HTML (authenticated):
 
 | Pattern | Occurrences |
 |---|---|
-| the Basic password | **0** |
+| `PREVIEW_PASSWORD` / `PREVIEW_USER` (the removed control — checked to prove it is gone) | **0** |
 | `DATABASE_URL` | 0 |
 | `JWT_SECRET` | 0 |
 | `127.0.0.1` | 0 |
@@ -90,11 +112,11 @@ is truncated at parse time and **not rendered**; artifact paths are rejected if 
 | Risk | Assessment |
 |---|---|
 | Quick Tunnel is a public ingress | Accepted for a preview: the email gate authenticates before the origin, and the page is read-only public-interest data |
-| Two gates on a phone (OTP then Basic) | Friction, not risk. Basic credentials are stored by the mobile browser after first entry |
-| Basic credentials live in a `0600` file under `/tmp` | Outside the repository, not committed; lost on reboot (which also kills the tunnel) |
-| The whole Next app is reachable behind the gate | `/login` and `/` are the normal app; without a session they show no tenant data. Only `/preview` is added |
+| One mailbox controls access | Accepted and stated: the OTP is bound to `adi3814x@gmail.com`. It is stronger than a shared password that has appeared in a transcript, and weaker than a per-user account. A read-only page does not justify building one |
+| The whole Next app is reachable behind the gate | `/login` and `/` are the normal app; without a session they show no tenant data, and `/` and `/login` are rewritten to `/preview` for tunnel visitors. Only `/preview` is added |
 | Cloudflare terminates TLS | Expected for a tunnel; traffic between Cloudflare and the origin is the tunnel's own encrypted transport |
 | Tunnel process survives the session | `setsid` detaches it; the PID is recorded and the runbook gives a scoped stop command |
+| `x-middleware-rewrite` names the internal origin | Next emits `http://localhost:3100/preview` on a rewrite. Browsers ignore it and it is not a redirect primitive, so it cannot misdirect a phone; it does disclose that the origin is local. Recorded, not hidden |
 
 ## 7. Operational deviation, recorded because it happened
 
@@ -108,6 +130,7 @@ recorded PID, never by pattern.
 ## 8. Condition to keep the tunnel
 
 All of the following were observed: gate active, no data before authentication, no secret in
-HTML, no API/DB/Temporal exposure, read-only surface. If any stops being true — for example
-credentials are removed from the environment and the route starts answering 200 — stop the
-tunnel first and investigate second.
+HTML, no API/DB/Temporal exposure, read-only surface, both origins loopback-bound. If any stops
+being true — for example the tunnel starts answering 200 without Cloudflare Access, or an origin
+binds to `0.0.0.0` again, or the page gains a mutating control — stop the tunnel first and
+investigate second.

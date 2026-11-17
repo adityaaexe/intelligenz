@@ -13,7 +13,7 @@ by one root-cause investigation, not by three implementations.
 
 | Deliverable | Status | Evidence |
 |---|---|---|
-| Server-rendered read-only preview at `/preview` | **PASS** | 200 with Basic auth, 176 kB, real ledger data |
+| Server-rendered read-only preview at `/preview` | **PASS** | 200, 176 kB, real ledger data (Cloudflare-gated; the Basic gate added then removed is recorded in the security review) |
 | Mobile layout | **PASS (headless)** | no horizontal overflow at 360/390/412 px |
 | Access-restricted public URL | **PASS (gate active)** | 302 to `login.trycloudflare.com`, 0 bytes, 0 ledger strings unauthenticated |
 | Preview security review | **PASS** | `PREVIEW-SECURITY-REVIEW.md` |
@@ -29,9 +29,8 @@ by one root-cause investigation, not by three implementations.
 https://sci-imagination-velocity-nhs.trycloudflare.com
 ```
 
-- Origin: `http://127.0.0.1:3100`
-- Gate 1: Cloudflare email allowlist, `adi3814x@gmail.com`
-- Gate 2: HTTP Basic on `/preview` only
+- Origin: `http://127.0.0.1:3100` (loopback only; API `127.0.0.1:4100`, also loopback)
+- Gate: **Cloudflare Access only**, `adi3814x@gmail.com`. The Basic gate added during this phase was removed on 2026-11-17 — it was the step the operator could not pass, and its password had appeared in a transcript. See `PREVIEW-SECURITY-REVIEW.md` §3.
 - Tunnel pid: recorded in `/tmp/opencode/preview/cloudflared.pid`
 - Stop: `kill "$(cat /tmp/opencode/preview/cloudflared.pid)"` after a `ps` identity check
 
@@ -61,11 +60,12 @@ The page shows what the sources say and nothing more:
 
 ## 5. Security, in one paragraph
 
-Only 3100 is tunneled. The public request is intercepted by Cloudflare's gate before the origin:
-302 to `login.trycloudflare.com`, 0 bytes, no dashboard strings. Behind it, `/preview` requires
-Basic auth (503 when unconfigured, 401 without credentials, 200 with them) and the matcher is
-scoped so `/` and `/login` are unchanged. The rendered HTML contains **zero** occurrences of the
-password, `DATABASE_URL`, `JWT_SECRET`, `127.0.0.1`, `localhost:4100` or `postgres://`. The page
+Only 3100 is tunneled, and only on loopback. The public request is intercepted by Cloudflare's gate
+before the origin: 302 to `login.trycloudflare.com`, 0 bytes, no dashboard strings. Behind it,
+`/preview` has **no application credential** — Cloudflare Access is the gate — and a tunnel
+visitor at `/` or `/login` is rewritten to `/preview` internally, so no absolute origin has to be
+guessed. On localhost, `/` and `/login` are unchanged. The rendered HTML contains **zero**
+occurrences of `DATABASE_URL`, `JWT_SECRET`, `127.0.0.1`, `localhost:4100` or `postgres://`. The page
 has no mutating controls, no client JavaScript, no polling and no SSE.
 
 ## 6. The engineering backlog, honestly
@@ -87,9 +87,10 @@ cycle. That is a deviation, not a completion:
 ## 7. Verification
 
 See `VERIFICATION-MATRIX.md`. Summary: web typecheck 0, web lint 0, 30/30 preview tests, build
-pass, Basic auth 503/401/200 as designed, no secret leakage, public gate active, ports 3000/4000
-untouched. The full repo suite and API E2E were **not** re-run after a web-only change; their
-last measured results are labelled historical, not current.
+pass, Cloudflare gate active, tunnel-host rewrite renders the preview with no `Location`, local
+routes unchanged, both origins loopback-bound, no secret leakage, ports 3000/4000 untouched. The
+full repo suite and API E2E were **not** re-run after a web-only change; their last measured
+results are labelled historical, not current.
 
 ## 8. Operational deviation, recorded
 

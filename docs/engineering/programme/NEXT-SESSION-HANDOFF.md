@@ -453,3 +453,22 @@ domain — is unchanged. `/preview` keeps Basic auth; the matcher widening is pa
 Consequence to remember: **the full app is not reachable through the tunnel, by design.** If
 someone needs it remotely, that is a separate decision with its own exposure review — not a
 middleware tweak.
+
+### Preview access, corrected (2026-11-17)
+
+The operator could not get in on a phone. Two causes, both fixed:
+
+1. **The redirect named the wrong origin.** `new URL('/preview', request.url)` emitted the
+   *server's* origin (`http://localhost:3100/preview`), so a phone was told to retry on its own
+   loopback. Replaced with an internal **rewrite** — no `Location`, so there is no absolute origin
+   to get wrong. Tunnel detection accepts `cf-connecting-ip` as well as the host suffix, because
+   the forwarded `Host` is the uncertain part.
+2. **A second password gate.** Basic auth on `/preview` was the step that blocked the phone, and
+   its password had appeared in a chat transcript. Removed; **Cloudflare Access is the only gate**.
+
+Also fixed while checking: the **API listened on `0.0.0.0:4100`**, so anything on the LAN could
+reach it directly and bypass the tunnel. It now starts with `API_HOST=127.0.0.1`; the web binds
+`127.0.0.1:3100` through `pnpm start:preview`.
+
+Verify with: `ss -ltnp | grep -E ':3100|:4100'` → both `127.0.0.1`. If either shows `0.0.0.0`,
+the tunnel is not the only way in.

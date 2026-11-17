@@ -13,9 +13,13 @@ documents).
 | Web lint | exit 0, zero warnings | **PASS** — `eslint src --max-warnings=0`, exit 0 | command output |
 | Preview unit tests | all pass | **PASS** — 30/30, 1 file | `vitest run src/lib/preview-data.test.ts` |
 | Web build | pass | **PASS** — `/preview` reported as dynamic (ƒ); the served artefact is this build | `next build` |
-| Basic auth fail-closed (unset env) | 503 | **PASS** — 503, `Preview is not configured.` | observed during implementation |
-| Basic auth challenge | 401 | **PASS** — `WWW-Authenticate: Basic realm="INTELLIGENZ preview"` | `curl` |
-| Basic auth accept | 200 | **PASS** — 200, 176 409 bytes | `curl -u` |
+| Basic auth fail-closed (unset env) | 503 | **SUPERSEDED 2026-11-17** — the Basic gate was removed; Cloudflare Access is the only authentication. See `PREVIEW-SECURITY-REVIEW.md` §3 |
+| Basic auth challenge (historical) | 401 | **SUPERSEDED** — no application credential exists on `/preview` |
+| Basic auth accept (historical) | 200 | **SUPERSEDED** — `/preview` returns 200 to any request that has passed Cloudflare Access |
+| Tunnel-host `/` renders the preview | 200, preview content, no `Location` | **PASS** — 200, `TEMPORARY PREVIEW` present, `^location:` count 0 |
+| `cf-connecting-ip` fallback | preview content when forwarded `Host` is not the tunnel name | **PASS** — marker present with `Host: 127.0.0.1:3100` + `cf-connecting-ip` |
+| Local `/` unchanged | no preview content | **PASS** — marker count 0 on plain `127.0.0.1:3100/` |
+| Origins loopback-bound | `127.0.0.1:3100` and `127.0.0.1:4100` | **PASS** — both loopback; LAN address returns `000` |
 | Matcher scope | `/` and `/login` unaffected | **PASS** — both 200 without a challenge | `curl` |
 | Secret leakage in HTML | none | **PASS** — password 0, `DATABASE_URL` 0, `JWT_SECRET` 0, `127.0.0.1` 0, `localhost:4100` 0, `postgres://` 0 | `grep -c` over the rendered body |
 | Real data rendered | from the ledger, not invented | **PASS** — `15 / 32`, `P83-007`, `TEMPORARY PREVIEW`, `NOT CHECKED`, `UNKNOWN — no heartbeat endpoint` present | rendered body |
