@@ -464,7 +464,7 @@ The operator could not get in on a phone. Two causes, both fixed:
    to get wrong. Tunnel detection accepts `cf-connecting-ip` as well as the host suffix, because
    the forwarded `Host` is the uncertain part.
 2. **A second password gate.** Basic auth on `/preview` was the step that blocked the phone, and
-   its password had appeared in a chat transcript. Removed; **Cloudflare Access is the only gate**.
+   its password had appeared in a chat transcript. It was then removed in favour of Cloudflare Access alone — and Cloudflare's OTP flow then failed (`sso.cloudflare.dev/…cf-standard-user-authentication-flow` → `/access-denied`), so the gate is now **HTTP Basic at the origin** and the tunnel runs without `--allowed-mail`. See the next subsection.
 
 Also fixed while checking: the **API listened on `0.0.0.0:4100`**, so anything on the LAN could
 reach it directly and bypass the tunnel. It now starts with `API_HOST=127.0.0.1`; the web binds
@@ -472,3 +472,18 @@ reach it directly and bypass the tunnel. It now starts with `API_HOST=127.0.0.1`
 
 Verify with: `ss -ltnp | grep -E ':3100|:4100'` → both `127.0.0.1`. If either shows `0.0.0.0`,
 the tunnel is not the only way in.
+
+### Preview access, final state (2026-11-17, supersedes the paragraph above)
+
+| Item | Value |
+|---|---|
+| URL | `https://kenny-adaptor-jumping-scientific.trycloudflare.com` (the previous URL is dead; the tunnel was restarted) |
+| Gate | **HTTP Basic at the origin** — `PREVIEW_USER` / `PREVIEW_PASSWORD`, 96-bit credential in `/tmp/opencode/preview-credentials.txt` (0600, outside the repo) |
+| Cloudflare allowlist | **removed** — its OTP flow failed at `sso.cloudflare.dev/...cf-standard-user-authentication-flow` → `/access-denied`, before reaching this host. The tunnel log had confirmed `One-Time PIN` and `Allowed recipients: 1 address`, so the allowlist was not the fault |
+| Bindings | web `127.0.0.1:3100` (`pnpm start:preview`), API `127.0.0.1:4100` (`API_HOST=127.0.0.1`) |
+| Verified | no credentials → 401 with 25 bytes and 0 data markers; wrong password → 401; correct → 200 with the ledger markers; tunnel `/` → 401 |
+
+Trade-off, recorded: one shared secret with no per-person identity, revocation, second factor,
+expiry or audit trail. Accepted because the IdP is broken, there is one operator, the page is
+read-only, renders no tenant data, and both origins are loopback-bound. If the page ever gains a
+mutating control or tenant data, a real identity gate is mandatory.

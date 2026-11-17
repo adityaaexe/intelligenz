@@ -30,7 +30,7 @@ https://sci-imagination-velocity-nhs.trycloudflare.com
 ```
 
 - Origin: `http://127.0.0.1:3100` (loopback only; API `127.0.0.1:4100`, also loopback)
-- Gate: **Cloudflare Access only**, `adi3814x@gmail.com`. The Basic gate added during this phase was removed on 2026-11-17 — it was the step the operator could not pass, and its password had appeared in a transcript. See `PREVIEW-SECURITY-REVIEW.md` §3.
+- Gate: **HTTP Basic at the origin**. Cloudflare Access with `--allowed-mail` was tried and its OTP flow failed at `sso.cloudflare.dev/…cf-standard-user-authentication-flow` → `/access-denied`, before reaching this host; the tunnel now runs without an allowlist and the origin gate is the only authentication. Full history in `PREVIEW-SECURITY-REVIEW.md` §3.
 - Tunnel pid: recorded in `/tmp/opencode/preview/cloudflared.pid`
 - Stop: `kill "$(cat /tmp/opencode/preview/cloudflared.pid)"` after a `ps` identity check
 

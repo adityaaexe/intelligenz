@@ -14,7 +14,7 @@ design.
 | Origin | `http://127.0.0.1:3100` (Next.js `next start`) |
 | Tunnel | Cloudflare Quick Tunnel, `cloudflared 2026.11.0` |
 | Restriction | `--allowed-mail adi3814x@gmail.com` (verified present in argv) |
-| Inner gate | **none** — the Basic gate was removed on 2026-11-17 (§3); Cloudflare Access is the only authentication |
+| Gate | **HTTP Basic at the origin** (96-bit credential, loopback-bound). Cloudflare Access was removed after its OTP flow failed before reaching us — see §3. |
 | Bindings | web `127.0.0.1:3100`, API `127.0.0.1:4100` — loopback only |
 
 **Not exposed:** `4100` API, `5432` Postgres, `6379` Redis, `7233`/`8233` Temporal, SSH, any
@@ -40,39 +40,48 @@ set-cookie: __Secure-cloudflared-qt-auth-state-…; HttpOnly; Secure; SameSite=N
 mailbox, so "the authorised user reaches the page" is proven only up to the gate. The
 operator's first visit is the acceptance test for that leg.
 
-## 3. Superseded: the second gate was removed (2026-11-17)
+## 3. Current gate: HTTP Basic at the origin (2026-11-17)
 
-The preview previously required HTTP Basic auth as a second gate. **It has been removed**, for
-two reasons recorded rather than hidden:
+Three access models were tried in one day, and the third is the one that works. The history is
+kept because each failure explains why the next was chosen.
 
-1. It was the step the operator could not get past on a phone, so the stronger gate (Cloudflare
-   Access, bound to one mailbox) was unusable behind it.
-2. Its password had been transmitted in a chat transcript, which made it the weakest credential
-   in the path — weaker than the email OTP.
-
-The authentication model is now **one gate**: Cloudflare Access with `--allowed-mail`, verified
-above. There is no application-level credential on `/preview`, and no `PREVIEW_*` environment
-variable is read anywhere in the web app.
-
-What replaces the second gate is a **network boundary**, not a secret:
-
-| Control | State |
+| Model | Outcome |
 |---|---|
-| Web origin | `127.0.0.1:3100` — loopback only; LAN request returns `000` (connection refused) |
-| API origin | `127.0.0.1:4100` — loopback only; LAN request returns `000` |
-| Public ingress | the tunnel only, behind Cloudflare Access |
+| Cloudflare `--allowed-mail` **plus** Basic | The operator could not get past the second prompt on a phone |
+| Cloudflare `--allowed-mail` alone | The OTP flow failed: `sso.cloudflare.dev/…cf-standard-user-authentication-flow` → `/access-denied`. The tunnel's own log confirmed `Authentication: One-Time PIN (using Cloudflare Access)` and `Allowed recipients: 1 address`, so the allowlist was correct and the failure was inside Cloudflare's identity service — before any request reached this host |
+| **HTTP Basic at the origin, tunnel without an allowlist** | **Current.** Verified end to end from the public URL |
 
-Before this change the API listened on `0.0.0.0:4100`, so anything on the LAN could reach it and
-bypass the tunnel entirely. That is fixed; the subagent review that found it is credited in the
-commit.
+Why this is acceptable for a read-only preview, stated plainly:
 
-A rewrite, not a redirect, sends a tunnel visitor from `/` and `/login` to `/preview`: a redirect
-must name an absolute origin, and the forwarded `Host` is exactly what is uncertain behind a
-tunnel. `cf-connecting-ip` is the authoritative signal that a request came through Cloudflare.
+- the page cannot write, cannot start or stop anything, holds no session, and renders no tenant
+  data;
+- both origins are loopback-bound, so the tunnel is the only ingress;
+- the credential is 96 bits, generated locally, stored `0600` outside the repository, and is the
+  only thing standing between a visitor and a read-only page.
 
-**The trade-off, stated:** anyone who controls the authorised mailbox can view the page. The page
-is read-only, renders no tenant data, holds no session, and has no mutating control. If any of
-those stop being true, an application-level gate becomes mandatory again.
+Why it is weaker than an identity provider, stated just as plainly: one shared secret, no
+per-person identity, no per-device revocation, no second factor, no expiry, no audit trail of who
+viewed. It is accepted **because** the IdP is broken, there is one operator, and the content is
+read-only. If this page ever gains a mutating control or tenant data, a real identity gate is
+mandatory again.
+
+## 3a. What was actually observed on the public path
+
+| Request | Result |
+|---|---|
+| `GET /preview` with no credentials | **401**, 25-byte body, `WWW-Authenticate: Basic realm="INTELLIGENZ preview"`, **0** data markers |
+| `GET /preview` with a wrong password | **401** |
+| `GET /preview` with the correct credential | **200**, 187 883 bytes, `TEMPORARY PREVIEW` / `15 / 32` / `P83-007` / `NOT CHECKED` present |
+| `GET /` with no credentials | **401** (the rewrite sits behind the gate) |
+| `GET /` on localhost, no credentials | **200**, the normal app, no preview marker |
+
+## 3b. Why a rewrite, not a redirect
+
+A redirect must name an absolute origin, and behind a tunnel the forwarded `Host` is exactly what
+is uncertain — the earlier attempt emitted `http://localhost:3100/preview`, which on a phone
+means the phone. An internal rewrite has no `Location` at all. Tunnel detection accepts
+`cf-connecting-ip` (which Cloudflare always sets and a local browser never sends) as well as the
+host suffix.
 
 ## 4. Data leaving the origin
 
