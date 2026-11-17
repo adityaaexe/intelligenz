@@ -3,7 +3,7 @@ import { NextResponse } from 'next/server';
 
 /**
  * HTTP Basic auth at the origin for the operator preview, plus the tunnel landing
- * rewrite.
+ * redirect.
  *
  * The gate is here because the gate in front of us stopped working. Cloudflare
  * Access was the only credential on the tunnel, bound to the operator's mailbox,
@@ -41,16 +41,17 @@ import { NextResponse } from 'next/server';
  * into a header. The failure response is a fixed sentence; the 401 carries only
  * the realm, which is what makes a browser prompt appear.
  *
- * A visitor arriving through a Cloudflare tunnel is served the preview at the
- * same URL by an internal **rewrite**, not a redirect. A redirect has to name an
- * absolute origin, and the origin is exactly what is uncertain here: cloudflared
- * may forward the tunnel hostname or `127.0.0.1:3100` in `Host`, and the server
- * itself was started with a localhost origin. Picking the wrong one told the
- * phone to retry on its own loopback. A rewrite emits no `Location` header —
- * `request.url` is only the base of the internal target and is never sent to the
- * browser — so there is no absolute origin to get wrong. The rewrite happens
- * only after the credential is checked: an unauthenticated tunnel request for `/`
- * is a 401, not a page.
+ * A visitor arriving through a Cloudflare tunnel is sent from `/` or `/login` to
+ * `/preview` by an explicit **redirect**, not an internal rewrite. A rewrite
+ * inherits the forwarded `https` scheme: Next treats an absolute rewrite target
+ * carrying a scheme as an external proxy and opens TLS against its own origin,
+ * which serves plain HTTP, so the hop dies with `EPROTO: wrong version number`
+ * and the visitor gets a 500. A redirect happens in the browser instead, which
+ * already has the right scheme, so it is built from the visitor's own `Host` and
+ * `x-forwarded-proto` — never from `request.url`, whose scheme is the forwarded
+ * one and whose host is this origin's, not the tunnel's. The redirect happens
+ * only after the credential is checked: an unauthenticated tunnel request for
+ * `/` is a 401, not a redirect.
  *
  * Detection does not depend on the forwarded `Host` either. Cloudflare always
  * sets `cf-connecting-ip` on a tunnel request and a local browser never sends
@@ -192,10 +193,19 @@ export function middleware(request: NextRequest): NextResponse {
     });
   }
 
-  // Authorised. A tunnel visitor at the root or login is served the preview at
-  // the same URL; `/preview` itself passes through, and local `/` never gets here.
+  // Authorised. A tunnel visitor at the root or login is sent to the preview.
+  // A redirect, not a rewrite: a rewrite inherits the forwarded `https` scheme and
+  // Next proxies over TLS to its own plain-HTTP port, which fails with EPROTO. The
+  // redirect is resolved by the browser, which already has the right scheme.
   if ((pathname === '/' || pathname === '/login') && tunnelRequest) {
-    return NextResponse.rewrite(new URL('/preview', request.url), { status: 200 });
+    const host = normalizeHost(request.headers.get('host'));
+    const protocol = request.headers.get('x-forwarded-proto') === 'http' ? 'http' : 'https';
+
+    // `Host` is mandatory in HTTP/1.1 and cloudflared always forwards it; an empty
+    // one cannot produce an absolute target, and a thrown URL error would be a 500.
+    if (host.length === 0) return plainResponse('Bad request.\n', 400);
+
+    return NextResponse.redirect(new URL('/preview', `${protocol}://${host}`), 307);
   }
 
   return NextResponse.next();

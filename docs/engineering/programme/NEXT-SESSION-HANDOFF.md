@@ -487,3 +487,10 @@ Trade-off, recorded: one shared secret with no per-person identity, revocation, 
 expiry or audit trail. Accepted because the IdP is broken, there is one operator, the page is
 read-only, renders no tenant data, and both origins are loopback-bound. If the page ever gains a
 mutating control or tenant data, a real identity gate is mandatory.
+
+Trap found the hard way: a middleware **rewrite** inherits the forwarded `https` scheme, and Next
+treats an absolute rewrite target with a scheme as an external proxy — it opened TLS against its
+own plain-HTTP origin and returned `500 EPROTO: wrong version number` on the tunnel root. A
+**redirect** executes in the browser, which already has the right scheme, so `/` and `/login`
+redirect (307) to `/preview`, built from `Host` + `x-forwarded-proto`. If the tunnel root ever
+500s again while `/preview` works, this is the first thing to check.
