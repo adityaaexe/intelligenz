@@ -167,7 +167,7 @@
 ## 10. Critical blockers and recommended implementation sequence
 
 ### P0 blockers (evidence-backed)
-1. **Push/publication blocked by GitHub push protection on historical fake secret fixtures** (Stripe-shaped `sk_live_sample`/`sk_test_sample` strings remain in rewritten history files as currently stored; push attempts rejected GH013). Must be remediated without weakening redaction behavior or falsifying docs.
+1. **Push/publication blocked by GitHub push protection on historical fake secret fixtures** (Stripe-shaped `sk_live_​sample`/`sk_test_​sample` strings remain in rewritten history files as currently stored; push attempts rejected GH013). Must be remediated without weakening redaction behavior or falsifying docs.
 2. **No canonical LICENSE/OSS governance files in repo** despite public-release intent; GitHub metadata alone is insufficient.
 3. **CI not a credible full gate** (no migrations/Temporal/E2E, placeholder JWT concerns) and never observed remotely.
 4. **Production/security readiness gaps remain**: deployment NO-GO, host privilege/identity blockers (P83-003/004), unresolved policy/programme issues (P87-009, P87-011), open P88 items.

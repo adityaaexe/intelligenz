@@ -21,7 +21,7 @@
 
 ### Immediate actions
 1. **Remediate GH013 push protection blockers** (highest priority).
-   - Replace remaining Stripe-shaped fake fixtures (`sk_live_sample...`, `sk_test_sample...`) in affected files/history with non-detectable, inert placeholders that still satisfy redaction tests/intent.
+   - Replace remaining Stripe-shaped fake fixtures (`sk_live_​sample...`, `sk_test_​sample...`) in affected files/history with non-detectable, inert placeholders that still satisfy redaction tests/intent.
    - Re-run targeted redaction tests and grep checks; verify no flagged patterns remain.
    - Use minimal history rewrite only if required for push (backup refs/bundle exist); record old/new SHAs.
 2. **Push current branch** `phase-6/trust-boundary-closure` to `origin` (or agreed branch) and verify remote ref.
