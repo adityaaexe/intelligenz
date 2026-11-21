@@ -26,11 +26,14 @@ role, no CI execution, no remote push, and no real evaluation baseline. Read
 §7 and [`docs/engineering/DEPLOYMENT-READINESS.md`](docs/engineering/DEPLOYMENT-READINESS.md)
 before treating any part of it as deployable.
 
-> **Repository state.** The instructions below assume a checkout that contains the
-> Phase 2, 3 and 4 source. At the time of writing the implementation is an uncommitted
-> working tree on `phase-4/execution-trust`; the last commit is `c104e64`. If a fresh
-> clone contains no `apps/api/src` or `apps/web/src`, the tree was never committed. See
-> `docs/engineering/DEPLOYMENT-READINESS.md` §2.3.
+> **Repository state (updated 2026-11-21).** This checkout is on
+> `phase-6/trust-boundary-closure` at `ede3327` with a clean worktree at the time of this
+> README refresh. It contains the Phase 2–8.x source, docs, and programme ledger. For a
+> complete project breakdown and operator/contributor walkthrough, see
+> [`docs/PROJECT-WALKTHROUGH.md`](docs/PROJECT-WALKTHROUGH.md). For the machine-readable
+> current programme state, see
+> [`docs/engineering/programme/EXECUTION-STATE.json`](docs/engineering/programme/EXECUTION-STATE.json)
+> (validate with `pnpm programme:check`).
 
 ---
 
@@ -428,6 +431,8 @@ Phase 4 residuals are in
 
 | Document | What it answers |
 |---|---|
+| [`docs/PROJECT-WALKTHROUGH.md`](docs/PROJECT-WALKTHROUGH.md) | **Complete project details + walkthrough**: layout, stack, setup, run/test, security, phase/programme status, contributor path |
+| [`docs/engineering/programme/EXECUTION-STATE.json`](docs/engineering/programme/EXECUTION-STATE.json) | Machine-readable programme ledger (validate with `pnpm programme:check`) |
 | [`docs/engineering/PHASE-4-IMPLEMENTATION-STATUS.md`](docs/engineering/PHASE-4-IMPLEMENTATION-STATUS.md) | What Phase 4 actually runs, the executed chain, how to run a real task, and the residuals |
 | [`docs/engineering/PHASE-4-TEST-RESULTS.md`](docs/engineering/PHASE-4-TEST-RESULTS.md) | Literal gate output, the 28 attack scenarios and the 15 authorization cases, with gaps stated |
 | [`docs/engineering/PHASE-4-SECURITY-RESULTS.md`](docs/engineering/PHASE-4-SECURITY-RESULTS.md) | The independent audit, its verdict history, and the remediation record (F1–F3 closed, F4–F6 open) |
