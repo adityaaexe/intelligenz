@@ -45,13 +45,13 @@ const CASES: readonly Case[] = [
     // is `sk_live_`, and it is written bare here so the generic `KEY=value` rule cannot
     // be what makes this pass.
     name: 'Stripe-style sk_live_ secret',
-    input: 'the credential printed by the tool was sk_live_​sample0000000000000000000',
-    leaks: ['sk_live_​sample0000000000000000000'],
+    input: 'the credential printed by the tool was sk_live_' + 'sample0000000000000000000',
+    leaks: ['sk_live_' + 'sample0000000000000000000'],
   },
   {
     name: 'Stripe-style sk_test_ secret',
-    input: 'sk_test_​sample0000000000000000000',
-    leaks: ['sk_test_​sample0000000000000000000'],
+    input: 'sk_test_' + 'sample0000000000000000000',
+    leaks: ['sk_test_' + 'sample0000000000000000000'],
   },
   {
     name: 'GitHub personal access token',
@@ -109,9 +109,9 @@ const CASES: readonly Case[] = [
   },
   {
     name: 'base64 of an env assignment',
-    // btoa('OPENAI_API_KEY=sk_live_​sample0000000000000')
-    input: `payload ${Buffer.from('OPENAI_API_KEY=sk_live_​sample0000000000000', 'utf8').toString('base64')}`,
-    leaks: ['T1BFTkFJX0FQSV9LRVk9c2tfbGl2ZV9hYmNkZWYxMjM0NTY3ODkw'],
+    // btoa('OPENAI_API_KEY=' + 'sk_live_' + 'sample0000000000000')
+    input: `payload ${Buffer.from('OPENAI_API_KEY=' + 'sk_live_' + 'sample0000000000000', 'utf8').toString('base64')}`,
+    leaks: ['T1BFTkFJX0FQSV9LRVk9c2tfbGl2ZV9zYW1wbGUwMDAwMDAwMDAwMDAw'],
   },
   {
     name: 'base64 of a bearer token with a scheme',
@@ -148,7 +148,7 @@ describe('redact', () => {
   });
 
   it('is idempotent', () => {
-    const once = redact('Authorization: Bearer abcdef0123456789.xyz and sk_live_​sample0000000000000');
+    const once = redact('Authorization: Bearer abcdef0123456789.xyz and sk_live_' + 'sample0000000000000');
     expect(redact(once)).toBe(once);
   });
 
